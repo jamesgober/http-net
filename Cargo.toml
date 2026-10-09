@@ -1,0 +1,78 @@
+# =============================================================================
+#  R E P S   ·   http-net
+# =============================================================================
+[package]
+name    = "http-net"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Sans-IO HTTP/1.1 server and client: strict parsing, bounded buffers, keep-alive, chunked bodies, no dependencies."
+
+# Keywords (5 max)
+keywords = ["http", "server", "client", "sans-io", "protocol"]
+
+# Categories
+categories = ["network-programming", "web-programming", "no-std"]
+
+# Links
+homepage      = "https://github.com/jamesgober/http-net"
+repository    = "https://github.com/jamesgober/http-net"
+documentation = "https://docs.rs/http-net"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "http_net"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std"]
+std = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# First-party -lang dependencies are wired at v0.2.0, when first used.
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
