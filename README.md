@@ -18,17 +18,46 @@
 
 <div align="left">
     <p>
-        <strong>http-net</strong> is an HTTP/1.1 engine that does no I/O itself: feed it bytes, get requests or responses back, and hand it responses to serialize. Parsing is strict and every buffer is bounded, so hostile clients cannot exhaust memory. Keep-alive, chunked transfer encoding, and pipelining are handled; the caller owns sockets and threads.
+        <strong>http-net</strong> is an HTTP/1.1 engine that does no I/O itself: feed it bytes, get requests or responses back as borrowed views of those bytes, and hand it responses to serialize. The caller owns sockets, threads, and timers, so the same core runs under a blocking loop, an event loop, or a test that never opens a socket.
+    </p>
+    <p>
+        Parsing follows RFC 9112 strictly. A message that two implementations could frame differently is refused, not repaired: conflicting <code>Content-Length</code> and <code>Transfer-Encoding</code>, duplicate lengths, obsolete line folding, bare CR or LF, whitespace before a colon, and control bytes in field values each have their own error. Every buffer is bounded, and each limit is checked before the bytes it governs are buffered. Keep-alive, pipelined requests, chunked bodies both ways, and the protocol-upgrade hand-off for WebSocket are built in; a small blocking adapter over <code>std::net</code> serves a handler and fetches a URL.
     </p>
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition).
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The public API is being designed across the 0.x series and frozen at <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.2.0</code>).</strong> The foundation is in place; the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
+
+<hr>
+<br>
+
+## The model
+
+- A **[`ServerConn`](./docs/API.md#serverconn)** is the server side of one connection. Bytes go in with `feed` (or `read_buf` + `commit`); `poll` reports a **[`ServerEvent`](./docs/API.md#serverevent)**: a request head, body runs, the end of the request, or what it needs next. `respond` writes a **[`Response`](./docs/API.md#response)** into your output buffer.
+- A **[`ClientConn`](./docs/API.md#clientconn)** is the mirror image: `send_request` writes a **[`Request`](./docs/API.md#request)**, `poll` reports the response as **[`ClientEvent`](./docs/API.md#clientevent)**s.
+- **[`RequestHead`](./docs/API.md#requesthead)** and **[`ResponseHead`](./docs/API.md#responsehead)** are zero-copy views of a parsed head.
+- **[`Limits`](./docs/API.md#limits)** bounds every buffer; **[`HttpError`](./docs/API.md#httperror)** says exactly what was refused and which status to answer with.
+- The **[`blocking`](./docs/API.md#blocking-adapter)** module (feature `std`) drives both over `std::net`: a bounded thread-per-connection `Server`, a per-connection `Connection`, and `get`.
+
+<br>
+
+What it guarantees, and how each guarantee is checked:
+
+| Guarantee | How it is held |
+|---|---|
+| Parsing follows RFC 9112; malformed messages get a precise error, never a guess. | 15 request accept cases, 65 request reject cases, and 16 response cases as data (`tests/rfc_cases.rs`), each run whole and one byte at a time; a differential test against an independent whole-buffer reference parser over every single-byte mutation of eight seed requests plus 8,192 random multi-byte mutations (`tests/prop_reference.rs`). |
+| Request smuggling vectors are refused. | 25 CL.TE / TE.CL / TE.TE / line-ending vectors, each at every split point (`tests/smuggling.rs`); after an error the connection never parses another request; outgoing messages cannot carry framing headers or CR/LF. An adversarial suite (`tests/adversarial.rs`) adds target forms and the authority, `Expect: 100-continue`, chunk and trailer edges, cumulative chunk-extension and interim-response budgets, and integer edges. |
+| Limits are enforced before allocation. | Boundary tests at the limit and one past it for line length, header bytes, header count, and body; declared lengths and chunk sizes are checked before their data is read; the input buffer never exceeds `2 * (line + headers) + 16 KiB`, and the test drivers assert the parser never waits for input with a full buffer. |
+| Nothing panics on hostile bytes. | Property tests feed arbitrary bytes and dictionary-built near-HTTP to both connections, from the first byte and behind valid heads (so body, chunk, and trailer states are reached), whole and split, with default and tiny limits. |
+| The parse does not depend on how input is split. | Property tests compare whole, split, and byte-at-a-time feeding. |
+| Serialize and parse round-trip. | Property tests: requests from `ClientConn` parsed by `ServerConn`, responses the other way, with full, chunked, and fixed-length streamed bodies; absolute-form targets; keep-alive intent. |
+| Slow or stuck peers cannot pin the server. | Socket tests: a head or body trickled inside the read timeout is cut off by the request timeout with `408`; a refused client that keeps sending cannot stall the accept loop; lingering close ends after 1 s however the peer behaves. |
+| It works over real sockets. | `tests/localhost.rs`: the Tier-1 server and client, keep-alive, pipelining, a 200 KB chunked upload echoed back, streamed responses, error answers, `Expect: 100-continue`, the connection cap, the upgrade hand-off, and shutdown. |
 
 <hr>
 <br>
@@ -37,14 +66,140 @@
 
 ```toml
 [dependencies]
-http-net = "0.1"
+http-net = "0.2"
+```
+
+Without the standard library (the sans-IO core only):
+
+```toml
+[dependencies]
+http-net = { version = "0.2", default-features = false }
+```
+
+<hr>
+<br>
+
+## Quick start
+
+Serve a handler on localhost and fetch from it:
+
+```rust
+use http_net::{blocking, Response};
+
+let server = blocking::Server::bind("127.0.0.1:0")?;
+let addr = server.local_addr();
+let stop = server.shutdown_handle();
+let thread = std::thread::spawn(move || {
+    server.serve(|req, _body| Response::text(200, &format!("you asked for {}", req.path())))
+});
+
+let resp = blocking::get(&format!("http://{addr}/hello"))?;
+assert_eq!(resp.status(), 200);
+assert_eq!(resp.text(), Some("you asked for /hello"));
+
+stop.shutdown();
+thread.join().unwrap()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The server runs one thread per connection, at most 64 at once (the next is answered `503`), with a 10 s read timeout and a 30 s deadline per request (first byte to end of body; a late request gets `408`), answers `Expect: 100-continue` itself, and adds a `date` header to every response. Requests that fail to parse are answered with the matching status (`400`, `413`, `414`, `431`, `501`, `505`) and closed; the handler never sees them. A handler that returns a streamed or invalid response gets a `500` instead of a hung client.
+
+### The sans-IO core
+
+The same kind of exchange with no socket at all:
+
+```rust
+use http_net::{Response, ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let mut out = Vec::new();
+let _ = conn.feed(b"POST /notes HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
+let mut body = Vec::new();
+loop {
+    match conn.poll()? {
+        ServerEvent::Request(req) => assert_eq!(req.path(), "/notes"),
+        ServerEvent::Body(chunk) => body.extend_from_slice(chunk),
+        ServerEvent::RequestEnd => conn.respond(&Response::text(201, "saved"), &mut out)?,
+        _ => break, // NeedInput: read more from the socket and feed it
+    }
+}
+assert_eq!(body, b"hello");
+assert!(out.starts_with(b"HTTP/1.1 201 Created\r\n"));
+# Ok::<(), http_net::HttpError>(())
+```
+
+### Handing a connection to WebSocket
+
+```rust
+use http_net::{Response, ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET /rpc HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x85");
+let ServerEvent::Request(req) = conn.poll()? else { unreachable!() };
+assert!(req.is_upgrade());
+assert!(matches!(conn.poll()?, ServerEvent::RequestEnd));
+
+let mut out = Vec::new();
+let accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="; // computed by the WebSocket engine
+conn.respond(&Response::switching_protocols("websocket").header("sec-websocket-accept", accept), &mut out)?;
+assert!(matches!(conn.poll()?, ServerEvent::Upgraded));
+assert_eq!(conn.remaining_input(), b"\x81\x85"); // the first bytes of the first frame
+# Ok::<(), http_net::HttpError>(())
 ```
 
 <br>
 
-## Status
+## Limits
 
-This is the <code>v0.1.0</code> scaffold: structure, tooling, and quality gates are in place; the implementation lands across the 0.x series per the <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a> and <a href="./docs/API.md"><code>docs/API.md</code></a>.
+| Budget | Default | Error when exceeded |
+|---|---|---|
+| request line, status line, chunk-size line | 8 KiB | `StartLineTooLong` (414) / `ChunkLineTooLong` (400) |
+| header section | 16 KiB | `HeadersTooLarge` (431) |
+| header fields (trailer fields counted separately) | 100 | `TooManyHeaders` (431) |
+| body | 1 MiB | `BodyTooLarge` (413) |
+| chunk extensions, summed over one message | 16 KiB (the header budget) | `ChunkExtensionsTooLarge` (400) |
+| interim 1xx heads before a response (client) | 16 KiB (the header budget) | `HeadersTooLarge` |
+
+These are the budgets of LexerSketch Studio's localhost server. Change them with [`Limits`](./docs/API.md#limits). The blocking server adds time budgets in [`ServerConfig`](./docs/API.md#blockingserverconfig): 10 s per read, 30 s per request, 10 s per write, at most 1 s of lingering close.
+
+<br>
+
+## Examples
+
+```bash
+cargo run --example localhost   # serve, fetch, shut down
+cargo run --example sans_io     # the core with no socket
+cargo run --example serve -- 127.0.0.1:8080
+cargo run --example get -- http://127.0.0.1:8080/
+```
+
+<br>
+
+## What is not here yet
+
+- TLS: plain `http://` only.
+- Interim responses other than `100 Continue` from the server (for example `103 Early Hints`), sending `Expect: 100-continue` from the client, a client with several outstanding pipelined requests, and an async adapter: v0.5.0 (see the [roadmap](./dev/ROADMAP.md)). The server already answers `Expect: 100-continue` and serves pipelined requests in order.
+- `cargo fuzz` targets: v0.9.0. Until then, property tests feed arbitrary bytes to both connections, from the first byte and behind valid heads.
+- A total deadline per response on the blocking client: its 30 s timeouts apply to each connect, read, and write.
+- Content codings (gzip and others): a body is delivered as sent, and a `Transfer-Encoding` other than `chunked` is refused with 501.
+
+<hr>
+<br>
+
+## Performance
+
+Criterion medians on Windows x86_64 (Rust stable, release profile), from `cargo bench` (1 s warm-up, 3 s measurement):
+
+| Benchmark | Median |
+|---|---:|
+| 12-field browser GET, parsed and answered | ~280 ns |
+| 100,000 pipelined GETs in 16 KiB reads | ~8.4 ms (about 11.9 M requests/s) |
+| 1 MiB body, `Content-Length`, 16 KiB reads | ~13 µs |
+| 1 MiB body, chunked in 4 KiB chunks | ~17 µs |
+| response with five fields and a 1 KiB body, serialized | ~75 ns |
+| client parsing a 1 KiB response | ~98 ns |
+
+These are library-only numbers: no sockets are involved. Body events borrow the input buffer, so the 1 MiB cases measure one copy into the buffer plus framing.
 
 <hr>
 <br>

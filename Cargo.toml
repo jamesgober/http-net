@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Sans-IO HTTP/1.1 server and client: strict parsing, bounded buffers, keep-alive, chunked bodies, no dependencies."
+description = "Sans-IO HTTP/1.1 server and client: strict RFC 9112 parsing, smuggling defences, bounded buffers, keep-alive, chunked bodies, upgrades, a blocking std adapter, no dependencies."
 
 # Keywords (5 max)
 keywords = ["http", "server", "client", "sans-io", "protocol"]
@@ -45,13 +45,15 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
+# The blocking adapter over std::net (Server, Connection, Client, get).
+# Without it the crate is no_std and needs only `alloc`.
 std = []
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# None. The parser, framing, and blocking adapter are all in this crate.
 
 
 # DEV DEPENDENCIES
@@ -66,6 +68,21 @@ proptest  = "1"
 [[bench]]
 name    = "bench"
 harness = false
+
+
+# EXAMPLES
+# #################################
+[[example]]
+name              = "localhost"
+required-features = ["std"]
+
+[[example]]
+name              = "serve"
+required-features = ["std"]
+
+[[example]]
+name              = "get"
+required-features = ["std"]
 
 
 # RELEASE PROFILE

@@ -1,4 +1,185 @@
-//! Benchmark harness placeholder. Criterion benchmarks land with the 0.x
-//! implementation phases (see `dev/ROADMAP.md`). `harness = false` requires a `main`.
+//! Criterion benchmarks for the sans-IO core at realistic scale.
+//!
+//! - `request_head`: one browser-like GET (12 fields, ~500 bytes) parsed
+//!   and answered on a reused connection.
+//! - `pipelined_100k`: 100,000 small requests in 16 KiB reads.
+//! - `body_1mib`: a 1 MiB body, `Content-Length` and chunked (4 KiB
+//!   chunks), fed in 16 KiB reads.
+//! - `response_write`: serializing a response with five fields and a
+//!   1 KiB body.
+//! - `response_parse`: a client parsing a response with a 1 KiB body.
 
-fn main() {}
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use http_net::{ClientConn, ClientEvent, Limits, Request, Response, ServerConn, ServerEvent};
+
+const BROWSER_GET: &[u8] = b"GET /assets/app.3f9a1c.js?v=2 HTTP/1.1\r\n\
+Host: 127.0.0.1:53817\r\n\
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36\r\n\
+Accept: */*\r\n\
+Accept-Encoding: gzip, deflate, br, zstd\r\n\
+Accept-Language: en-US,en;q=0.9\r\n\
+Cache-Control: no-cache\r\n\
+Connection: keep-alive\r\n\
+Pragma: no-cache\r\n\
+Referer: http://127.0.0.1:53817/\r\n\
+Sec-Fetch-Dest: script\r\n\
+Sec-Fetch-Mode: no-cors\r\n\
+Sec-Fetch-Site: same-origin\r\n\r\n";
+
+/// Drives a server connection over `input` in `read`-sized pieces,
+/// answering every request with `response`. Returns the request count.
+fn serve_all(conn: &mut ServerConn, input: &[u8], read: usize, response: &Response) -> usize {
+    let mut out = Vec::with_capacity(256);
+    let mut pending = input;
+    let mut requests = 0;
+    loop {
+        match conn.poll() {
+            Ok(ServerEvent::Request(r)) => {
+                black_box(r.path());
+            }
+            Ok(ServerEvent::Body(b)) => {
+                black_box(b);
+            }
+            Ok(ServerEvent::RequestEnd) => {
+                requests += 1;
+                out.clear();
+                conn.respond(response, &mut out).unwrap_or_default();
+            }
+            Ok(ServerEvent::NeedInput) => {
+                if pending.is_empty() {
+                    return requests;
+                }
+                let take = pending.len().min(read);
+                let n = conn.feed(&pending[..take]);
+                pending = &pending[n..];
+            }
+            _ => return requests,
+        }
+    }
+}
+
+fn bench_request_head(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_head");
+    group.throughput(Throughput::Bytes(BROWSER_GET.len() as u64));
+    let response = Response::new(204);
+    let mut conn = ServerConn::new();
+    group.bench_function("browser_get", |b| {
+        b.iter(|| serve_all(&mut conn, black_box(BROWSER_GET), 16 * 1024, &response))
+    });
+    group.finish();
+}
+
+fn bench_pipelined(c: &mut Criterion) {
+    let one = b"GET /item/42 HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\n";
+    let input = one.repeat(100_000);
+    let response = Response::new(204);
+    let mut group = c.benchmark_group("pipelined_100k");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(100_000));
+    group.bench_function("small_gets", |b| {
+        b.iter_batched(
+            ServerConn::new,
+            |mut conn| assert_eq!(serve_all(&mut conn, &input, 16 * 1024, &response), 100_000),
+            BatchSize::LargeInput,
+        )
+    });
+    group.finish();
+}
+
+fn bench_body(c: &mut Criterion) {
+    let body = vec![0x5au8; 1024 * 1024];
+    let mut length = b"POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 1048576\r\n\r\n".to_vec();
+    length.extend_from_slice(&body);
+    let mut chunked =
+        b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for piece in body.chunks(4096) {
+        chunked.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        chunked.extend_from_slice(piece);
+        chunked.extend_from_slice(b"\r\n");
+    }
+    chunked.extend_from_slice(b"0\r\n\r\n");
+    let response = Response::new(204);
+    let limits = Limits::new().with_max_body(2 << 20);
+    let mut group = c.benchmark_group("body_1mib");
+    group.throughput(Throughput::Bytes(body.len() as u64));
+    group.bench_function("content_length", |b| {
+        b.iter_batched(
+            || ServerConn::with_limits(limits),
+            |mut conn| serve_all(&mut conn, &length, 16 * 1024, &response),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("chunked_4k", |b| {
+        b.iter_batched(
+            || ServerConn::with_limits(limits),
+            |mut conn| serve_all(&mut conn, &chunked, 16 * 1024, &response),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+fn bench_response_write(c: &mut Criterion) {
+    let body: Vec<u8> = vec![b'x'; 1024];
+    let response = Response::new(200)
+        .header("content-type", "application/javascript")
+        .header("cache-control", "max-age=31536000, immutable")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header("cross-origin-resource-policy", "same-origin")
+        .body(body);
+    let mut group = c.benchmark_group("response_write");
+    group.bench_function("five_fields_1k_body", |b| {
+        let mut conn = ServerConn::new();
+        let mut out = Vec::with_capacity(4096);
+        b.iter(|| {
+            let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+            out.clear();
+            conn.respond(&response, &mut out).unwrap_or_default();
+            black_box(out.len())
+        })
+    });
+    group.finish();
+}
+
+fn bench_response_parse(c: &mut Criterion) {
+    let mut wire = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nDate: Sun, 04 Oct 2026 00:00:00 GMT\r\nContent-Length: 1024\r\n\r\n".to_vec();
+    wire.extend(std::iter::repeat_n(b'{', 1024));
+    let request = Request::get("/api").header("host", "a");
+    let mut group = c.benchmark_group("response_parse");
+    group.throughput(Throughput::Bytes(wire.len() as u64));
+    group.bench_function("json_1k", |b| {
+        let mut conn = ClientConn::new();
+        let mut out = Vec::with_capacity(256);
+        b.iter(|| {
+            out.clear();
+            conn.send_request(&request, &mut out).unwrap_or_default();
+            let _ = conn.feed(&wire);
+            loop {
+                match conn.poll() {
+                    Ok(ClientEvent::Body(b)) => {
+                        black_box(b);
+                    }
+                    Ok(ClientEvent::ResponseEnd) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            black_box(conn.poll().is_ok())
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_request_head,
+    bench_pipelined,
+    bench_body,
+    bench_response_write,
+    bench_response_parse
+);
+criterion_main!(benches);
