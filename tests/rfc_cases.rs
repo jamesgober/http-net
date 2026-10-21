@@ -6,7 +6,10 @@
 mod common;
 
 use common::{Ev, drive_client, drive_server};
-use http_net::{BodyFraming, HttpError, Limits, Request, Version};
+use http_net::{
+    BodyFraming, ClientConn, ClientEvent, HttpError, Limits, Request, Response, ServerConn,
+    ServerEvent, TargetForm, Version,
+};
 
 struct Accept {
     name: &'static str,
@@ -167,6 +170,28 @@ const ACCEPT: &[Accept] = &[
         input: b"GET / HTTP/1.1\r\nHost: \t a \t\r\nX-Text:caf\xc3\xa9 \x80\xff\r\nX-Empty:\r\n\r\n",
         method: "GET",
         target: "/",
+        version: Version::Http11,
+        framing: BodyFraming::None,
+        body: b"",
+        keep_alive: true,
+    },
+    Accept {
+        // E-16: a one-byte method is a token.
+        name: "one-byte extension method",
+        input: b"X / HTTP/1.1\r\nHost: a\r\n\r\n",
+        method: "X",
+        target: "/",
+        version: Version::Http11,
+        framing: BodyFraming::None,
+        body: b"",
+        keep_alive: true,
+    },
+    Accept {
+        // E-37: the scheme is the application's decision, not the parser's.
+        name: "absolute-form with a non-http scheme",
+        input: b"GET ftp://h/ HTTP/1.1\r\nHost: h\r\n\r\n",
+        method: "GET",
+        target: "ftp://h/",
         version: Version::Http11,
         framing: BodyFraming::None,
         body: b"",
@@ -555,6 +580,12 @@ const REJECT: &[(&str, &[u8], HttpError)] = &[
         b"GET / HTTP/1.1\r\nHost: a\r\n",
         HttpError::UnexpectedEof,
     ),
+    (
+        // E-18, T-42: prior-knowledge HTTP/2 to an HTTP/1.1-only listener.
+        "HTTP/2 connection preface",
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        HttpError::UnsupportedVersion,
+    ),
 ];
 
 #[test]
@@ -697,9 +728,23 @@ const RESPONSES: &[ResponseCase] = &[
         expect: Ok((200, BodyFraming::None, b"")),
     },
     ResponseCase {
-        name: "status line without the second space",
+        // E-152: senders MUST send the space, but real servers omit it and
+        // it cannot change framing, so the client accepts it from 0.3.
+        name: "status line without the space after the code",
         request: get,
-        input: b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n",
+        input: b"HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok",
+        expect: Ok((200, BodyFraming::Length(2), b"ok")),
+    },
+    ResponseCase {
+        name: "status code of two digits and no reason",
+        request: get,
+        input: b"HTTP/1.1 20\r\nContent-Length: 0\r\n\r\n",
+        expect: Err(HttpError::InvalidStartLine),
+    },
+    ResponseCase {
+        name: "status code glued to the version",
+        request: get,
+        input: b"HTTP/1.1200 OK\r\nContent-Length: 0\r\n\r\n",
         expect: Err(HttpError::InvalidStartLine),
     },
     ResponseCase {
@@ -784,4 +829,258 @@ fn test_response_cases() {
             Err(e) => assert_eq!(whole.last(), Some(&Ev::Err(e)), "{}: {whole:?}", case.name),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0.3 edge-case rows (specification section 12.3)
+// ---------------------------------------------------------------------------
+
+/// The first request head of `input`, fed whole, checked by `f`.
+fn with_head(input: &[u8], limits: Limits, f: impl FnOnce(&http_net::RequestHead<'_>)) {
+    let mut conn = ServerConn::with_limits(limits);
+    let _ = conn.feed(input);
+    match conn.poll() {
+        Ok(ServerEvent::Request(r)) => f(&r),
+        other => panic!(
+            "expected a request for {:?}, got {other:?}",
+            String::from_utf8_lossy(input)
+        ),
+    }
+}
+
+#[test]
+fn test_method_of_eight_kib_is_start_line_too_long() {
+    // E-17
+    let mut input = vec![b'M'; 8 * 1024];
+    input.extend_from_slice(b" / HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert_eq!(
+        common::server_error(&input),
+        Some(HttpError::StartLineTooLong)
+    );
+}
+
+#[test]
+fn test_empty_query_is_some_empty() {
+    // E-28
+    with_head(b"GET /a? HTTP/1.1\r\nHost: a\r\n\r\n", Limits::new(), |r| {
+        assert_eq!(r.path(), "/a");
+        assert_eq!(r.query(), Some(""));
+    });
+    with_head(
+        b"GET /a?b HTTP/1.1\r\nHost: a\r\n\r\n",
+        Limits::new(),
+        |r| {
+            assert_eq!(r.query(), Some("b"));
+        },
+    );
+}
+
+#[test]
+fn test_target_form_reports_all_four_forms() {
+    // E-37 and the four forms of RFC 9112 section 3.2.
+    let cases: &[(&[u8], TargetForm, &str, &str)] = &[
+        (
+            b"GET /p?q HTTP/1.1\r\nHost: h\r\n\r\n",
+            TargetForm::Origin,
+            "h",
+            "/p",
+        ),
+        (
+            b"GET ftp://h/ HTTP/1.1\r\nHost: other\r\n\r\n",
+            TargetForm::Absolute,
+            "h",
+            "/",
+        ),
+        (
+            b"GET http://h:8080 HTTP/1.1\r\nHost: other\r\n\r\n",
+            TargetForm::Absolute,
+            "h:8080",
+            "/",
+        ),
+        (
+            b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\n\r\n",
+            TargetForm::Authority,
+            "h:443",
+            "h:443",
+        ),
+        (
+            b"OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n",
+            TargetForm::Asterisk,
+            "h",
+            "*",
+        ),
+    ];
+    for (input, form, host, path) in cases {
+        with_head(input, Limits::new(), |r| {
+            assert_eq!(
+                r.target_form(),
+                *form,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+            assert_eq!(r.host(), Some(*host));
+            assert_eq!(r.path(), *path);
+        });
+    }
+}
+
+#[test]
+fn test_target_of_exactly_the_remaining_budget_is_accepted() {
+    // E-40: "GET " + target + " HTTP/1.1\r\n" fills the start-line budget.
+    let limits = Limits::new().with_max_start_line(64);
+    let line = |target_len: usize| {
+        let mut v = b"GET /".to_vec();
+        v.extend(std::iter::repeat_n(b'a', target_len - 1));
+        v.extend_from_slice(b" HTTP/1.1\r\nHost: a\r\n\r\n");
+        v
+    };
+    let fit = 64 - "GET  HTTP/1.1\r\n".len();
+    with_head(&line(fit), limits, |r| assert_eq!(r.target().len(), fit));
+    assert_eq!(
+        drive_server(&[&line(fit + 1)], limits).last(),
+        Some(&Ev::Err(HttpError::StartLineTooLong))
+    );
+}
+
+#[test]
+fn test_zero_header_budget_accepts_fieldless_http10_only() {
+    // E-45
+    let limits = Limits::new().with_max_headers(0);
+    with_head(b"GET / HTTP/1.0\r\n\r\n", limits, |r| {
+        assert_eq!(r.headers().len(), 0);
+    });
+    assert_eq!(
+        drive_server(&[b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"], limits).last(),
+        Some(&Ev::Err(HttpError::TooManyHeaders))
+    );
+}
+
+#[test]
+fn test_field_names_with_every_tchar_punctuation_are_accepted() {
+    // E-60: the 15 punctuation characters of RFC 9110 section 5.6.2.
+    for c in "!#$%&'*+-.^_`|~".chars() {
+        let name = format!("X{c}Y");
+        let input = format!("GET / HTTP/1.1\r\nHost: a\r\n{name}: v\r\n\r\n");
+        with_head(input.as_bytes(), Limits::new(), |r| {
+            assert_eq!(r.header(&name), Some(&b"v"[..]), "{name}");
+        });
+    }
+}
+
+#[test]
+fn test_duplicate_fields_are_kept_in_order() {
+    // E-61
+    with_head(
+        b"GET / HTTP/1.1\r\nHost: a\r\nAccept: text/html\r\naccept: */*\r\n\r\n",
+        Limits::new(),
+        |r| {
+            assert_eq!(r.header("accept"), Some(&b"text/html"[..]));
+            let all: Vec<&[u8]> = r.header_all("ACCEPT").collect();
+            assert_eq!(all, [&b"text/html"[..], &b"*/*"[..]]);
+            assert_eq!(r.header_all("x-missing").count(), 0);
+        },
+    );
+}
+
+#[test]
+fn test_content_length_zero_is_distinct_from_absent() {
+    // E-74
+    with_head(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n",
+        Limits::new(),
+        |r| {
+            assert_eq!(r.framing(), BodyFraming::None);
+            assert_eq!(r.content_length(), Some(0));
+        },
+    );
+    with_head(b"POST / HTTP/1.1\r\nHost: a\r\n\r\n", Limits::new(), |r| {
+        assert_eq!(r.content_length(), None);
+    });
+    with_head(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 7\r\n\r\n",
+        Limits::new(),
+        |r| assert_eq!(r.content_length(), Some(7)),
+    );
+}
+
+#[test]
+fn test_te_request_field_does_not_affect_framing() {
+    // E-92: `TE` is not `Transfer-Encoding`.
+    with_head(
+        b"GET / HTTP/1.1\r\nHost: a\r\nTE: trailers\r\n\r\n",
+        Limits::new(),
+        |r| assert_eq!(r.framing(), BodyFraming::None),
+    );
+    let events = drive_server(
+        &[b"POST / HTTP/1.1\r\nHost: a\r\nTE: trailers, deflate\r\nContent-Length: 3\r\n\r\nabc"],
+        Limits::new(),
+    );
+    assert!(events.contains(&Ev::Body(b"abc".to_vec())), "{events:?}");
+}
+
+#[test]
+fn test_ten_thousand_one_byte_chunks_decode_correctly() {
+    // E-113
+    let mut input = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    let mut expected = Vec::new();
+    for i in 0..10_000u32 {
+        let b = b'a' + (i % 26) as u8;
+        input.extend_from_slice(b"1\r\n");
+        input.push(b);
+        input.extend_from_slice(b"\r\n");
+        expected.push(b);
+    }
+    input.extend_from_slice(b"0\r\n\r\n");
+    let whole = drive_server(&[&input], Limits::new());
+    assert!(whole.contains(&Ev::Body(expected)), "body differs");
+    assert!(whole.contains(&Ev::End));
+    // Odd-sized reads split chunk lines everywhere.
+    let pieces: Vec<&[u8]> = input.chunks(7).collect();
+    assert_eq!(drive_server(&pieces, Limits::new()), whole);
+}
+
+#[test]
+fn test_client_half_close_after_complete_request_still_gets_response() {
+    // E-123: the client shut down its sending side after the request.
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    conn.feed_eof();
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Request(_))));
+    assert!(matches!(conn.poll(), Ok(ServerEvent::RequestEnd)));
+    let mut out = Vec::new();
+    conn.respond(&Response::text(200, "still here"), &mut out)
+        .unwrap();
+    assert!(out.ends_with(b"still here"));
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Closed)));
+}
+
+#[test]
+fn test_two_set_cookie_fields_are_never_joined() {
+    // E-162
+    let mut conn = ClientConn::new();
+    conn.send_request(&get(), &mut Vec::new()).unwrap();
+    let _ = conn.feed(
+        b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1; Path=/\r\nset-cookie: b=2, c=3\r\nContent-Length: 0\r\n\r\n",
+    );
+    let ClientEvent::Response(resp) = conn.poll().unwrap() else {
+        panic!("expected a response");
+    };
+    let all: Vec<&[u8]> = resp.header_all("set-cookie").collect();
+    assert_eq!(all, [&b"a=1; Path=/"[..], &b"b=2, c=3"[..]]);
+    assert_eq!(resp.content_length(), Some(0));
+}
+
+#[test]
+fn test_unregistered_status_keeps_the_space_before_an_empty_reason() {
+    // E-176: RFC 9112 section 4, `status-code SP [ reason-phrase ]`.
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+    let mut out = Vec::new();
+    conn.respond(&Response::new(299), &mut out).unwrap();
+    assert!(
+        out.starts_with(b"HTTP/1.1 299 \r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&out)
+    );
 }

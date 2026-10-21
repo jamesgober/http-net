@@ -176,12 +176,27 @@ impl Limits {
         self.body
     }
 
-    /// The input buffer's hard capacity. The current message's head stays
-    /// pinned while its body streams, and the decoder may need one whole
-    /// chunk-size line or trailer section on top of it, so twice the head
-    /// budget plus the body window always fits whatever the parser is
-    /// waiting to complete.
-    pub(crate) const fn buffer_cap(&self) -> usize {
+    /// The input buffer's hard capacity, `2 * (max_start_line +
+    /// max_header_bytes) + 16 KiB` (64 KiB with the defaults), so a driver
+    /// can plan memory per connection.
+    ///
+    /// The current message's head stays pinned while its body streams, and
+    /// the decoder may need one whole chunk-size line or trailer section on
+    /// top of it, so twice the head budget plus the body window always fits
+    /// whatever the parser is waiting to complete. A connection's memory is
+    /// this buffer plus `max_headers` field records of 16 bytes each.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::Limits;
+    ///
+    /// assert_eq!(Limits::new().buffer_capacity(), 64 * 1024);
+    /// let small = Limits::new().with_max_start_line(1024).with_max_header_bytes(4096);
+    /// assert_eq!(small.buffer_capacity(), 2 * (1024 + 4096) + 16 * 1024);
+    /// ```
+    #[must_use]
+    pub const fn buffer_capacity(&self) -> usize {
         2 * (self.start_line + self.header_bytes) + BODY_WINDOW
     }
 }
@@ -209,6 +224,6 @@ mod tests {
         assert_eq!(l.max_start_line(), HARD_CAP);
         assert_eq!(l.max_header_bytes(), 2);
         assert_eq!(l.max_headers(), 65_536);
-        assert!(l.buffer_cap() <= u32::MAX as usize);
+        assert!(l.buffer_capacity() <= u32::MAX as usize);
     }
 }

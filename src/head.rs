@@ -14,6 +14,8 @@ use core::{fmt, slice};
 use crate::{
     error::HttpError,
     limits::Limits,
+    method::Method,
+    redact::{FieldName, FieldValue},
     syntax::{
         check_field_value, find_byte, is_host_value, is_ows, is_reason, is_target_chars, is_tchar,
         is_token, list_elements, parse_decimal, trim_ows,
@@ -251,95 +253,6 @@ fn parse_field(line: &[u8], base: usize) -> Result<Field, HttpError> {
     })
 }
 
-/// The request method.
-///
-/// Methods are case-sensitive (RFC 9110 section 9.1): `get` is a different,
-/// unregistered method and parses as [`Method::Other`]. The exact text is
-/// always available from [`RequestHead::method_str`].
-///
-/// # Examples
-///
-/// ```
-/// use http_net::Method;
-///
-/// assert_eq!(Method::from_bytes(b"GET"), Method::Get);
-/// assert_eq!(Method::from_bytes(b"get"), Method::Other);
-/// assert_eq!(Method::Post.as_str(), Some("POST"));
-/// ```
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Method {
-    /// `GET`
-    Get,
-    /// `HEAD`: the response carries headers but never a body.
-    Head,
-    /// `POST`
-    Post,
-    /// `PUT`
-    Put,
-    /// `DELETE`
-    Delete,
-    /// `CONNECT`: the target is in authority form; a 2xx response turns the
-    /// connection into a tunnel.
-    Connect,
-    /// `OPTIONS`: the only method that may use the `*` target.
-    Options,
-    /// `TRACE`
-    Trace,
-    /// `PATCH`
-    Patch,
-    /// Any other token.
-    Other,
-}
-
-impl Method {
-    /// Classifies a method token (case-sensitive).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(http_net::Method::from_bytes(b"PATCH"), http_net::Method::Patch);
-    /// ```
-    #[must_use]
-    pub fn from_bytes(token: &[u8]) -> Self {
-        match token {
-            b"GET" => Self::Get,
-            b"HEAD" => Self::Head,
-            b"POST" => Self::Post,
-            b"PUT" => Self::Put,
-            b"DELETE" => Self::Delete,
-            b"CONNECT" => Self::Connect,
-            b"OPTIONS" => Self::Options,
-            b"TRACE" => Self::Trace,
-            b"PATCH" => Self::Patch,
-            _ => Self::Other,
-        }
-    }
-
-    /// The method's text, or `None` for [`Method::Other`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(http_net::Method::Other.as_str(), None);
-    /// ```
-    #[must_use]
-    pub const fn as_str(&self) -> Option<&'static str> {
-        Some(match self {
-            Self::Get => "GET",
-            Self::Head => "HEAD",
-            Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Delete => "DELETE",
-            Self::Connect => "CONNECT",
-            Self::Options => "OPTIONS",
-            Self::Trace => "TRACE",
-            Self::Patch => "PATCH",
-            Self::Other => return None,
-        })
-    }
-}
-
 /// The HTTP version of a message.
 ///
 /// # Examples
@@ -403,6 +316,60 @@ pub enum BodyFraming {
     UntilClose,
 }
 
+/// The form of a request target (RFC 9112 section 3.2).
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{ServerConn, ServerEvent, TargetForm};
+///
+/// let mut conn = ServerConn::new();
+/// let _ = conn.feed(b"OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n");
+/// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+/// assert_eq!(req.target_form(), TargetForm::Asterisk);
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TargetForm {
+    /// `/path?query`: the usual form for requests to an origin server.
+    Origin,
+    /// `scheme://authority/path?query`: requests to a proxy (and, per RFC
+    /// 9112 section 3.2.2, acceptable to origin servers too).
+    Absolute,
+    /// `host:port`: only with `CONNECT`.
+    Authority,
+    /// `*`: only with `OPTIONS`, for the server as a whole.
+    Asterisk,
+}
+
+/// The `h2c` upgrade token, which is never treated as an upgrade offer
+/// (RFC 9113 section 3.1 deprecates it; forwarded blindly by a proxy, it is
+/// the h2c smuggling attack).
+pub(crate) fn is_h2c(protocol: &[u8]) -> bool {
+    let name = protocol
+        .iter()
+        .position(|&b| b == b'/')
+        .map_or(protocol, |i| &protocol[..i]);
+    name.eq_ignore_ascii_case(b"h2c")
+}
+
+/// Whether a `101` naming `chosen` answers an `Upgrade` offer `element`:
+/// ASCII case-insensitive, and a name without a version matches an offer of
+/// that name with any version (`websocket` answers `websocket/13`).
+pub(crate) fn protocol_matches(chosen: &[u8], element: &[u8]) -> bool {
+    if is_h2c(element) || is_h2c(chosen) {
+        return false;
+    }
+    if chosen.eq_ignore_ascii_case(element) {
+        return true;
+    }
+    !chosen.contains(&b'/')
+        && element
+            .iter()
+            .position(|&b| b == b'/')
+            .is_some_and(|i| element[..i].eq_ignore_ascii_case(chosen))
+}
+
 fn parse_version(v: &[u8]) -> Result<Version, HttpError> {
     match v {
         [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
@@ -431,6 +398,8 @@ struct FieldFacts {
     keep_alive: bool,
     upgrade_token: bool,
     upgrade_field: bool,
+    /// An `Upgrade` element other than `h2c`.
+    upgrade_offer: bool,
     expect_continue: bool,
     hosts: usize,
     host: Option<Span>,
@@ -481,6 +450,7 @@ fn scan_fields(head: &[u8], fields: &[Field]) -> Result<FieldFacts, HttpError> {
             }
         } else if name.eq_ignore_ascii_case(b"upgrade") {
             facts.upgrade_field |= !value.is_empty();
+            facts.upgrade_offer |= list_elements(value).any(|e| !is_h2c(e));
         } else if name.eq_ignore_ascii_case(b"host") {
             facts.hosts += 1;
             facts.host = Some(field.value);
@@ -522,8 +492,10 @@ pub(crate) struct RequestInfo {
     pub(crate) method: Method,
     method_span: Span,
     target: Span,
+    target_form: TargetForm,
     pub(crate) version: Version,
     pub(crate) framing: BodyFraming,
+    content_length: Option<u64>,
     pub(crate) keep_alive: bool,
     pub(crate) upgrade: bool,
     pub(crate) expect_continue: bool,
@@ -540,8 +512,10 @@ impl RequestInfo {
         method: Method::Get,
         method_span: Span { start: 0, end: 0 },
         target: Span { start: 0, end: 0 },
+        target_form: TargetForm::Origin,
         version: Version::Http11,
         framing: BodyFraming::None,
+        content_length: None,
         keep_alive: false,
         upgrade: false,
         expect_continue: false,
@@ -636,11 +610,13 @@ pub(crate) fn interpret_request(
     check_target(method, target)?;
     let target_start = base + sp1 + 1;
     let target_span = Span::new(target_start, base + sp2);
-    let (authority, origin) = match target.first() {
-        Some(b'/' | b'*') => (None, target_span),
-        _ if method == Method::Connect => (None, target_span),
+    let (target_form, authority, origin) = match target.first() {
+        Some(b'/') => (TargetForm::Origin, None, target_span),
+        Some(b'*') => (TargetForm::Asterisk, None, target_span),
+        _ if method == Method::Connect => (TargetForm::Authority, None, target_span),
         _ => match split_absolute_form(target) {
             Some((a, b)) => (
+                TargetForm::Absolute,
                 Some(Span::new(target_start + a, target_start + b)),
                 Span::new(target_start + b, base + sp2),
             ),
@@ -675,11 +651,15 @@ pub(crate) fn interpret_request(
         method,
         method_span: Span::new(base, base + sp1),
         target: target_span,
+        target_form,
         version,
         framing,
+        content_length: facts.content_length,
         keep_alive,
         // RFC 9110 section 7.8: Upgrade in an HTTP/1.0 request is ignored.
-        upgrade: version == Version::Http11 && facts.upgrade_token && facts.upgrade_field,
+        // An offer of only `h2c` is no offer: the request is served as
+        // HTTP/1.1 (RFC 9113 section 3.1).
+        upgrade: version == Version::Http11 && facts.upgrade_token && facts.upgrade_offer,
         // RFC 9110 section 10.1.1: ignored in HTTP/1.0, and meaningless
         // without a body to wait for.
         expect_continue: version == Version::Http11
@@ -698,6 +678,7 @@ pub(crate) struct ResponseInfo {
     reason: Span,
     pub(crate) version: Version,
     pub(crate) framing: BodyFraming,
+    content_length: Option<u64>,
     pub(crate) keep_alive: bool,
     pub(crate) upgrade_field: bool,
 }
@@ -708,6 +689,7 @@ impl ResponseInfo {
         reason: Span { start: 0, end: 0 },
         version: Version::Http11,
         framing: BodyFraming::None,
+        content_length: None,
         keep_alive: false,
         upgrade_field: false,
     };
@@ -730,7 +712,10 @@ pub(crate) fn interpret_response(
     let line = start.get(head);
     let base = start.start as usize;
     // status-line = HTTP-version SP status-code SP [ reason-phrase ]
-    if line.len() < 13 || line[8] != b' ' || line[12] != b' ' {
+    // The SP after the code is required of senders, but some servers omit
+    // it when the reason is empty (`HTTP/1.1 200`); accepting that cannot
+    // change framing, so the client does (RFC 9112 section 4).
+    if line.len() < 12 || line[8] != b' ' || (line.len() > 12 && line[12] != b' ') {
         return Err(HttpError::InvalidStartLine);
     }
     let version = parse_version(&line[..8])?;
@@ -744,7 +729,8 @@ pub(crate) fn interpret_response(
     if !(100..=599).contains(&status) {
         return Err(HttpError::InvalidStatus);
     }
-    let reason = &line[13..];
+    let reason_start = line.len().min(13);
+    let reason = &line[reason_start..];
     if !is_reason(reason) {
         return Err(HttpError::InvalidStartLine);
     }
@@ -775,9 +761,10 @@ pub(crate) fn interpret_response(
         };
     Ok(ResponseInfo {
         status,
-        reason: Span::new(base + 13, base + line.len()),
+        reason: Span::new(base + reason_start, base + line.len()),
         version,
         framing,
+        content_length: facts.content_length,
         keep_alive,
         upgrade_field: facts.upgrade_field,
     })
@@ -828,22 +815,76 @@ impl<'a> Iterator for Headers<'a> {
 
 impl ExactSizeIterator for Headers<'_> {}
 
+/// Shows the fields as `(name, value)` pairs; the values of credential
+/// fields (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`)
+/// are replaced by `<redacted N bytes>`.
 impl fmt::Debug for Headers<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let head = self.head;
         f.debug_list()
-            .entries(self.clone().map(|(n, v)| (n, Lossy(v))))
+            .entries(self.fields.clone().map(|field| {
+                let name = field.name.get(head);
+                (
+                    FieldName(name),
+                    FieldValue {
+                        name,
+                        value: field.value.get(head),
+                    },
+                )
+            }))
             .finish()
     }
 }
 
-struct Lossy<'a>(&'a [u8]);
+/// Iterator over the values of every field with one name, in arrival
+/// order: what [`RequestHead::header_all`] and
+/// [`ResponseHead::header_all`] return. Each `Set-Cookie`, for example, is
+/// its own field and its own item; nothing is comma-joined.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{ServerConn, ServerEvent};
+///
+/// let mut conn = ServerConn::new();
+/// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nVia: 1.1 p1\r\nVia: 1.1 p2\r\n\r\n");
+/// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+/// let vias: Vec<&[u8]> = req.header_all("via").collect();
+/// assert_eq!(vias, [&b"1.1 p1"[..], &b"1.1 p2"[..]]);
+/// ```
+///
+/// The values borrow the head (`'a`), not the name (`'n`), so they outlive
+/// a temporary name used for the lookup.
+#[derive(Clone)]
+pub struct HeaderValues<'a, 'n> {
+    head: &'a [u8],
+    fields: slice::Iter<'a, Field>,
+    name: &'n [u8],
+}
 
-impl fmt::Debug for Lossy<'_> {
+impl<'a> Iterator for HeaderValues<'a, '_> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let (head, name) = (self.head, self.name);
+        self.fields
+            .find(|f| f.name.get(head).eq_ignore_ascii_case(name))
+            .map(|f| f.value.get(head))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.fields.size_hint().1)
+    }
+}
+
+impl fmt::Debug for HeaderValues<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match core::str::from_utf8(self.0) {
-            Ok(s) => fmt::Debug::fmt(s, f),
-            Err(_) => fmt::Debug::fmt(self.0, f),
-        }
+        let name = self.name;
+        f.debug_list()
+            .entries(self.clone().map(|value| FieldValue { name, value }))
+            .finish()
     }
 }
 
@@ -852,6 +893,18 @@ fn find_header<'a>(head: &'a [u8], fields: &[Field], name: &str) -> Option<&'a [
         .iter()
         .find(|f| f.name.get(head).eq_ignore_ascii_case(name.as_bytes()))
         .map(|f| f.value.get(head))
+}
+
+fn header_values<'a, 'n>(
+    head: &'a [u8],
+    fields: &'a [Field],
+    name: &'n str,
+) -> HeaderValues<'a, 'n> {
+    HeaderValues {
+        head,
+        fields: fields.iter(),
+        name: name.as_bytes(),
+    }
 }
 
 /// A parsed request head, borrowed from the connection's buffer.
@@ -935,6 +988,22 @@ impl<'a> RequestHead<'a> {
     #[must_use]
     pub fn target(&self) -> &'a str {
         core::str::from_utf8(self.info.target.get(self.head)).unwrap_or("")
+    }
+
+    /// Which of the four RFC 9112 section 3.2 forms the target uses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent, TargetForm};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET http://a.test/x HTTP/1.1\r\nHost: a.test\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// assert_eq!(req.target_form(), TargetForm::Absolute);
+    /// ```
+    #[must_use]
+    pub fn target_form(&self) -> TargetForm {
+        self.info.target_form
     }
 
     /// The path: the target up to (not including) the first `?`, with
@@ -1061,6 +1130,52 @@ impl<'a> RequestHead<'a> {
         self.header(name).and_then(|v| core::str::from_utf8(v).ok())
     }
 
+    /// The values of every field named `name` (ASCII case-insensitive), in
+    /// arrival order: for fields that may be repeated, such as `via`,
+    /// `forwarded`, or `cookie` from clients that send one line per cookie.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET /x HTTP/1.1\r\nHost: a\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// let cookies: Vec<&[u8]> = req.header_all("cookie").collect();
+    /// assert_eq!(cookies, [&b"a=1"[..], &b"b=2"[..]]);
+    /// assert_eq!(req.header_all("accept").count(), 0);
+    ///
+    /// // The values borrow the head, not the name.
+    /// let first = {
+    ///     let name = String::from("COOKIE");
+    ///     req.header_all(&name).next()
+    /// };
+    /// assert_eq!(first, Some(&b"a=1"[..]));
+    /// ```
+    #[must_use]
+    pub fn header_all<'n>(&self, name: &'n str) -> HeaderValues<'a, 'n> {
+        header_values(self.head, self.fields, name)
+    }
+
+    /// The declared `Content-Length`, if the request has one. Unlike
+    /// [`framing`](Self::framing), which reports `Content-Length: 0` as
+    /// [`BodyFraming::None`], this tells `Some(0)` from an absent field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{BodyFraming, ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// assert_eq!(req.framing(), BodyFraming::None);
+    /// assert_eq!(req.content_length(), Some(0));
+    /// ```
+    #[must_use]
+    pub fn content_length(&self) -> Option<u64> {
+        self.info.content_length
+    }
+
     /// The authority the request is for (`host [":" port]`), if known.
     ///
     /// This is the `Host` field, except for an absolute-form target
@@ -1153,10 +1268,14 @@ impl<'a> RequestHead<'a> {
     }
 
     /// Whether this is an HTTP/1.1 request to switch protocols: `Connection`
-    /// lists `upgrade` and an `Upgrade` field names the protocol (read it
-    /// with `header("upgrade")`). Answer with
-    /// [`Response::switching_protocols`](crate::Response::switching_protocols)
-    /// to hand the connection over.
+    /// lists `upgrade` and an `Upgrade` field offers at least one protocol
+    /// other than `h2c` (read the offer with `header("upgrade")`). Answer
+    /// with [`Response::switching_protocols`](crate::Response::switching_protocols)
+    /// naming an offered protocol to hand the connection over.
+    ///
+    /// `h2c` is never an offer: RFC 9113 section 3.1 deprecates the
+    /// HTTP/2 upgrade, and a proxy that forwards it blindly is open to h2c
+    /// smuggling. A request offering only `h2c` is served as HTTP/1.1.
     ///
     /// # Examples
     ///
@@ -1167,13 +1286,29 @@ impl<'a> RequestHead<'a> {
     /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
     /// assert!(req.is_upgrade());
     /// assert_eq!(req.header("upgrade"), Some(&b"websocket"[..]));
+    ///
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAA\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// assert!(!req.is_upgrade());
     /// ```
     #[must_use]
     pub fn is_upgrade(&self) -> bool {
         self.info.upgrade
     }
+
+    /// Whether the request's `Upgrade` field offers `protocol` (see
+    /// [`Response::switching_protocols`](crate::Response::switching_protocols)).
+    pub(crate) fn offers(&self, protocol: &[u8]) -> bool {
+        self.info.upgrade
+            && self
+                .header_all("upgrade")
+                .any(|v| list_elements(v).any(|e| protocol_matches(protocol, e)))
+    }
 }
 
+/// Shows method, target, version, fields, and framing; the values of
+/// credential fields are replaced by `<redacted N bytes>`.
 impl fmt::Debug for RequestHead<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RequestHead")
@@ -1231,7 +1366,8 @@ impl<'a> ResponseHead<'a> {
     }
 
     /// The reason phrase, if it is UTF-8 (it carries no meaning; RFC 9112
-    /// tells clients to ignore it).
+    /// tells clients to ignore it). Empty for a status line without one,
+    /// including `HTTP/1.1 200` with no space after the code.
     ///
     /// # Examples
     ///
@@ -1319,6 +1455,46 @@ impl<'a> ResponseHead<'a> {
         self.header(name).and_then(|v| core::str::from_utf8(v).ok())
     }
 
+    /// The values of every field named `name`, in arrival order. Each
+    /// `Set-Cookie` is its own field (they are never comma-joined), so
+    /// this is how a client reads all of them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ClientConn, ClientEvent, Request};
+    /// # let mut conn = ClientConn::new();
+    /// # conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new()).unwrap();
+    /// # let _ = conn.feed(b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2; Path=/\r\nContent-Length: 0\r\n\r\n");
+    /// # let ClientEvent::Response(resp) = conn.poll().unwrap() else { panic!() };
+    /// let cookies: Vec<&[u8]> = resp.header_all("set-cookie").collect();
+    /// assert_eq!(cookies, [&b"a=1"[..], &b"b=2; Path=/"[..]]);
+    /// ```
+    #[must_use]
+    pub fn header_all<'n>(&self, name: &'n str) -> HeaderValues<'a, 'n> {
+        header_values(self.head, self.fields, name)
+    }
+
+    /// The declared `Content-Length`, if the response has one, whatever the
+    /// framing rules made of it (a `HEAD` response's length is reported
+    /// here while [`framing`](Self::framing) is `None`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{BodyFraming, ClientConn, ClientEvent, Request};
+    /// # let mut conn = ClientConn::new();
+    /// # conn.send_request(&Request::head("/").header("host", "a"), &mut Vec::new()).unwrap();
+    /// # let _ = conn.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n");
+    /// # let ClientEvent::Response(resp) = conn.poll().unwrap() else { panic!() };
+    /// assert_eq!(resp.framing(), BodyFraming::None);
+    /// assert_eq!(resp.content_length(), Some(1234));
+    /// ```
+    #[must_use]
+    pub fn content_length(&self) -> Option<u64> {
+        self.info.content_length
+    }
+
     /// How the response body is delimited (accounts for `HEAD` requests and
     /// bodiless status codes).
     ///
@@ -1355,6 +1531,9 @@ impl<'a> ResponseHead<'a> {
     }
 }
 
+/// Shows status, reason, version, fields, and framing; the values of
+/// credential fields (`set-cookie` above all) are replaced by
+/// `<redacted N bytes>`.
 impl fmt::Debug for ResponseHead<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ResponseHead")
@@ -1494,6 +1673,70 @@ mod tests {
             .err(),
             Some(HttpError::HeadersTooLarge)
         );
+    }
+
+    fn response(line: &[u8]) -> Result<ResponseInfo, HttpError> {
+        let mut msg = line.to_vec();
+        msg.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+        let (s, _) = scan(&msg, HeadKind::Response)?;
+        interpret_response(
+            &msg,
+            s.start_line(),
+            &s.fields,
+            &Limits::new(),
+            Asked {
+                head: false,
+                connect: false,
+            },
+        )
+    }
+
+    #[test]
+    fn test_status_line_without_space_after_code_is_accepted() {
+        let info = response(b"HTTP/1.1 200").unwrap();
+        assert_eq!(info.status, 200);
+        assert_eq!(info.reason, Span::new(12, 12));
+        assert_eq!(response(b"HTTP/1.1 200 ").unwrap().status, 200);
+        assert_eq!(response(b"HTTP/1.1 204 No Content").unwrap().status, 204);
+        assert_eq!(
+            response(b"HTTP/1.1 20").err(),
+            Some(HttpError::InvalidStartLine)
+        );
+        assert_eq!(
+            response(b"HTTP/1.1 2000").err(),
+            Some(HttpError::InvalidStartLine)
+        );
+        assert_eq!(
+            response(b"HTTP/1.1200 OK").err(),
+            Some(HttpError::InvalidStartLine)
+        );
+        assert_eq!(
+            response(b"HTTP/1.1 600").err(),
+            Some(HttpError::InvalidStatus)
+        );
+    }
+
+    #[test]
+    fn test_protocol_matching_rules() {
+        assert!(protocol_matches(b"websocket", b"websocket"));
+        assert!(protocol_matches(b"WebSocket", b"websocket"));
+        assert!(protocol_matches(b"websocket", b"websocket/13"));
+        assert!(protocol_matches(b"foo/2", b"FOO/2"));
+        assert!(!protocol_matches(b"foo/2", b"foo/3"));
+        assert!(!protocol_matches(b"foo/2", b"foo"));
+        assert!(!protocol_matches(b"ws", b"websocket"));
+        assert!(!protocol_matches(b"h2c", b"h2c"));
+        assert!(!protocol_matches(b"H2C", b"h2c"));
+        assert!(is_h2c(b"h2c/1") && is_h2c(b"H2c") && !is_h2c(b"h2"));
+    }
+
+    #[test]
+    fn test_authority_targets_refuse_empty_host_and_bad_escapes() {
+        assert!(check_target(Method::Connect, b"a%41:443").is_ok());
+        assert!(check_target(Method::Connect, b"a%4:443").is_err());
+        assert!(check_target(Method::Get, b"http://a%zz/").is_err());
+        assert!(check_target(Method::Get, b"http://a%41b/").is_ok());
+        assert!(check_target(Method::Get, b"ftp://h/").is_ok());
     }
 
     #[test]

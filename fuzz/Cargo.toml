@@ -1,0 +1,62 @@
+[package]
+name    = "http-net-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+authors = ["James Gober <me@jamesgober.com>"]
+description = "cargo-fuzz targets for http-net (not published)."
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: not a member of any workspace above it.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary     = { version = "1", features = ["derive"] }
+httparse      = "1.10"
+http-net      = { path = ".." }
+
+[[bin]]
+name  = "server_conn"
+path  = "fuzz_targets/server_conn.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "client_conn"
+path  = "fuzz_targets/client_conn.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "chunk_line"
+path  = "fuzz_targets/chunk_line.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "reference_diff"
+path  = "fuzz_targets/reference_diff.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "httparse_diff"
+path  = "fuzz_targets/httparse_diff.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "builders"
+path  = "fuzz_targets/builders.rs"
+test  = false
+doc   = false
+bench = false

@@ -39,7 +39,8 @@ pub enum HttpError {
     InvalidMethod,
     /// The request target contains characters outside RFC 3986, a bad
     /// percent-encoding, or a form the method does not allow (`*` outside
-    /// `OPTIONS`, authority-form outside `CONNECT`).
+    /// `OPTIONS`, authority-form outside `CONNECT`); or an absolute form
+    /// without `//authority`, with userinfo, or with an empty host.
     InvalidTarget,
     /// The protocol version is not of the form `HTTP/DIGIT.DIGIT`.
     InvalidVersion,
@@ -77,7 +78,8 @@ pub enum HttpError {
     /// An HTTP/1.1 request without a `Host` field.
     MissingHost,
     /// More than one `Host` field, or a `Host` value that is not
-    /// `host [":" port]`.
+    /// `host [":" port]`: also an empty host before a port (`:80`) and a
+    /// `%` not followed by two hex digits.
     InvalidHost,
     /// `Content-Length` is not a plain decimal number that fits in 64 bits
     /// (signs, lists, spaces, and empty values are all refused).
@@ -130,6 +132,12 @@ pub enum HttpError {
     /// A streamed body's length differs from the `content_length` declared
     /// for it.
     BodyLengthMismatch,
+    /// A `101 Switching Protocols` names a protocol the request's `Upgrade`
+    /// field did not offer (RFC 9110 section 7.8: a server MUST NOT switch
+    /// to it), or names `h2c`, whose upgrade RFC 9113 section 3.1
+    /// deprecates. Also raised by `Request::upgrade("h2c")`. Answer with a
+    /// protocol the client offered, or with a normal response.
+    UpgradeNotOffered,
     /// A call made in the wrong state, for example `respond` twice for one
     /// request. The text names the rule that was broken.
     InvalidState(&'static str),
@@ -186,8 +194,74 @@ impl HttpError {
             | Self::ReservedHeader
             | Self::BodyNotAllowed
             | Self::BodyLengthMismatch
+            | Self::UpgradeNotOffered
             | Self::InvalidState(_) => None,
         }
+    }
+
+    /// Whether parsing bytes from the peer can produce this error. After
+    /// such an error from `poll`, the connection is finished: send at most
+    /// one error response, then close.
+    ///
+    /// Some variants are also usage errors (for example
+    /// [`InvalidTarget`](HttpError::InvalidTarget) comes from a bad request
+    /// line or from `Request::new` with a bad target): the call that
+    /// returned the error tells which it was, since `poll` returns only
+    /// peer errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::HttpError;
+    ///
+    /// assert!(HttpError::ConflictingFraming.is_peer_error());
+    /// assert!(!HttpError::ReservedHeader.is_peer_error());
+    /// ```
+    #[must_use]
+    pub const fn is_peer_error(&self) -> bool {
+        !matches!(
+            self,
+            Self::ReservedHeader
+                | Self::BodyNotAllowed
+                | Self::BodyLengthMismatch
+                | Self::UpgradeNotOffered
+                | Self::InvalidState(_)
+        )
+    }
+
+    /// Whether a caller mistake (builder misuse, a call in the wrong state)
+    /// can produce this error. Such an error leaves the connection usable:
+    /// nothing was written.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::HttpError;
+    ///
+    /// assert!(HttpError::ReservedHeader.is_usage_error());
+    /// assert!(!HttpError::BareLf.is_usage_error());
+    /// // Raised by parsing or by a builder: both.
+    /// assert!(HttpError::InvalidTarget.is_peer_error() && HttpError::InvalidTarget.is_usage_error());
+    /// ```
+    #[must_use]
+    pub const fn is_usage_error(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidMethod
+                | Self::InvalidTarget
+                | Self::InvalidStatus
+                | Self::BareCr
+                | Self::InvalidHeaderName
+                | Self::InvalidHeaderValue
+                | Self::MissingHost
+                | Self::InvalidHost
+                | Self::UnexpectedData
+                | Self::ReservedHeader
+                | Self::BodyNotAllowed
+                | Self::BodyLengthMismatch
+                | Self::UpgradeNotOffered
+                | Self::InvalidState(_)
+        )
     }
 }
 
@@ -233,6 +307,10 @@ impl fmt::Display for HttpError {
             }
             Self::BodyNotAllowed => "this status code cannot carry a body",
             Self::BodyLengthMismatch => "streamed body length differs from the declared length",
+            Self::UpgradeNotOffered => {
+                "101 names a protocol the request did not offer (or h2c); \
+                 answer with an offered protocol or a normal response"
+            }
             Self::InvalidState(rule) => return write!(f, "invalid call order: {rule}"),
         };
         f.write_str(msg)
@@ -254,6 +332,74 @@ mod tests {
         assert_eq!(HttpError::UnsupportedTransferEncoding.status(), Some(501));
         assert_eq!(HttpError::BareCr.status(), Some(400));
         assert_eq!(HttpError::UnexpectedEof.status(), None);
+    }
+
+    /// Every variant, so the category and text tests cannot miss one.
+    const ALL: &[HttpError] = &[
+        HttpError::InvalidStartLine,
+        HttpError::InvalidMethod,
+        HttpError::InvalidTarget,
+        HttpError::InvalidVersion,
+        HttpError::UnsupportedVersion,
+        HttpError::InvalidStatus,
+        HttpError::StartLineTooLong,
+        HttpError::HeadersTooLarge,
+        HttpError::TooManyHeaders,
+        HttpError::BareCr,
+        HttpError::BareLf,
+        HttpError::ObsFold,
+        HttpError::InvalidHeaderName,
+        HttpError::WhitespaceBeforeColon,
+        HttpError::InvalidHeaderValue,
+        HttpError::MissingHost,
+        HttpError::InvalidHost,
+        HttpError::InvalidContentLength,
+        HttpError::DuplicateContentLength,
+        HttpError::ConflictingFraming,
+        HttpError::InvalidTransferEncoding,
+        HttpError::UnsupportedTransferEncoding,
+        HttpError::TransferEncodingInHttp10,
+        HttpError::InvalidChunkSize,
+        HttpError::InvalidChunkExtension,
+        HttpError::InvalidChunkTerminator,
+        HttpError::ChunkLineTooLong,
+        HttpError::ChunkExtensionsTooLarge,
+        HttpError::BodyTooLarge,
+        HttpError::UnexpectedEof,
+        HttpError::UnexpectedData,
+        HttpError::UnexpectedUpgrade,
+        HttpError::ReservedHeader,
+        HttpError::BodyNotAllowed,
+        HttpError::BodyLengthMismatch,
+        HttpError::UpgradeNotOffered,
+        HttpError::InvalidState("rule"),
+    ];
+
+    #[test]
+    fn test_every_variant_has_a_category() {
+        for e in ALL {
+            assert!(e.is_peer_error() || e.is_usage_error(), "{e:?}");
+            // A usage-only error never maps to a status: it is not about a request.
+            if !e.is_peer_error() {
+                assert_eq!(e.status(), None, "{e:?}");
+            }
+        }
+        assert!(HttpError::UpgradeNotOffered.is_usage_error());
+        assert!(!HttpError::UpgradeNotOffered.is_peer_error());
+        assert!(HttpError::BareLf.is_peer_error() && !HttpError::BareLf.is_usage_error());
+    }
+
+    /// Threat T-37: error text is static and never reflects input bytes.
+    #[test]
+    fn test_display_every_variant_is_static_ascii_text() {
+        for e in ALL {
+            let text = e.to_string();
+            assert!(!text.is_empty(), "{e:?}");
+            assert!(
+                text.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
+                "{e:?}: {text}"
+            );
+        }
     }
 
     #[test]

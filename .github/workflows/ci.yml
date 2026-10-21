@@ -50,6 +50,68 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  no_std:
+    name: no_std build (thumbv7em-none-eabihf / ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      # A target without std proves the core needs only `alloc`; the host
+      # `--no-default-features` test above cannot show that.
+      - name: Build the library for a target without std
+        run: cargo build --lib --no-default-features --target thumbv7em-none-eabihf
+
+  fuzz:
+    name: Fuzz smoke (60 s per target)
+    runs-on: ubuntu-latest
+    env:
+      # The harness builds on nightly; a lint that nightly adds later must
+      # not turn the smoke run red, so the workflow-wide `-D warnings` is
+      # dropped here (cargo-fuzz adds its own instrumentation flags).
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          [server_conn, client_conn, chunk_line, reference_diff, httparse_diff, builders]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      # Not in install-action's manifest list; it falls back to
+      # cargo-binstall, which fetches the published binary.
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build the target
+        working-directory: fuzz
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+      # The corpus lives outside the repository (in the runner's temp
+      # directory), so a run never writes into the checkout.
+      - name: Run for 60 seconds
+        working-directory: fuzz
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpus/${{ matrix.target }}" "$RUNNER_TEMP/artifacts/${{ matrix.target }}"
+          cargo +nightly fuzz run ${{ matrix.target }} "$RUNNER_TEMP/corpus/${{ matrix.target }}" -- \
+            -max_total_time=60 -dict=http.dict \
+            -artifact_prefix="$RUNNER_TEMP/artifacts/${{ matrix.target }}/"
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: ${{ runner.temp }}/artifacts/${{ matrix.target }}/
+
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest

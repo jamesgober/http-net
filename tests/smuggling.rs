@@ -210,3 +210,76 @@ fn test_outgoing_messages_cannot_inject_framing() {
     }
     conn.respond(&Response::new(200), &mut out).unwrap();
 }
+
+/// T-9, Funky Chunks (TERM.EXT and EXT.TERM): a CR or LF inside a chunk
+/// extension that one hop reads as a line end and another as extension
+/// bytes (Netty CVE-2025-58056 and CVE-2026-33870, Jetty CVE-2026-2332,
+/// ASP.NET Core CVE-2025-55315). Chunk lines end only at CRLF: a lone LF is
+/// `BareLf`, and a CR inside an extension or a quoted value fails the
+/// extension grammar. Nothing after the bad chunk line is parsed, whole or
+/// split at any byte.
+const FUNKY_CHUNKS: &[(&str, &[u8], HttpError)] = &[
+    (
+        "TERM.EXT: LF ends the extension for a lenient hop",
+        b"5;a=b\nX\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::BareLf,
+    ),
+    (
+        "EXT.TERM: CR inside an extension name",
+        b"5;a\rb\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::InvalidChunkExtension,
+    ),
+    (
+        "CR inside a quoted extension value",
+        b"5;a=\"x\ry\"\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::InvalidChunkExtension,
+    ),
+    (
+        "LF inside a quoted extension",
+        b"5;\"\n\"\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::BareLf,
+    ),
+    (
+        "CR after an extension value",
+        b"5;a=b\rX\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::InvalidChunkExtension,
+    ),
+    (
+        "LF straight after the chunk size",
+        b"5\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::BareLf,
+    ),
+    (
+        "LF after the last chunk's extension",
+        b"0;a=b\n\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+        HttpError::BareLf,
+    ),
+];
+
+/// T-9: every Funky Chunks vector is refused with its exact error, whole and
+/// at every split, and the request smuggled after it is never parsed.
+#[test]
+fn test_funky_chunks_vectors_split_anywhere_are_refused() {
+    let head: &[u8] = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for (name, chunks, expected) in FUNKY_CHUNKS {
+        let input = [head, chunks].concat();
+        let whole = drive_server(&[&input], Limits::new());
+        assert_eq!(whole.last(), Some(&Ev::Err(*expected)), "{name}: {whole:?}");
+        let targets: Vec<&str> = whole
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Head { target, .. } => Some(target.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["/"], "{name}: {whole:?}");
+        assert!(
+            !whole.iter().any(|e| matches!(e, Ev::Body(_))),
+            "{name}: data of the bad chunk was delivered: {whole:?}"
+        );
+        for cut in 1..input.len() {
+            let split = drive_server(&[&input[..cut], &input[cut..]], Limits::new());
+            assert_eq!(whole, split, "{name}: split at {cut} changed the result");
+        }
+    }
+}

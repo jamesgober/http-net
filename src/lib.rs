@@ -63,10 +63,10 @@
 //!
 //! ## Protocol upgrades
 //!
-//! A request with `Connection: upgrade` and an `Upgrade` field reports
-//! [`RequestHead::is_upgrade`]. Answering it with
-//! [`Response::switching_protocols`] moves the connection to
-//! [`ServerEvent::Upgraded`], after which
+//! A request with `Connection: upgrade` and an `Upgrade` field offering a
+//! protocol other than `h2c` reports [`RequestHead::is_upgrade`]. Answering
+//! it with [`Response::switching_protocols`] naming an offered protocol
+//! moves the connection to [`ServerEvent::Upgraded`], after which
 //! [`ServerConn::remaining_input`] holds any bytes of the new protocol that
 //! arrived with the request. This is the hand-off point for a WebSocket
 //! engine such as `ws-net`.
@@ -75,7 +75,14 @@
 //!
 //! | Feature | Default | Description |
 //! |---|---|---|
-//! | `std` | yes | The `blocking` adapter over `std::net`. Without it the crate is `no_std` and needs only `alloc`. |
+//! | `std` | yes | The `blocking` adapter over `std::net`. Without it the crate is `no_std` and needs only `alloc` (built in CI for `thumbv7em-none-eabihf`). |
+//!
+//! ## Credentials in `Debug` output
+//!
+//! Every `Debug` implementation in the crate prints the values of
+//! `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` as
+//! `<redacted N bytes>`, so logging a request with `{:?}` never leaks a
+//! session cookie or a bearer token. The accessors return the real values.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -90,6 +97,7 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
+#![deny(clippy::unreachable)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 extern crate alloc;
@@ -101,7 +109,10 @@ mod error;
 mod head;
 mod limits;
 mod message;
+mod method;
+mod redact;
 mod server;
+pub mod status;
 mod syntax;
 
 #[cfg(feature = "std")]
@@ -110,15 +121,37 @@ pub mod blocking;
 
 pub use client::{ClientConn, ClientEvent};
 pub use error::HttpError;
-pub use head::{BodyFraming, Headers, Method, RequestHead, ResponseHead, Version};
+pub use head::{
+    BodyFraming, HeaderValues, Headers, RequestHead, ResponseHead, TargetForm, Version,
+};
 pub use limits::Limits;
-pub use message::{Request, Response, reason_phrase};
+pub use message::{Request, Response};
+pub use method::{Method, MethodSet};
 pub use server::{ServerConn, ServerEvent};
+pub use status::{StatusClass, reason_phrase, status_class};
 
-// The README's examples run as doctests, so its claims stay true.
+/// The crate version, as published (`CARGO_PKG_VERSION`).
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(http_net::VERSION.split('.').count(), 3);
+/// ```
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// The README's and the API reference's examples run as doctests, so their
+// claims stay true.
 #[cfg(all(doctest, feature = "std"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiDoctests;
+
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../docs/MIGRATION.md")]
+struct MigrationDoctests;
 
 #[cfg(test)]
 mod tests {
@@ -126,10 +159,39 @@ mod tests {
     fn test_public_types_are_send_and_sync() {
         fn assert<T: Send + Sync>() {}
         assert::<crate::ServerConn>();
+        assert::<crate::ServerEvent<'_>>();
         assert::<crate::ClientConn>();
+        assert::<crate::ClientEvent<'_>>();
         assert::<crate::Response>();
         assert::<crate::Request>();
+        assert::<crate::RequestHead<'_>>();
+        assert::<crate::ResponseHead<'_>>();
+        assert::<crate::Headers<'_>>();
+        assert::<crate::HeaderValues<'_, '_>>();
         assert::<crate::HttpError>();
         assert::<crate::Limits>();
+        assert::<crate::Method>();
+        assert::<crate::MethodSet>();
+        assert::<crate::Version>();
+        assert::<crate::BodyFraming>();
+        assert::<crate::TargetForm>();
+        assert::<crate::StatusClass>();
+        #[cfg(feature = "std")]
+        {
+            assert::<crate::blocking::Server>();
+            assert::<crate::blocking::ServerConfig>();
+            assert::<crate::blocking::ShutdownHandle>();
+            assert::<crate::blocking::Connection>();
+            assert::<crate::blocking::Incoming<'_>>();
+            assert::<crate::blocking::Upgraded>();
+            assert::<crate::blocking::Client>();
+            assert::<crate::blocking::ClientResponse>();
+            assert::<crate::blocking::Error>();
+        }
+    }
+
+    #[test]
+    fn test_version_matches_the_manifest() {
+        assert_eq!(crate::VERSION, env!("CARGO_PKG_VERSION"));
     }
 }

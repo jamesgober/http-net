@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod reference;
+
 use http_net::{
     BodyFraming, ClientConn, ClientEvent, HttpError, Limits, Request, Response, ServerConn,
     ServerEvent, Version,
@@ -58,6 +60,16 @@ pub fn split<'a>(input: &'a [u8], cuts: &[usize]) -> Vec<&'a [u8]> {
     pieces
 }
 
+/// The first protocol other than `h2c` that a request's `Upgrade` offers.
+pub fn first_offered(r: &http_net::RequestHead<'_>) -> Option<String> {
+    r.header_all("upgrade")
+        .flat_map(|v| v.split(|&b| b == b','))
+        .map(|e| e.trim_ascii())
+        .find(|e| !e.is_empty() && !e.eq_ignore_ascii_case(b"h2c") && !e.starts_with(b"h2c/"))
+        .and_then(|e| std::str::from_utf8(e).ok())
+        .map(str::to_string)
+}
+
 /// Feeds `pieces` to a server connection, answering every request with an
 /// empty 200 (or 101 for upgrades), then signals EOF. Returns the events.
 pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
@@ -67,11 +79,13 @@ pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
     let mut next = 0;
     let mut pending: &[u8] = &[];
     let mut eof = false;
-    let mut upgrade_requested = false;
+    // The protocol to answer an upgrade request with: the first one the
+    // request offered (a 101 must name an offered protocol).
+    let mut upgrade_to: Option<String> = None;
     for _ in 0..10_000_000 {
         match conn.poll() {
             Ok(ServerEvent::Request(r)) => {
-                upgrade_requested = r.is_upgrade();
+                upgrade_to = r.is_upgrade().then(|| first_offered(&r)).flatten();
                 events.push(Ev::Head {
                     method: r.method_str().to_string(),
                     target: r.target().to_string(),
@@ -88,10 +102,9 @@ pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
             Ok(ServerEvent::Body(b)) => push_body(&mut events, b),
             Ok(ServerEvent::RequestEnd) => {
                 events.push(Ev::End);
-                let response = if upgrade_requested {
-                    Response::switching_protocols("test")
-                } else {
-                    Response::new(200)
+                let response = match &upgrade_to {
+                    Some(protocol) => Response::switching_protocols(protocol),
+                    None => Response::new(200),
                 };
                 conn.respond(&response, &mut out).expect("respond");
             }

@@ -6,12 +6,11 @@ use crate::{
     body::{Decoder, Encoder, Step, push_framing},
     buffer::Buffer,
     error::HttpError,
-    head::{
-        HeadKind, HeadScanner, Method, Progress, RequestHead, RequestInfo, Version,
-        interpret_request,
-    },
+    head::{HeadKind, HeadScanner, Progress, RequestHead, RequestInfo, Version, interpret_request},
     limits::Limits,
-    message::{OutBody, Response, reason_phrase},
+    message::{OutBody, Response},
+    method::Method,
+    status::reason_phrase,
     syntax::push_decimal,
 };
 
@@ -184,7 +183,7 @@ impl ServerConn {
     /// ```
     #[must_use]
     pub fn with_limits(limits: Limits) -> Self {
-        let mut buf = Buffer::new(limits.buffer_cap());
+        let mut buf = Buffer::new(limits.buffer_capacity());
         buf.pin_at_pos();
         Self {
             buf,
@@ -487,7 +486,10 @@ impl ServerConn {
     /// - the first error recorded by the [`Response`] builder;
     /// - [`HttpError::InvalidStatus`] for a status outside `100..=599`, or a
     ///   1xx other than 101;
-    /// - [`HttpError::BodyNotAllowed`] for a body on 1xx, 204, or 304;
+    /// - [`HttpError::BodyNotAllowed`] for a body on 1xx, 204, 304, 101, or a
+    ///   2xx to `CONNECT`;
+    /// - [`HttpError::UpgradeNotOffered`] for a 101 whose protocol the
+    ///   request's `Upgrade` field did not offer;
     /// - [`HttpError::InvalidState`] when there is no request to answer, a
     ///   response was already started, or a 101 does not answer a complete
     ///   upgrade request.
@@ -557,6 +559,15 @@ impl ServerConn {
                     "101 (or 2xx to CONNECT) must answer a complete upgrade request; \
                      build it with Response::switching_protocols",
                 ));
+            }
+            // RFC 9110 section 7.8: never switch to a protocol the client
+            // did not offer.
+            if status == 101
+                && !response
+                    .upgrade_protocol()
+                    .is_some_and(|p| self.view().offers(p))
+            {
+                return Err(HttpError::UpgradeNotOffered);
             }
         }
 
@@ -845,6 +856,77 @@ mod tests {
         assert!(out.ends_with(b"\r\n\r\nabc"));
         assert!(!out.windows(17).any(|w| w == b"transfer-encoding"));
         assert!(matches!(conn.poll(), Ok(ServerEvent::Closed)));
+    }
+
+    fn upgrade_request(conn: &mut ServerConn, offer: &str) {
+        let msg = alloc::format!(
+            "GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: {offer}\r\n\r\n"
+        );
+        let _ = conn.feed(msg.as_bytes());
+        assert_eq!(events(conn), vec!["req /", "end"]);
+    }
+
+    #[test]
+    fn test_switching_protocols_must_name_an_offered_protocol() {
+        let mut conn = ServerConn::new();
+        upgrade_request(&mut conn, "websocket/13, foo/2");
+        let mut out = Vec::new();
+        // `foo` alone would match `foo/2`: a name without a version
+        // answers an offer of that name with any version.
+        for refused in ["ftp", "foo/3", "websocket/12", "h2c"] {
+            assert_eq!(
+                conn.respond(&Response::switching_protocols(refused), &mut out),
+                Err(HttpError::UpgradeNotOffered),
+                "{refused}"
+            );
+            assert!(out.is_empty());
+            assert!(!conn.is_upgraded());
+        }
+        conn.respond(&Response::switching_protocols("WebSocket"), &mut out)
+            .unwrap();
+        assert!(conn.is_upgraded());
+        assert!(out.windows(18).any(|w| w == b"upgrade: WebSocket"));
+    }
+
+    #[test]
+    fn test_refused_switch_leaves_a_normal_response_possible() {
+        let mut conn = ServerConn::new();
+        upgrade_request(&mut conn, "websocket");
+        let mut out = Vec::new();
+        assert_eq!(
+            conn.respond(&Response::switching_protocols("irc"), &mut out),
+            Err(HttpError::UpgradeNotOffered)
+        );
+        conn.respond(&Response::new(426), &mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 426 Upgrade Required\r\n"));
+        assert!(matches!(conn.poll(), Ok(ServerEvent::NeedInput)));
+    }
+
+    #[test]
+    fn test_h2c_only_offer_is_served_as_http11() {
+        let mut conn = ServerConn::new();
+        let _ = conn.feed(
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAA\r\n\r\n",
+        );
+        assert!(matches!(conn.poll(), Ok(ServerEvent::Request(r)) if !r.is_upgrade()));
+        assert!(matches!(conn.poll(), Ok(ServerEvent::RequestEnd)));
+        let mut out = Vec::new();
+        assert!(matches!(
+            conn.respond(&Response::switching_protocols("websocket"), &mut out),
+            Err(HttpError::InvalidState(_))
+        ));
+        conn.respond(&Response::new(200), &mut out).unwrap();
+        assert!(matches!(conn.poll(), Ok(ServerEvent::NeedInput)));
+    }
+
+    #[test]
+    fn test_unregistered_status_keeps_the_space_before_an_empty_reason() {
+        let mut conn = ServerConn::new();
+        let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert_eq!(events(&mut conn), vec!["req /", "end"]);
+        let mut out = Vec::new();
+        conn.respond(&Response::new(299), &mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 299 \r\n"));
     }
 
     #[test]

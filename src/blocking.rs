@@ -27,7 +27,7 @@ use std::{
 
 use crate::{
     ClientConn, ClientEvent, HttpError, Limits, Method, Request, RequestHead, Response, ServerConn,
-    ServerEvent,
+    ServerEvent, redact::FieldValue,
 };
 
 /// Bytes a closing connection reads and discards so the peer's unread data
@@ -673,12 +673,7 @@ fn serve_stream(
         let (response, is_head) = match outcome {
             Ok(answer) => answer,
             Err(Error::Http(e)) => {
-                let status = e.status().unwrap_or(400);
-                let message = e.to_string();
-                if conn
-                    .respond(&Response::text(status, &message).close())
-                    .is_err()
-                {
+                if conn.respond(&Response::from_error(&e)).is_err() {
                     return;
                 }
                 break;
@@ -1168,11 +1163,39 @@ impl Connection {
 /// # Examples
 ///
 /// See [`Server`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientResponse {
     status: u16,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
+}
+
+/// Shows status, fields, and body size; the values of credential fields
+/// (`set-cookie` above all) are replaced by `<redacted N bytes>`.
+impl fmt::Debug for ClientResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Fields<'a>(&'a [(String, Vec<u8>)]);
+        impl fmt::Debug for Fields<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list()
+                    .entries(self.0.iter().map(|(name, value)| {
+                        (
+                            name.as_str(),
+                            FieldValue {
+                                name: name.as_bytes(),
+                                value,
+                            },
+                        )
+                    }))
+                    .finish()
+            }
+        }
+        f.debug_struct("ClientResponse")
+            .field("status", &self.status)
+            .field("headers", &Fields(&self.headers))
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .finish()
+    }
 }
 
 impl ClientResponse {

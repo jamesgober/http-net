@@ -14,8 +14,10 @@ use core::fmt;
 
 use crate::{
     error::HttpError,
-    head::{Method, check_target},
-    syntax::{check_field_value, is_token, trim_ows},
+    head::{check_target, is_h2c},
+    method::Method,
+    redact::{SerializedFields, serialized_fields},
+    syntax::{check_field_value, is_protocol, is_token, trim_ows},
 };
 
 /// How an outgoing message's body is supplied.
@@ -141,11 +143,47 @@ impl Response {
             .body(text.as_bytes().to_vec())
     }
 
+    /// The response a server sends after [`ServerConn::poll`](crate::ServerConn::poll)
+    /// returned a parse error: the status from [`HttpError::status`] (400
+    /// when it has none), a short `text/plain` body with the error's
+    /// one-line description, and [`close`](Self::close). The text is static
+    /// and never includes the bytes that were refused.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{HttpError, Response, ServerConn};
+    ///
+    /// let r = Response::from_error(&HttpError::HeadersTooLarge);
+    /// assert_eq!(r.status(), 431);
+    /// assert!(r.closes());
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\n\r\n");
+    /// let err = conn.poll().unwrap_err();
+    /// let mut out = Vec::new();
+    /// conn.respond(&Response::from_error(&err), &mut out).unwrap();
+    /// assert!(out.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    /// ```
+    #[must_use]
+    pub fn from_error(error: &HttpError) -> Self {
+        Self::new(error.status().unwrap_or(400))
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(format!("{error}").into_bytes())
+            .close()
+    }
+
     /// A `101 Switching Protocols` response handing the connection to
-    /// `protocol` (for example `websocket`). The connection writes
-    /// `connection: upgrade` and `upgrade: <protocol>`; add any
-    /// protocol-specific headers (such as `sec-websocket-accept`) with
-    /// [`header`](Self::header).
+    /// `protocol` (for example `websocket`, or a `name/version` product
+    /// token). The connection writes `connection: upgrade` and
+    /// `upgrade: <protocol>`; add any protocol-specific headers (such as
+    /// `sec-websocket-accept`) with [`header`](Self::header).
+    ///
+    /// The protocol must be one the request offered (RFC 9110 section 7.8),
+    /// compared ASCII case-insensitively; a name without a version matches
+    /// an offer of that name with any version. Otherwise, and always for
+    /// `h2c` (RFC 9113 section 3.1), writing it fails with
+    /// [`HttpError::UpgradeNotOffered`].
     ///
     /// # Examples
     ///
@@ -159,8 +197,12 @@ impl Response {
     pub fn switching_protocols(protocol: &str) -> Self {
         let mut r = Self::new(101);
         r.upgrade = true;
-        if !is_token(protocol.as_bytes()) {
+        if !is_protocol(protocol.as_bytes()) {
             r.error = Some(HttpError::InvalidHeaderValue);
+            return r;
+        }
+        if is_h2c(protocol.as_bytes()) {
+            r.error = Some(HttpError::UpgradeNotOffered);
             return r;
         }
         r.fields
@@ -325,13 +367,25 @@ impl Response {
     pub(crate) fn fields(&self) -> &[u8] {
         &self.fields
     }
+
+    /// The protocol a `101` built with
+    /// [`switching_protocols`](Self::switching_protocols) switches to.
+    pub(crate) fn upgrade_protocol(&self) -> Option<&[u8]> {
+        if self.upgrade {
+            self.header_value("upgrade")
+        } else {
+            None
+        }
+    }
 }
 
+/// Shows status, fields, body size, and flags; the values of credential
+/// fields (`set-cookie` above all) are replaced by `<redacted N bytes>`.
 impl fmt::Debug for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Response")
             .field("status", &self.status)
-            .field("fields", &String::from_utf8_lossy(&self.fields))
+            .field("fields", &SerializedFields(&self.fields))
             .field("body", &body_debug(&self.body))
             .field("close", &self.close)
             .field("error", &self.error)
@@ -431,6 +485,54 @@ impl Request {
         Self::new("POST", target)
     }
 
+    /// A `HEAD` request: its response carries headers and no body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Request::head("/").method(), "HEAD");
+    /// ```
+    #[must_use]
+    pub fn head(target: &str) -> Self {
+        Self::new("HEAD", target)
+    }
+
+    /// A `PUT` request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Request::put("/files/a").method(), "PUT");
+    /// ```
+    #[must_use]
+    pub fn put(target: &str) -> Self {
+        Self::new("PUT", target)
+    }
+
+    /// A `DELETE` request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Request::delete("/files/a").method(), "DELETE");
+    /// ```
+    #[must_use]
+    pub fn delete(target: &str) -> Self {
+        Self::new("DELETE", target)
+    }
+
+    /// An `OPTIONS` request; `*` asks about the server as a whole.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Request::options("*").target(), "*");
+    /// ```
+    #[must_use]
+    pub fn options(target: &str) -> Self {
+        Self::new("OPTIONS", target)
+    }
+
     /// Adds a header field, validated as for [`Response::header`]. A second
     /// `host` is refused with [`HttpError::InvalidHost`].
     ///
@@ -516,16 +618,30 @@ impl Request {
     /// hands the connection over; see
     /// [`ClientEvent::Upgraded`](crate::ClientEvent::Upgraded).
     ///
+    /// `protocol` is a token or a `name/version` product token. `h2c` is
+    /// refused with [`HttpError::UpgradeNotOffered`]: RFC 9113 section 3.1
+    /// deprecates the HTTP/2 upgrade.
+    ///
     /// # Examples
     ///
     /// ```
-    /// let r = http_net::Request::get("/rpc").header("host", "a").upgrade("websocket");
+    /// use http_net::{ClientConn, HttpError, Request};
+    ///
+    /// let r = Request::get("/rpc").header("host", "a").upgrade("websocket");
     /// assert_eq!(r.header_value("upgrade"), Some(&b"websocket"[..]));
+    ///
+    /// let h2c = Request::get("/").header("host", "a").upgrade("h2c");
+    /// assert_eq!(
+    ///     ClientConn::new().send_request(&h2c, &mut Vec::new()),
+    ///     Err(HttpError::UpgradeNotOffered)
+    /// );
     /// ```
     #[must_use]
     pub fn upgrade(mut self, protocol: &str) -> Self {
         if self.error.is_none() {
-            if is_token(protocol.as_bytes()) {
+            if is_h2c(protocol.as_bytes()) {
+                self.error = Some(HttpError::UpgradeNotOffered);
+            } else if is_protocol(protocol.as_bytes()) {
                 self.upgrade = true;
                 self.fields
                     .extend_from_slice(b"connection: upgrade\r\nupgrade: ");
@@ -599,12 +715,15 @@ impl Request {
     }
 }
 
+/// Shows method, target, fields, and body size; the values of credential
+/// fields (`authorization`, `proxy-authorization`, `cookie`) are replaced by
+/// `<redacted N bytes>`.
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Request")
             .field("method", &self.method)
             .field("target", &self.target)
-            .field("fields", &String::from_utf8_lossy(&self.fields))
+            .field("fields", &SerializedFields(&self.fields))
             .field("body", &body_debug(&self.body))
             .field("error", &self.error)
             .finish()
@@ -621,78 +740,15 @@ fn body_debug(body: &OutBody) -> String {
 
 /// Looks a header up in serialized `name: value\r\n` lines.
 fn field_value<'a>(fields: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    fields
-        .split(|&b| b == b'\n')
-        .filter_map(|line| {
-            let line = line.strip_suffix(b"\r")?;
-            let colon = line.iter().position(|&b| b == b':')?;
-            Some((&line[..colon], line.get(colon + 2..).unwrap_or(&[])))
-        })
+    serialized_fields(fields)
         .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
         .map(|(_, v)| v)
 }
 
-/// The canonical reason phrase for a status code (RFC 9110 section 15).
-///
-/// # Examples
-///
-/// ```
-/// assert_eq!(http_net::reason_phrase(404), "Not Found");
-/// assert_eq!(http_net::reason_phrase(299), "");
-/// ```
-#[must_use]
-pub const fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        100 => "Continue",
-        101 => "Switching Protocols",
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        203 => "Non-Authoritative Information",
-        204 => "No Content",
-        205 => "Reset Content",
-        206 => "Partial Content",
-        300 => "Multiple Choices",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        406 => "Not Acceptable",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        410 => "Gone",
-        411 => "Length Required",
-        412 => "Precondition Failed",
-        413 => "Content Too Large",
-        414 => "URI Too Long",
-        415 => "Unsupported Media Type",
-        416 => "Range Not Satisfiable",
-        417 => "Expectation Failed",
-        421 => "Misdirected Request",
-        422 => "Unprocessable Content",
-        426 => "Upgrade Required",
-        428 => "Precondition Required",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        505 => "HTTP Version Not Supported",
-        _ => "",
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]
@@ -748,6 +804,101 @@ mod tests {
             Request::get("/").upgrade("a b").error(),
             Some(HttpError::InvalidHeaderValue)
         );
+    }
+
+    #[test]
+    fn test_from_error_uses_status_text_and_close() {
+        let r = Response::from_error(&HttpError::UnsupportedTransferEncoding);
+        assert_eq!(r.status(), 501);
+        assert!(r.closes());
+        assert_eq!(
+            r.header_value("content-type"),
+            Some(&b"text/plain; charset=utf-8"[..])
+        );
+        assert_eq!(
+            r.body_bytes(),
+            Some(
+                HttpError::UnsupportedTransferEncoding
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        // Errors without a request status still get a well-formed 400.
+        assert_eq!(
+            Response::from_error(&HttpError::UnexpectedEof).status(),
+            400
+        );
+        assert_eq!(
+            Response::from_error(&HttpError::InvalidState("x")).error(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_request_shortcuts_set_the_method() {
+        for (r, m) in [
+            (Request::head("/"), "HEAD"),
+            (Request::put("/"), "PUT"),
+            (Request::delete("/"), "DELETE"),
+            (Request::options("*"), "OPTIONS"),
+        ] {
+            assert_eq!(r.method(), m);
+            assert_eq!(r.error(), None);
+        }
+        assert_eq!(Request::put("*").error(), Some(HttpError::InvalidTarget));
+        assert_eq!(Request::head("/").method_kind, Method::Head);
+    }
+
+    #[test]
+    fn test_upgrade_builders_accept_product_tokens_and_refuse_h2c() {
+        let r = Response::switching_protocols("foo/2");
+        assert_eq!(r.error(), None);
+        assert_eq!(r.upgrade_protocol(), Some(&b"foo/2"[..]));
+        assert_eq!(
+            Response::switching_protocols("h2c").error(),
+            Some(HttpError::UpgradeNotOffered)
+        );
+        assert_eq!(
+            Response::switching_protocols("H2C").error(),
+            Some(HttpError::UpgradeNotOffered)
+        );
+        assert_eq!(
+            Response::switching_protocols("foo/").error(),
+            Some(HttpError::InvalidHeaderValue)
+        );
+        assert_eq!(Response::new(200).upgrade_protocol(), None);
+        assert_eq!(
+            Request::get("/").upgrade("h2c").error(),
+            Some(HttpError::UpgradeNotOffered)
+        );
+        assert!(Request::get("/").upgrade("websocket/13").upgrade);
+    }
+
+    /// Threat T-35: credential values never reach `Debug` output.
+    #[test]
+    fn test_debug_redacts_credential_fields() {
+        let r = Response::new(200)
+            .header("Set-Cookie", "sid=s3cr3t; HttpOnly")
+            .header("x-trace", "visible");
+        let shown = alloc::format!("{r:?}");
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+        assert!(shown.contains("<redacted 20 bytes>"), "{shown}");
+        assert!(shown.contains("visible"), "{shown}");
+        assert_eq!(
+            r.header_value("set-cookie"),
+            Some(&b"sid=s3cr3t; HttpOnly"[..])
+        );
+
+        let q = Request::get("/")
+            .header("host", "a")
+            .header("Authorization", "Bearer t0k3n")
+            .header("PROXY-AUTHORIZATION", "Basic cDpx")
+            .header("cookie", "a=b");
+        let shown = alloc::format!("{q:?}");
+        for secret in ["t0k3n", "cDpx", "a=b"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("\"host\", \"a\""), "{shown}");
     }
 
     #[test]

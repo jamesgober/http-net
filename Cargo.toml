@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -31,6 +31,9 @@ documentation = "https://docs.rs/http-net"
 
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
+
+# The fuzz crate and local tooling are not part of the published package.
+exclude = ["fuzz/", "dev/", ".github/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -61,6 +64,8 @@ std = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
+# Differential tests only (tests/prop_httparse.rs); never a runtime dependency.
+httparse  = "1.10"
 
 
 # BENCHMARKS
