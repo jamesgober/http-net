@@ -13,6 +13,97 @@
 
 ---
 
+## [0.3.0] - 2026-10-21
+
+Core, with the design lock revisited: `docs/API.md` now describes the
+whole 1.0 surface, each item marked with the version it ships in, and was
+approved before this release's code changes. This release closes a
+credential leak in 0.2.0's `Debug` output, refuses the `h2c` upgrade and
+switches to unoffered protocols, tightens `Host` validation, fills in the
+method and status registries, and adds fuzzing, an allocation-counting
+test, a differential test against `httparse`, and an RFC conformance table.
+See `docs/MIGRATION.md` for what a 0.2.0 user can notice.
+
+### Added
+
+- `VERSION`: the crate version string.
+- `HttpError::is_peer_error` and `HttpError::is_usage_error`, and the
+  variant `HttpError::UpgradeNotOffered`.
+- `Limits::buffer_capacity`: the input buffer's hard capacity, for planning
+  memory per connection.
+- `RequestHead::target_form` and the `TargetForm` enum (`Origin`,
+  `Absolute`, `Authority`, `Asterisk`).
+- `RequestHead::header_all`, `ResponseHead::header_all`, and the
+  `HeaderValues` iterator: every field with one name, in arrival order
+  (each `Set-Cookie` separately).
+- `RequestHead::content_length` and `ResponseHead::content_length`: the
+  declared `Content-Length`, telling `Some(0)` from an absent field.
+- `Method::is_safe`, `Method::is_idempotent`, `Method::index`, and
+  `MethodSet`, a bit set of methods with `write_allow` for the `Allow` field
+  of a `405`.
+- `StatusClass`, `status_class`, and the `status` module: a named `u16`
+  constant for every registered status code.
+- `Response::from_error`: the response for a request parse error (status,
+  short `text/plain` body, `close`); the blocking server uses it.
+- `Request::head`, `Request::put`, `Request::delete`, `Request::options`.
+- `docs/MIGRATION.md`, `dev/PLAN.md` (design and decision log), and
+  `.editorconfig`.
+- Tests: `tests/alloc.rs` (a counting allocator: 10,000 keep-alive requests
+  on one `ServerConn`, and 10,000 responses on one `ClientConn`, allocate
+  nothing after warm-up; 10 MiB hostile streams never grow a connection
+  past its buffer capacity), `tests/prop_httparse.rs` (differential against
+  `httparse` 1.10 on every head both accept, and a classified count of the
+  heads only `httparse` accepts), `tests/conformance.rs` (RFC 9112 and RFC
+  9110 statements as a table, one check each), `tests/redaction.rs`, and
+  new attack vectors for chunk-extension line ends (the Funky Chunks
+  classes), 0.CL and `Expect`-based desync, `h2c` and unoffered upgrades,
+  and `Host` escapes. The `docs/API.md` and `docs/MIGRATION.md` examples
+  run as doctests.
+- Fuzzing: six cargo-fuzz targets in `fuzz/` (`server_conn`, `client_conn`,
+  `chunk_line`, `reference_diff`, `httparse_diff`, `builders`), each run
+  for 60 s in CI.
+- CI: a `no_std` build for `thumbv7em-none-eabihf` and the fuzz smoke run.
+
+### Changed
+
+- `RequestHead::is_upgrade` is false for a request whose `Upgrade` offers
+  only `h2c`; such a request is served as plain HTTP/1.1 (RFC 9113 section
+  3.1).
+- `ServerConn::respond` refuses a `101` naming a protocol the request did
+  not offer with `UpgradeNotOffered` (RFC 9110 section 7.8). Names are
+  compared ASCII case-insensitively, and a name without a version answers
+  an offer of that name with any version.
+- `Response::switching_protocols` and `Request::upgrade` accept a
+  `name/version` product token and refuse `h2c` with `UpgradeNotOffered`.
+- The client accepts a status line without the space after the code
+  (`HTTP/1.1 200`); `reason()` is then empty.
+- `reason_phrase` covers every code in the IANA registry: `102`, `103`,
+  `207`, `208`, `226`, `305`, `402`, `407`, `423`, `424`, `425`, `451`,
+  `506`, `507`, `508`, `510`, and `511` were added; `306` and `418` stay
+  empty as reserved.
+- `Method` and the status registry moved to their own modules; the public
+  paths (`http_net::Method`, `http_net::reason_phrase`) are unchanged.
+- `dev/ROADMAP.md` follows the library specification's version plan: fuzz
+  targets moved from 0.9 to 0.3, the client `Expect`, interim responses,
+  and blocking deadlines to 0.4, client pipelining to 0.5; the async
+  adapter is withdrawn (no crate in this family takes an async runtime).
+
+### Security
+
+- `Debug` for `RequestHead`, `ResponseHead`, `Headers`, `HeaderValues`,
+  `ServerEvent`, `ClientEvent`, `Request`, `Response`, and
+  `blocking::ClientResponse` replaces the values of `authorization`,
+  `proxy-authorization`, `cookie`, and `set-cookie` with
+  `<redacted N bytes>`. In 0.2.0 a `{:?}` of a request printed session
+  cookies and bearer tokens in full.
+- `Host` values with an empty host before a port (`:80`) or a `%` not
+  followed by two hex digits are refused (`InvalidHost`), as are such
+  authorities in `CONNECT` and absolute-form targets (`InvalidTarget`).
+- The `h2c` upgrade is never honoured (h2c smuggling), and a server cannot
+  switch to a protocol the client did not offer.
+
+---
+
 ## [0.2.0] - 2026-10-12
 
 The foundation: a sans-IO HTTP/1.1 engine for servers and clients, strict
@@ -107,7 +198,7 @@ chunked bodies both ways, the protocol-upgrade hand-off for WebSocket,
 
 ## [0.1.0] - 2026-10-08
 
-Initial scaffold and repository bootstrap. No domain logic yet &mdash; this release establishes the structure, tooling, and quality gates the implementation will be built on.
+Initial scaffold and repository bootstrap. No domain logic yet; this release establishes the structure, tooling, and quality gates the implementation will be built on.
 
 ### Added
 
@@ -118,6 +209,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/http-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/http-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/http-net/releases/tag/v0.1.0

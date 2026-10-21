@@ -249,10 +249,16 @@ pub(crate) fn is_host_value(s: &[u8]) -> bool {
         }
     } else {
         match s.iter().rposition(|&b| b == b':') {
+            // A port needs a host: `:80` names no authority at all.
+            Some(0) => return false,
             Some(colon) => (&s[..colon], Some(&s[colon + 1..])),
             None => (s, None),
         }
     };
+    // reg-name allows pct-encoded triples only: `%` and two hex digits.
+    if !host_pct_ok(host) {
+        return false;
+    }
     let host_ok = host.iter().all(|&b| {
         b.is_ascii_alphanumeric()
             || matches!(
@@ -276,6 +282,28 @@ pub(crate) fn is_host_value(s: &[u8]) -> bool {
     });
     let port_ok = port.is_none_or(|p| p.iter().all(u8::is_ascii_digit));
     host_ok && port_ok
+}
+
+/// Whether every `%` in `host` starts a `%XX` triple.
+fn host_pct_ok(host: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(off) = host.get(i..).and_then(|rest| find_byte(b'%', rest)) {
+        let at = i + off;
+        match (host.get(at + 1), host.get(at + 2)) {
+            (Some(&h1), Some(&h2)) if has(h1, HEX) && has(h2, HEX) => i = at + 3,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Validates an upgrade protocol: `protocol-name ["/" protocol-version]`,
+/// both tokens (RFC 9110 section 7.8).
+pub(crate) fn is_protocol(s: &[u8]) -> bool {
+    match find_byte(b'/', s) {
+        Some(i) => is_token(&s[..i]) && is_token(&s[i + 1..]),
+        None => is_token(s),
+    }
 }
 
 /// Parses `1*DIGIT` into a `u64`, refusing signs, spaces, and overflow.
@@ -453,6 +481,39 @@ mod tests {
         assert!(!is_host_value(b"host:8x"));
         assert!(!is_host_value(b"[::1"));
         assert!(!is_host_value(b"a/b"));
+    }
+
+    #[test]
+    fn test_host_value_empty_host_with_port_is_refused() {
+        assert!(!is_host_value(b":80"));
+        assert!(!is_host_value(b":"));
+        // An empty port is allowed by RFC 3986 (`port = *DIGIT`), and the
+        // port is not bounded by the grammar.
+        assert!(is_host_value(b"example.com:"));
+        assert!(is_host_value(b"example.com:99999"));
+        assert!(is_host_value(b"[::1]:80"));
+        assert!(is_host_value(b"[v1.fe80::a]"));
+    }
+
+    #[test]
+    fn test_host_value_percent_escapes_need_two_hex_digits() {
+        assert!(is_host_value(b"a%41"));
+        assert!(is_host_value(b"%41%42:8080"));
+        assert!(!is_host_value(b"a%zz"));
+        assert!(!is_host_value(b"a%4"));
+        assert!(!is_host_value(b"a%"));
+        assert!(!is_host_value(b"a%4:80"));
+    }
+
+    #[test]
+    fn test_protocol_names_and_versions() {
+        assert!(is_protocol(b"websocket"));
+        assert!(is_protocol(b"foo/2"));
+        assert!(!is_protocol(b"foo/"));
+        assert!(!is_protocol(b"/2"));
+        assert!(!is_protocol(b"a/b/c"));
+        assert!(!is_protocol(b"a b"));
+        assert!(!is_protocol(b""));
     }
 
     #[test]

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.2.0</code>).</strong> The foundation is in place; the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.3.0</code>).</strong> The core is in place and the 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -41,7 +41,8 @@
 - A **[`ServerConn`](./docs/API.md#serverconn)** is the server side of one connection. Bytes go in with `feed` (or `read_buf` + `commit`); `poll` reports a **[`ServerEvent`](./docs/API.md#serverevent)**: a request head, body runs, the end of the request, or what it needs next. `respond` writes a **[`Response`](./docs/API.md#response)** into your output buffer.
 - A **[`ClientConn`](./docs/API.md#clientconn)** is the mirror image: `send_request` writes a **[`Request`](./docs/API.md#request)**, `poll` reports the response as **[`ClientEvent`](./docs/API.md#clientevent)**s.
 - **[`RequestHead`](./docs/API.md#requesthead)** and **[`ResponseHead`](./docs/API.md#responsehead)** are zero-copy views of a parsed head.
-- **[`Limits`](./docs/API.md#limits)** bounds every buffer; **[`HttpError`](./docs/API.md#httperror)** says exactly what was refused and which status to answer with.
+- **[`Limits`](./docs/API.md#limits)** bounds every buffer; **[`HttpError`](./docs/API.md#httperror)** says exactly what was refused and which status to answer with, and [`Response::from_error`](./docs/API.md#responsefrom_error) builds that answer.
+- **[`Method`](./docs/API.md#method)** and **[`MethodSet`](./docs/API.md#methodset)** classify methods (safe, idempotent, a bit set for routers and `Allow`); [`reason_phrase`](./docs/API.md#reason_phrase) and the [`status`](./docs/API.md#status-constants) constants cover the whole IANA status registry.
 - The **[`blocking`](./docs/API.md#blocking-adapter)** module (feature `std`) drives both over `std::net`: a bounded thread-per-connection `Server`, a per-connection `Connection`, and `get`.
 
 <br>
@@ -50,13 +51,17 @@ What it guarantees, and how each guarantee is checked:
 
 | Guarantee | How it is held |
 |---|---|
-| Parsing follows RFC 9112; malformed messages get a precise error, never a guess. | 15 request accept cases, 65 request reject cases, and 16 response cases as data (`tests/rfc_cases.rs`), each run whole and one byte at a time; a differential test against an independent whole-buffer reference parser over every single-byte mutation of eight seed requests plus 8,192 random multi-byte mutations (`tests/prop_reference.rs`). |
-| Request smuggling vectors are refused. | 25 CL.TE / TE.CL / TE.TE / line-ending vectors, each at every split point (`tests/smuggling.rs`); after an error the connection never parses another request; outgoing messages cannot carry framing headers or CR/LF. An adversarial suite (`tests/adversarial.rs`) adds target forms and the authority, `Expect: 100-continue`, chunk and trailer edges, cumulative chunk-extension and interim-response budgets, and integer edges. |
+| Parsing follows RFC 9112; malformed messages get a precise error, never a guess. | 17 request accept cases, 66 request reject cases, and 18 response cases as data (`tests/rfc_cases.rs`), each run whole and one byte at a time; a differential test against an independent whole-buffer reference parser over every single-byte mutation of eight seed requests plus 8,192 random multi-byte mutations (`tests/prop_reference.rs`). |
+| Request smuggling vectors are refused. | 25 CL.TE / TE.CL / TE.TE / line-ending vectors and 7 chunk-extension line-end vectors (the Funky Chunks classes), each at every split point (`tests/smuggling.rs`); after an error the connection never parses another request; outgoing messages cannot carry framing headers or CR/LF. An adversarial suite (`tests/adversarial.rs`) adds target forms and the authority, `Host` escapes, `Expect: 100-continue` and `Expect`-based desync shapes, 0.CL desync, `h2c` and unoffered upgrades, chunk and trailer edges, cumulative chunk-extension and interim-response budgets, and integer edges. |
 | Limits are enforced before allocation. | Boundary tests at the limit and one past it for line length, header bytes, header count, and body; declared lengths and chunk sizes are checked before their data is read; the input buffer never exceeds `2 * (line + headers) + 16 KiB`, and the test drivers assert the parser never waits for input with a full buffer. |
 | Nothing panics on hostile bytes. | Property tests feed arbitrary bytes and dictionary-built near-HTTP to both connections, from the first byte and behind valid heads (so body, chunk, and trailer states are reached), whole and split, with default and tiny limits. |
 | The parse does not depend on how input is split. | Property tests compare whole, split, and byte-at-a-time feeding. |
 | Serialize and parse round-trip. | Property tests: requests from `ClientConn` parsed by `ServerConn`, responses the other way, with full, chunked, and fixed-length streamed bodies; absolute-form targets; keep-alive intent. |
 | Slow or stuck peers cannot pin the server. | Socket tests: a head or body trickled inside the read timeout is cut off by the request timeout with `408`; a refused client that keeps sending cannot stall the accept loop; lingering close ends after 1 s however the peer behaves. |
+| Credentials never reach logs through `Debug`. | `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` values print as `<redacted N bytes>` in every `Debug` output of the crate; `tests/redaction.rs` checks every type that prints fields, in every case spelling of the names. |
+| Steady-state parsing allocates nothing. | A counting allocator (`tests/alloc.rs`): 10,000 keep-alive requests on one `ServerConn`, and 10,000 responses on one `ClientConn`, allocate nothing after warm-up; 10 MiB hostile streams never grow a connection past its buffer capacity. |
+| It agrees with other parsers where it accepts. | A differential test against `httparse` (`tests/prop_httparse.rs`): on every request head both accept, the length, method, target, version, and fields match; every head only `httparse` accepts is one of the documented stricter refusals. An RFC 9112 / 9110 conformance table (`tests/conformance.rs`) checks one statement per row. |
+| It survives fuzzing. | Six cargo-fuzz targets (`fuzz/`): both connections under fuzzer-chosen splits and limits, the chunk-line grammar, the builders, and differential oracles against the reference parser and `httparse`, each run in CI on every push. |
 | It works over real sockets. | `tests/localhost.rs`: the Tier-1 server and client, keep-alive, pipelining, a 200 KB chunked upload echoed back, streamed responses, error answers, `Expect: 100-continue`, the connection cap, the upgrade hand-off, and shutdown. |
 
 <hr>
@@ -66,14 +71,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.2"
+http-net = "0.3"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.2", default-features = false }
+http-net = { version = "0.3", default-features = false }
 ```
 
 <hr>
@@ -178,9 +183,9 @@ cargo run --example get -- http://127.0.0.1:8080/
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- Interim responses other than `100 Continue` from the server (for example `103 Early Hints`), sending `Expect: 100-continue` from the client, a client with several outstanding pipelined requests, and an async adapter: v0.5.0 (see the [roadmap](./dev/ROADMAP.md)). The server already answers `Expect: 100-continue` and serves pipelined requests in order.
-- `cargo fuzz` targets: v0.9.0. Until then, property tests feed arbitrary bytes to both connections, from the first byte and behind valid heads.
-- A total deadline per response on the blocking client: its 30 s timeouts apply to each connect, read, and write.
+- Interim responses other than `100 Continue` from the server (for example `103 Early Hints`), sending `Expect: 100-continue` from the client, trailers exposed and sent, a cached `Date`, and total deadlines in the blocking server and client: v0.4.0. The server already answers `Expect: 100-continue`; the blocking adapter's timeouts apply to each connect, read, and write.
+- Client pipelining, the allocation-free Tier-3 writer and stateless parsers, spans for zero-copy copy-out, and a standalone chunked decoder: v0.5.0. The server already serves pipelined requests in order. See the [roadmap](./dev/ROADMAP.md) and the planned items in [`docs/API.md`](./docs/API.md).
+- An async runtime or adapter: never; drive the sans-IO core from any loop.
 - Content codings (gzip and others): a body is delivered as sent, and a `Transfer-Encoding` other than `chunked` is refused with 501.
 
 <hr>
@@ -188,16 +193,16 @@ cargo run --example get -- http://127.0.0.1:8080/
 
 ## Performance
 
-Criterion medians on Windows x86_64 (Rust stable, release profile), from `cargo bench` (1 s warm-up, 3 s measurement):
+Criterion medians for 0.3.0 on Windows x86_64 (Rust stable, release profile), from `cargo bench`, measured back to back with a 0.2.0 build on the same machine (the largest consistent difference from 0.2.0 is about +2%, on the head and pipelined benchmarks; the rest are within run-to-run noise):
 
 | Benchmark | Median |
 |---|---:|
-| 12-field browser GET, parsed and answered | ~280 ns |
-| 100,000 pipelined GETs in 16 KiB reads | ~8.4 ms (about 11.9 M requests/s) |
-| 1 MiB body, `Content-Length`, 16 KiB reads | ~13 µs |
-| 1 MiB body, chunked in 4 KiB chunks | ~17 µs |
-| response with five fields and a 1 KiB body, serialized | ~75 ns |
-| client parsing a 1 KiB response | ~98 ns |
+| 12-field browser GET, parsed and answered | ~298 ns |
+| 100,000 pipelined GETs in 16 KiB reads | ~8.9 ms (about 11.2 M requests/s) |
+| 1 MiB body, `Content-Length`, 16 KiB reads | ~13.5 µs |
+| 1 MiB body, chunked in 4 KiB chunks | ~16.9 µs |
+| response with five fields and a 1 KiB body, serialized | ~78 ns |
+| client parsing a 1 KiB response | ~101 ns |
 
 These are library-only numbers: no sockets are involved. Body events borrow the input buffer, so the 1 MiB cases measure one copy into the buffer plus framing.
 
@@ -214,8 +219,8 @@ See <a href="./dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for enginee
     <h2>License</h2>
     <p>Licensed under either of</p>
     <ul>
-        <li><b>Apache License, Version 2.0</b> &mdash; <a href="./LICENSE-APACHE">LICENSE-APACHE</a></li>
-        <li><b>MIT License</b> &mdash; <a href="./LICENSE-MIT">LICENSE-MIT</a></li>
+        <li><b>Apache License, Version 2.0</b>: <a href="./LICENSE-APACHE">LICENSE-APACHE</a></li>
+        <li><b>MIT License</b>: <a href="./LICENSE-MIT">LICENSE-MIT</a></li>
     </ul>
     <p>at your option.</p>
 </div>

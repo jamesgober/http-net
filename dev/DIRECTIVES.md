@@ -1,6 +1,6 @@
-# http-net &mdash; Engineering Directives
+# http-net - Engineering Directives
 
-> Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative) and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
+> Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative), `dev/PLAN.md` (design and decision log), and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
 > LexerSketch plan: `C:/Dev/libraries/Rust/lang-collection/_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
@@ -39,7 +39,7 @@ LexerSketch Studio's local server and the publish step's HTTPS client both need 
 3. `cargo audit` + `cargo deny check` pass.
 4. No `unwrap`/`expect`/`todo!`/`dbg!` in shipping code.
 5. A Tier-1 API exists and headlines the docs.
-6. Property tests cover every section-4 invariant; a fuzz target exists for every decoder or parser.
+6. Property tests cover every section-4 invariant; a cargo-fuzz target in `fuzz/` exists for every decoder or parser and runs in CI (60 s smoke run per target).
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
 9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).

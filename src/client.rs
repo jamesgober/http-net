@@ -7,11 +7,11 @@ use crate::{
     buffer::Buffer,
     error::HttpError,
     head::{
-        Asked, HeadKind, HeadScanner, Method, Progress, ResponseHead, ResponseInfo,
-        interpret_response,
+        Asked, HeadKind, HeadScanner, Progress, ResponseHead, ResponseInfo, interpret_response,
     },
     limits::Limits,
     message::{OutBody, Request},
+    method::Method,
 };
 
 /// What a [`ClientConn`] has for the caller after [`poll`](ClientConn::poll).
@@ -165,7 +165,7 @@ impl ClientConn {
     #[must_use]
     pub fn with_limits(limits: Limits) -> Self {
         Self {
-            buf: Buffer::new(limits.buffer_cap()),
+            buf: Buffer::new(limits.buffer_capacity()),
             limits,
             scanner: HeadScanner::new(),
             trailers: HeadScanner::new(),

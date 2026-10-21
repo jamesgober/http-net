@@ -554,3 +554,292 @@ fn test_chunk_sizes_cannot_overflow_the_running_total() {
         Some(&Ev::Err(HttpError::BodyTooLarge))
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.3 attack vectors: 0.CL, Expect, Host, h2c, offered protocols
+// ---------------------------------------------------------------------------
+
+/// Runs `input` whole and split at every byte; all runs must agree.
+fn whole_and_split(input: &[u8]) -> Vec<Ev> {
+    let whole = drive_server(&[input], Limits::new());
+    for cut in 1..input.len() {
+        let split = drive_server(&[&input[..cut], &input[cut..]], Limits::new());
+        assert_eq!(
+            whole,
+            split,
+            "split at {cut} changed the result for {:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
+    whole
+}
+
+fn targets(events: &[Ev]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Head { target, .. } => Some(target.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// T-14, 0.CL desync (E-91): a GET with `Content-Length` and a body. A hop
+/// that ignores the body on GET would read it as the next request; this
+/// crate honours `Content-Length` on every method, so the body stays body
+/// and the pipelined request after it is the second request.
+#[test]
+fn test_get_with_content_length_body_then_pipelined_request_frames_both() {
+    let input = b"GET /a HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nGET /GET /b HTTP/1.1\r\nHost: a\r\n\r\n";
+    let events = whole_and_split(input);
+    assert_eq!(targets(&events), ["/a", "/b"], "{events:?}");
+    assert!(events.contains(&Ev::Body(b"GET /".to_vec())), "{events:?}");
+    let Ev::Head { framing, .. } = &events[0] else {
+        panic!("{events:?}");
+    };
+    assert_eq!(*framing, BodyFraming::Length(5));
+}
+
+/// T-14, 0.CL: answering before the declared body was read closes the
+/// connection, so whatever the peer sends as "body" is never parsed as a
+/// request.
+#[test]
+fn test_early_answer_with_unread_body_closes_before_smuggled_request() {
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 30\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+    );
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Request(_))));
+    let mut out = Vec::new();
+    conn.respond(&Response::new(401), &mut out).unwrap();
+    assert!(out.windows(17).any(|w| w == b"connection: close"));
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Closed)));
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Closed)));
+}
+
+/// T-15, Expect-based desync: obfuscated `Expect` values make hops disagree
+/// on whether a body follows. Here `Expect` never changes framing: each
+/// request is framed by its `Content-Length`, the pipelined request after
+/// it is parsed as the second request, and `expects_continue()` is true
+/// exactly for a `100-continue` list element (case-insensitive, OWS
+/// trimmed) on an HTTP/1.1 request with a body.
+#[test]
+fn test_expect_variants_never_change_framing() {
+    let cases: &[(&str, &str, bool)] = &[
+        ("leading space", "Expect:  100-continue\r\n", true),
+        ("leading tab", "Expect:\t100-continue\r\n", true),
+        ("mixed case", "Expect: 100-Continue\r\n", true),
+        ("trailing junk", "Expect: 100-continuex\r\n", false),
+        ("unknown expectation", "Expect: foo\r\n", false),
+        ("in a list", "Expect: foo, 100-continue\r\n", true),
+        (
+            "duplicate fields",
+            "Expect: 100-continue\r\nExpect: 100-continue\r\n",
+            true,
+        ),
+        ("empty", "Expect:\r\n", false),
+    ];
+    for (name, expect, continues) in cases {
+        let input = format!(
+            "POST /a HTTP/1.1\r\nHost: a\r\n{expect}Content-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: a\r\n\r\n"
+        );
+        let events = whole_and_split(input.as_bytes());
+        assert_eq!(targets(&events), ["/a", "/b"], "{name}: {events:?}");
+        assert!(events.contains(&Ev::Body(b"hello".to_vec())), "{name}");
+        let mut conn = ServerConn::new();
+        let _ = conn.feed(input.as_bytes());
+        let ServerEvent::Request(req) = conn.poll().unwrap() else {
+            panic!("{name}");
+        };
+        assert_eq!(req.framing(), BodyFraming::Length(5), "{name}");
+        assert_eq!(req.expects_continue(), *continues, "{name}");
+    }
+
+    // On a GET without a body there is nothing to wait for.
+    let input =
+        b"GET /a HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n";
+    let events = whole_and_split(input);
+    assert_eq!(targets(&events), ["/a", "/b"]);
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(input);
+    let ServerEvent::Request(req) = conn.poll().unwrap() else {
+        panic!();
+    };
+    assert_eq!(req.framing(), BodyFraming::None);
+    assert!(!req.expects_continue());
+}
+
+/// T-18, Host attacks (E-67 to E-72): an empty host before a port and a `%`
+/// not followed by two hex digits are refused; other RFC 3986 shapes are
+/// accepted. The same rules apply to authority-form and absolute-form
+/// targets and to an outgoing `host` field.
+#[test]
+fn test_host_percent_escapes_and_empty_host_with_port() {
+    for bad in [":80", "a%zz", "a%4", "a%", "%", "a%g1"] {
+        let input = format!("GET / HTTP/1.1\r\nHost: {bad}\r\n\r\n");
+        assert_eq!(
+            server_error(input.as_bytes()),
+            Some(HttpError::InvalidHost),
+            "Host: {bad}"
+        );
+    }
+    for good in [
+        "a%41",
+        "[v1.fe80::a]",
+        "example.com:",
+        "example.com:99999",
+        "",
+    ] {
+        let input = format!("GET / HTTP/1.1\r\nHost: {good}\r\n\r\n");
+        let mut conn = ServerConn::new();
+        let _ = conn.feed(input.as_bytes());
+        let ServerEvent::Request(req) = conn.poll().unwrap() else {
+            panic!("Host: {good} refused");
+        };
+        assert_eq!(req.host(), Some(good));
+    }
+    for target in ["a%4:443", "a%zz:443", ":443"] {
+        let input = format!("CONNECT {target} HTTP/1.1\r\nHost: a:443\r\n\r\n");
+        assert_eq!(
+            server_error(input.as_bytes()),
+            Some(HttpError::InvalidTarget),
+            "CONNECT {target}"
+        );
+    }
+    for target in ["http://a%zz/", "http://a%4/x", "http://:80/"] {
+        let input = format!("GET {target} HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert_eq!(
+            server_error(input.as_bytes()),
+            Some(HttpError::InvalidTarget),
+            "{target}"
+        );
+    }
+    let mut conn = ClientConn::new();
+    for bad in [":80", "a%zz"] {
+        let request = Request::get("/").header("host", bad);
+        assert_eq!(
+            conn.send_request(&request, &mut Vec::new()),
+            Err(HttpError::InvalidHost),
+            "host {bad}"
+        );
+    }
+}
+
+/// T-20, h2c smuggling (E-141): `Upgrade: h2c` with `HTTP2-Settings` is
+/// never an upgrade offer; the request is served as plain HTTP/1.1 and the
+/// connection stays keep-alive.
+#[test]
+fn test_h2c_upgrade_is_served_as_http11() {
+    let input = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAA\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n";
+    let events = whole_and_split(input);
+    assert_eq!(targets(&events), ["/", "/next"], "{events:?}");
+    assert!(!events.iter().any(|e| matches!(e, Ev::Upgraded(_))));
+
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(input);
+    let ServerEvent::Request(req) = conn.poll().unwrap() else {
+        panic!();
+    };
+    assert!(!req.is_upgrade());
+    assert!(matches!(conn.poll(), Ok(ServerEvent::RequestEnd)));
+    let mut out = Vec::new();
+    assert_eq!(
+        conn.respond(&Response::switching_protocols("h2c"), &mut out),
+        Err(HttpError::UpgradeNotOffered)
+    );
+    conn.respond(&Response::new(200), &mut out).unwrap();
+    assert!(out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(!out.windows(17).any(|w| w == b"connection: close"));
+    assert!(!out.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")));
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Request(_))));
+}
+
+/// T-20 (E-142): `h2c` beside another protocol: the request is an upgrade
+/// offer for the other protocol only.
+#[test]
+fn test_h2c_beside_websocket_offers_websocket_only() {
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(
+        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: h2c, websocket\r\n\r\n",
+    );
+    let ServerEvent::Request(req) = conn.poll().unwrap() else {
+        panic!();
+    };
+    assert!(req.is_upgrade());
+    assert!(matches!(conn.poll(), Ok(ServerEvent::RequestEnd)));
+    let mut out = Vec::new();
+    assert_eq!(
+        conn.respond(&Response::switching_protocols("h2c"), &mut out),
+        Err(HttpError::UpgradeNotOffered)
+    );
+    assert!(out.is_empty());
+    conn.respond(&Response::switching_protocols("websocket"), &mut out)
+        .unwrap();
+    assert!(conn.is_upgraded());
+}
+
+/// T-20: a client never asks for h2c.
+#[test]
+fn test_client_refuses_to_offer_h2c() {
+    let mut conn = ClientConn::new();
+    for protocol in ["h2c", "H2C"] {
+        let request = Request::get("/").header("host", "a").upgrade(protocol);
+        assert_eq!(
+            conn.send_request(&request, &mut Vec::new()),
+            Err(HttpError::UpgradeNotOffered),
+            "{protocol}"
+        );
+    }
+    // The refusal left the connection usable.
+    conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())
+        .unwrap();
+}
+
+/// T-21, upgrade smuggling (E-143): a 101 must name a protocol the request
+/// offered (RFC 9110 section 7.8). A refused 101 writes nothing and leaves
+/// the connection in HTTP, able to send a normal response.
+#[test]
+fn test_switching_protocols_must_name_an_offered_protocol() {
+    fn answer(offer: &str, protocol: &str) -> (Result<(), HttpError>, ServerConn) {
+        let mut conn = ServerConn::new();
+        let input =
+            format!("GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: {offer}\r\n\r\n");
+        let _ = conn.feed(input.as_bytes());
+        while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+        let mut out = Vec::new();
+        let result = conn.respond(&Response::switching_protocols(protocol), &mut out);
+        assert_eq!(result.is_ok(), !out.is_empty(), "{offer} / {protocol}");
+        (result, conn)
+    }
+
+    let (result, mut conn) = answer("websocket", "ftp");
+    assert_eq!(result, Err(HttpError::UpgradeNotOffered));
+    assert!(!conn.is_upgraded());
+    let mut out = Vec::new();
+    conn.respond(&Response::new(426), &mut out).unwrap();
+    assert!(out.starts_with(b"HTTP/1.1 426 Upgrade Required\r\n"));
+    assert!(!conn.is_upgraded());
+
+    for (offer, protocol, ok) in [
+        ("WebSocket", "websocket", true),
+        ("websocket", "WEBSOCKET", true),
+        ("websocket/13", "websocket", true),
+        ("foo/2", "foo/2", true),
+        ("foo/2", "foo/3", false),
+        ("foo/2", "foo", true),
+        ("foo", "foo/2", false),
+        ("a, b, c", "c", true),
+        ("a, b, c", "d", false),
+    ] {
+        let (result, conn) = answer(offer, protocol);
+        assert_eq!(
+            result.is_ok(),
+            ok,
+            "offer {offer:?}, 101 {protocol:?}: {result:?}"
+        );
+        assert_eq!(conn.is_upgraded(), ok);
+        if !ok {
+            assert_eq!(result, Err(HttpError::UpgradeNotOffered));
+        }
+    }
+}
