@@ -88,21 +88,23 @@ jobs:
         with:
           toolchain: nightly
       # Not in install-action's manifest list; it falls back to
-      # cargo-binstall, which fetches the published binary.
+      # cargo-binstall, which fetches the published binary. That binary is a
+      # musl build and would default to building for musl, which the address
+      # sanitizer cannot use, so every cargo-fuzz call names the gnu target.
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - name: Build the target
         working-directory: fuzz
-        run: cargo +nightly fuzz build ${{ matrix.target }}
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu ${{ matrix.target }}
       # The corpus lives outside the repository (in the runner's temp
       # directory), so a run never writes into the checkout.
       - name: Run for 60 seconds
         working-directory: fuzz
         run: |
           mkdir -p "$RUNNER_TEMP/corpus/${{ matrix.target }}" "$RUNNER_TEMP/artifacts/${{ matrix.target }}"
-          cargo +nightly fuzz run ${{ matrix.target }} "$RUNNER_TEMP/corpus/${{ matrix.target }}" -- \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} "$RUNNER_TEMP/corpus/${{ matrix.target }}" -- \
             -max_total_time=60 -dict=http.dict \
             -artifact_prefix="$RUNNER_TEMP/artifacts/${{ matrix.target }}/"
       - name: Upload the crashing input
