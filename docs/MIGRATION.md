@@ -23,11 +23,24 @@ input instead of parsing them.
 prior-knowledge HTTP/2: match `Http2Preface` (or call `is_h2_preface`
 before feeding the connection) and route to an HTTP/2 engine.
 
-### Added in 0.5 (forwarding and leniency)
+### Added in 0.5
 
+- Client pipelining: `Limits::with_pipeline_depth`, `ClientConn::outstanding`,
+  `ClientConn::can_send` (the default depth of 1 keeps 0.4 behaviour).
+- Reuse and pooling on both connections: `reset`, `with_buffer`,
+  `into_buffer`, `shrink_idle`; `ServerConn::set_wipe` (off by default).
+- Spans and copied heads: `Span`, `FieldSpan`, `RawHead`, `RequestHead::raw`,
+  `ResponseHead::raw`, `RequestHead::copy_into`, `RequestHead::to_owned`,
+  `OwnedRequestHead`, `HeadFacts`.
+- Stateless parsers: `parse_request_head`, `parse_response_head`, `Parsed`,
+  `ParsedRequest`, `ParsedResponse`, `Asked`.
+- The Tier-3 writer: `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan`,
+  `ServerConn::write_head`, `respond_into`, `send_body_into`,
+  `end_body_into`; `Response::clear`.
+- `ChunkedDecoder` and `ChunkStep`.
 - `Request::forward_from`, `is_hop_by_hop`, `RequestHead::connection_options`.
 - `is_h2_preface`.
-- `ClientLeniency`, `ClientConn::set_leniency`.
+- `ClientLeniency`, `ClientConn::set_leniency` (strict by default).
 
 ## 0.3 to 0.4
 

@@ -1,9 +1,9 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.4.0`).** This file is the approved
+> and examples. **Status: pre-1.0 (`0.5.0`).** This file is the approved
 > design of the 1.0 surface: each item says the version it ships in. Items
-> marked **exists**, **0.3**, or **0.4** are in this build; items marked
+> marked **exists**, **0.3**, **0.4**, or **0.5** are in this build; items marked
 > with a later version are the plan and are not in the crate yet. The
 > surface may still change in the 0.x series and is frozen at `1.0.0`.
 
@@ -35,7 +35,7 @@
   - [Variants](#variants)
 - [`Limits`](#limits)
   - [`Limits::buffer_capacity`](#limitsbuffer_capacity)
-  - [Planned budgets](#planned-budgets)
+  - [`Limits::with_pipeline_depth`](#limitswith_pipeline_depth)
 - [`ServerConn`](#serverconn)
   - [Input: `feed`, `read_buf`, `commit`, `feed_eof`](#input-feed-read_buf-commit-feed_eof)
   - [`ServerConn::poll`](#serverconnpoll)
@@ -48,7 +48,7 @@
   - [`ServerConn::respond_with_date`](#serverconnrespond_with_date)
   - [Keep-alive control and progress](#keep-alive-control-and-progress)
   - [Upgrades: `is_upgraded`, `remaining_input`](#upgrades-is_upgraded-remaining_input)
-  - [Planned `ServerConn` methods](#planned-serverconn-methods)
+  - [Tier-3 `ServerConn` methods](#tier-3-serverconn-methods)
 - [`ServerEvent`](#serverevent)
 - [`Progress`](#progress)
 - [`RequestHead`](#requesthead)
@@ -82,7 +82,7 @@
   - [`ClientConn::send_request`](#clientconnsend_request)
   - [Interim responses, `Expect`, trailers, and reuse](#interim-responses-expect-trailers-and-reuse)
   - [`ClientConn::set_leniency` and `ClientLeniency`](#clientconnset_leniency-and-clientleniency)
-  - [Planned `ClientConn` methods](#planned-clientconn-methods)
+  - [`ClientConn` methods added in 0.5](#clientconn-methods-added-in-05)
 - [`ClientEvent`](#clientevent)
 - [Tier 3: stateless parsers, chunked decoder, output](#tier-3-stateless-parsers-chunked-decoder-output)
   - [`is_hop_by_hop`](#is_hop_by_hop)
@@ -153,21 +153,21 @@ Each entry gives the signature, what it does, its errors, and an example.
 | exists; 0.3 | in 0.2.0, changed in 0.3.0 as described |
 | 0.3 | new in 0.3.0 |
 | 0.4 | new in 0.4.0 |
-| 0.5 | new in 0.5.0 where this build has it (spans, raw and owned heads, stateless parsers); otherwise planned |
+| 0.5 | new in 0.5.0 |
 | 0.6, after 1.0 | planned; not in this build. Signatures are the approved design and may still be adjusted before they ship. |
 
 ## Installation
 
 ```toml
 [dependencies]
-http-net = "0.4"
+http-net = "0.5"
 ```
 
 `no_std` (the core needs `alloc` only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.4", default-features = false }
+http-net = { version = "0.5", default-features = false }
 ```
 
 ## Quick start
@@ -234,9 +234,11 @@ ask for keep-alive, when the response asked to close, when a response was
 sent while request body bytes were still unread (a request without a body
 can be answered at `Request` and stays keep-alive), or after a parse error.
 
-A client connection has one request outstanding at a time and returns to
-`Idle` when the response allows reuse. Client pipelining (several
-outstanding idempotent requests) is planned for 0.5.
+A client connection has one request outstanding at a time by default and
+returns to `Idle` when the response allows reuse. With a pipeline depth
+above 1 (0.5) it accepts more idempotent requests before the first response
+arrives and matches the responses to them in order: see
+[Pipelining](#pipelining).
 
 ### Body framing
 
@@ -1085,7 +1087,7 @@ assert!(back.iter().all(|&b| b == 0));
 # Ok::<(), http_net::HttpError>(())
 ```
 
-### Planned `ServerConn` methods
+### Tier-3 `ServerConn` methods
 
 | Method | Behaviour | Errors | Ships |
 |---|---|---|---|
@@ -2269,7 +2271,7 @@ assert_eq!(resp.header("x-long"), Some(&b"one,   two"[..]));
 # Ok::<(), http_net::HttpError>(())
 ```
 
-### Planned `ClientConn` methods
+### `ClientConn` methods added in 0.5
 
 | Method | Behaviour | Ships |
 |---|---|---|
@@ -2302,9 +2304,9 @@ the connection cannot carry another request. **Ships:** exists;
 
 ## Tier 3: stateless parsers, chunked decoder, output
 
-Planned for 0.5 (0.6 for `respond_head_only`), allocation-free, sharing
-code with the connections rather than copying it. The stateless parsers
-ship in 0.5: see [Stateless head parsers](#stateless-head-parsers).
+New in 0.5 (`respond_head_only` is planned for 0.6), allocation-free, and
+sharing code with the connections rather than copying it. The stateless
+parsers are described in [Stateless head parsers](#stateless-head-parsers).
 
 ```rust,ignore
 pub struct ChunkedDecoder { /* state, budgets */ }

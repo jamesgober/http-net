@@ -163,19 +163,19 @@ Exit criteria:
 - [x] Benchmarks within 5% of 0.3.0.
 - [x] Release routine completed.
 
-## v0.5.0 - Feature complete
-- [ ] Client pipelining (`Limits::pipeline_depth`, `outstanding`, `can_send`).
-- [ ] Connection reuse: `reset`, `with_buffer`, `into_buffer`, `shrink_idle`; optional wipe of consumed input (`set_wipe`).
-- [ ] Tier 3: spans and raw heads (`Span`, `FieldSpan`, `RawHead`), `copy_into` and `HeadFacts` (passport copy-out, OD-12), `OwnedRequestHead`; stateless `parse_request_head` / `parse_response_head`; `ChunkedDecoder`; the `Output` trait, `ResponseHeadRef`, `write_head`, `respond_into`; `Response::clear`; `Request::forward_from` and `is_hop_by_hop`; `connection_options`; `is_h2_preface` and `Http2Preface`.
-- [ ] Opt-in client leniency for response obs-fold (`ClientLeniency`, in-place replacement).
-- [ ] Documentation: `docs/ARCHITECTURE.md`, `docs/SECURITY.md` draft; examples `passport`, `proxy_forward`, `pipelined_client`, `trailers`, `early_hints`.
+## v0.5.0 - Feature complete (DONE, 2026-10-21)
+- [x] Client pipelining (`Limits::pipeline_depth`, `outstanding`, `can_send`).
+- [x] Connection reuse: `reset`, `with_buffer`, `into_buffer`, `shrink_idle`; optional wipe of consumed input (`set_wipe`).
+- [x] Tier 3: spans and raw heads (`Span`, `FieldSpan`, `RawHead`), `copy_into` and `HeadFacts` (passport copy-out, OD-12), `OwnedRequestHead`; stateless `parse_request_head` / `parse_response_head`; `ChunkedDecoder`; the `Output` trait, `ResponseHeadRef`, `write_head`, `respond_into`; `Response::clear`; `Request::forward_from` and `is_hop_by_hop`; `connection_options`; `is_h2_preface` and `Http2Preface`.
+- [x] Opt-in client leniency for response obs-fold (`ClientLeniency`, in-place replacement).
+- [x] Documentation: `docs/ARCHITECTURE.md`, `docs/SECURITY.md` draft; examples `passport`, `proxy_forward`, `pipelined_client`, `trailers`, `early_hints`.
 
 Exit criteria:
-- [ ] Every functional requirement of the specification implemented and tested.
-- [ ] Counting allocator: Tier 3 parse and write paths allocate 0 bytes ever.
-- [ ] Stateless parser and `ChunkedDecoder` proven equal to the connection paths by property tests and fuzz targets.
-- [ ] `OwnedRequestHead::from_parts` refuses every tampered-span case in its unit tests.
-- [ ] Release routine completed.
+- [x] Every functional requirement of the specification implemented and tested.
+- [x] Counting allocator: Tier 3 parse and write paths allocate 0 bytes ever.
+- [x] Stateless parser and `ChunkedDecoder` proven equal to the connection paths by property tests and fuzz targets.
+- [x] `OwnedRequestHead::from_parts` refuses every tampered-span case in its unit tests.
+- [x] Release routine completed.
 
 ## v0.6.0 - Optimisation
 - [ ] `ServerConn::respond_head_only` (head-only write for vectored sends).

@@ -11,6 +11,17 @@
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] - 2026-10-21
+
+Feature complete: client pipelining, connection reuse and buffer pooling,
+optional wiping of consumed input, and the allocation-free Tier-3 surface
+(spans and copied heads, stateless parsers, the `Output` writer, a
+standalone chunked decoder, request forwarding, HTTP/2 preface detection),
+plus opt-in client tolerance for folded response fields. See
+`docs/MIGRATION.md` for what a 0.4 user can notice.
+
 ### Added
 
 - Client pipelining: `Limits::with_pipeline_depth` / `pipeline_depth`
@@ -30,6 +41,15 @@
   obsolete line folding in response heads, replaced by spaces in place
   (RFC 9112 section 5.2); every other refusal stays.
 - Example `proxy_forward`.
+- Example `pipelined_client`: four requests in flight on one connection.
+- `docs/ARCHITECTURE.md` (modules, data flow, state machines, framing,
+  memory) and the `docs/SECURITY.md` draft (threat model T-1 to T-42 with
+  each defence, test, and cost; the deliberate strictness choices).
+- Tests: pipelining, reuse, and wiping (`tests/pipelining_reuse.rs`, with a
+  property test and control runs for the wipe); allocation tests for
+  pipelined responses, wiping, and reset; the `client_conn` fuzz target
+  runs with fold leniency and checks that leniency changes nothing on
+  unfolded input.
 - Spans and raw heads (Tier 3): `Span` and `FieldSpan`, public `u32`
   offsets into a head's bytes (`Span::get` returns an empty slice for a
   span out of range and never panics); `RequestHead::raw` and
@@ -372,7 +392,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/http-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/http-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/http-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/http-net/compare/v0.1.0...v0.2.0
