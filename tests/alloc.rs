@@ -558,7 +558,7 @@ fn test_client_pipelined_steady_state_allocates_nothing() {
     let request = Request::get("/api/items").header("host", "api.example.com");
     let mut out = Vec::with_capacity(8 * 64);
     let wire = RESPONSE_JSON.repeat(8);
-    let mut round = |conn: &mut ClientConn, out: &mut Vec<u8>| {
+    let round = |conn: &mut ClientConn, out: &mut Vec<u8>| {
         out.clear();
         for _ in 0..8 {
             conn.send_request(&request, out).expect("send");
