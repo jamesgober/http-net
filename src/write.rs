@@ -247,11 +247,7 @@ impl ServerConn {
         date: Option<&HttpDate>,
         out: &mut O,
     ) -> Result<BodyPlan, HttpError> {
-        self.start_response(
-            &crate::server::HeadSpec::from_ref(head),
-            date.map(HttpDate::as_bytes).map(|d| &d[..]),
-            out,
-        )
+        self.start_response(head, date.map(HttpDate::as_bytes).map(|d| &d[..]), out)
     }
 
     /// [`respond`](Self::respond) into any [`Output`], with an optional

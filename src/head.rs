@@ -393,6 +393,10 @@ impl LineScan {
 }
 
 /// Validates one field line (`line` starts at offset `base` in the head).
+// Forced inline: the scanner is compiled once per field sink, and without
+// it this per-field call stays out of line (about 8% on the head
+// benchmark, 12% on client response parsing).
+#[inline(always)]
 fn parse_field(line: &[u8], base: usize) -> Result<Field, HttpError> {
     if line.first().is_some_and(|&b| is_ows(b)) {
         return Err(HttpError::ObsFold);

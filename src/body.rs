@@ -140,6 +140,7 @@ impl Decoder {
     /// [`TrailerMode::Locate`] reports a non-empty trailer section as
     /// [`Step::Trailers`] (its length in [`trailer_len`](Self::trailer_len))
     /// without storing its fields, so nothing is allocated.
+    #[inline]
     pub(crate) fn step_with(
         &mut self,
         unread: &[u8],
