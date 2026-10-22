@@ -646,8 +646,14 @@ struct FieldFacts {
 
 fn scan_fields(head: &[u8], fields: &[Field]) -> Result<FieldFacts, HttpError> {
     let mut facts = FieldFacts::default();
+    // The lengths of the six names below: most fields are ruled out before
+    // any compare.
+    const LENGTHS: u32 = 1 << 4 | 1 << 6 | 1 << 7 | 1 << 10 | 1 << 14 | 1 << 17;
     for field in fields {
         let name = field.name.get(head);
+        if name.len() > 17 || LENGTHS & (1 << name.len()) == 0 {
+            continue;
+        }
         let value = field.value.get(head);
         if name.eq_ignore_ascii_case(b"content-length") {
             if facts.content_length.is_some() {
