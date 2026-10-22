@@ -340,11 +340,63 @@ pub(crate) fn is_qdtext(b: u8) -> bool {
 
 /// Iterates the elements of a comma-separated list value, trimmed of OWS,
 /// skipping empty elements (RFC 9110 section 5.6.1.2).
-pub(crate) fn list_elements(value: &[u8]) -> impl Iterator<Item = &[u8]> {
-    value
-        .split(|&b| b == b',')
-        .map(trim_ows)
-        .filter(|e| !e.is_empty())
+///
+/// A comma inside a quoted string does not end an element: `a="x,y", b` is
+/// two elements, `a="x,y"` and `b` (a backslash escapes the next byte
+/// inside the quotes). An unterminated quote runs to the end of the value.
+/// This is the walker `parse-net` specifies; it stays here until http-net
+/// takes that crate as a dependency.
+pub(crate) fn list_elements(value: &[u8]) -> ListSplit<'_> {
+    ListSplit {
+        rest: value,
+        // Almost every list value has no quoted string; those are split
+        // with the word-at-a-time comma search instead of the byte walk.
+        quoted: find_byte(b'"', value).is_some(),
+    }
+}
+
+/// The iterator behind [`list_elements`].
+#[derive(Clone, Debug)]
+pub(crate) struct ListSplit<'a> {
+    rest: &'a [u8],
+    quoted: bool,
+}
+
+impl<'a> Iterator for ListSplit<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        while !self.rest.is_empty() {
+            let end = if self.quoted {
+                element_end(self.rest)
+            } else {
+                find_byte(b',', self.rest).unwrap_or(self.rest.len())
+            };
+            let element = trim_ows(&self.rest[..end]);
+            self.rest = self.rest.get(end + 1..).unwrap_or(&[]);
+            if !element.is_empty() {
+                return Some(element);
+            }
+        }
+        None
+    }
+}
+
+/// The index of the comma that ends the first element of `s` (or `s.len()`),
+/// skipping commas inside quoted strings.
+fn element_end(s: &[u8]) -> usize {
+    let mut i = 0;
+    let mut quoted = false;
+    while i < s.len() {
+        match s[i] {
+            b'"' => quoted = !quoted,
+            b'\\' if quoted => i += 1,
+            b',' if !quoted => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    s.len()
 }
 
 /// Finds the first occurrence of `needle` in `hay`, eight bytes at a time.
@@ -524,6 +576,21 @@ mod tests {
         assert_eq!(parse_decimal(b"+1"), None);
         assert_eq!(parse_decimal(b""), None);
         assert_eq!(parse_decimal(b"1 "), None);
+    }
+
+    #[test]
+    fn test_list_elements_respects_quoted_strings() {
+        fn all(v: &[u8]) -> Vec<&[u8]> {
+            list_elements(v).collect()
+        }
+        assert_eq!(all(b"a, b ,,c"), [&b"a"[..], b"b", b"c"]);
+        assert_eq!(all(b"a=\"x,y\", b"), [&b"a=\"x,y\""[..], b"b"]);
+        assert_eq!(all(b"a=\"x\\\",y\", b"), [&b"a=\"x\\\",y\""[..], b"b"]);
+        assert_eq!(all(b"a=\"unterminated, b"), [&b"a=\"unterminated, b"[..]]);
+        assert_eq!(all(b""), Vec::<&[u8]>::new());
+        assert_eq!(all(b" , ,"), Vec::<&[u8]>::new());
+        // A trailing backslash inside quotes cannot read past the end.
+        assert_eq!(all(b"\"\\"), [&b"\"\\"[..]]);
     }
 
     #[test]

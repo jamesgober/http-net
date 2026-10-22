@@ -28,10 +28,30 @@ pub enum Ev {
         framing: BodyFraming,
     },
     Body(Vec<u8>),
+    /// Reported trailer fields (only when the driver asked for them).
+    Trailers(Vec<(String, Vec<u8>)>),
+    /// A reported interim response (client, only when asked for).
+    Informational {
+        status: u16,
+        headers: Vec<(String, Vec<u8>)>,
+    },
+    /// `100 Continue` to an `expect_continue` request (client).
+    Continue,
     End,
     Upgraded(Vec<u8>),
     Closed,
     Err(HttpError),
+}
+
+/// What the drivers ask the connection to report beyond the default events.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Opts {
+    pub report_trailers: bool,
+    pub report_informational: bool,
+}
+
+fn fields_of<'a>(it: impl Iterator<Item = (&'a str, &'a [u8])>) -> Vec<(String, Vec<u8>)> {
+    it.map(|(n, v)| (n.to_string(), v.to_vec())).collect()
 }
 
 fn push_body(events: &mut Vec<Ev>, chunk: &[u8]) {
@@ -73,7 +93,13 @@ pub fn first_offered(r: &http_net::RequestHead<'_>) -> Option<String> {
 /// Feeds `pieces` to a server connection, answering every request with an
 /// empty 200 (or 101 for upgrades), then signals EOF. Returns the events.
 pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
+    drive_server_opts(pieces, limits, Opts::default())
+}
+
+/// As [`drive_server`], with the reports `opts` asks for.
+pub fn drive_server_opts(pieces: &[&[u8]], limits: Limits, opts: Opts) -> Vec<Ev> {
     let mut conn = ServerConn::with_limits(limits);
+    conn.set_report_trailers(opts.report_trailers);
     let mut out = Vec::new();
     let mut events = Vec::new();
     let mut next = 0;
@@ -100,6 +126,7 @@ pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
                 });
             }
             Ok(ServerEvent::Body(b)) => push_body(&mut events, b),
+            Ok(ServerEvent::Trailers(t)) => events.push(Ev::Trailers(fields_of(t))),
             Ok(ServerEvent::RequestEnd) => {
                 events.push(Ev::End);
                 let response = match &upgrade_to {
@@ -150,7 +177,19 @@ pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
 /// Sends `request` on a client connection, feeds `pieces` as the response,
 /// then EOF. Returns the events.
 pub fn drive_client(request: &Request, pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
+    drive_client_opts(request, pieces, limits, Opts::default())
+}
+
+/// As [`drive_client`], with the reports `opts` asks for.
+pub fn drive_client_opts(
+    request: &Request,
+    pieces: &[&[u8]],
+    limits: Limits,
+    opts: Opts,
+) -> Vec<Ev> {
     let mut conn = ClientConn::with_limits(limits);
+    conn.set_report_trailers(opts.report_trailers);
+    conn.set_report_informational(opts.report_informational);
     let mut out = Vec::new();
     conn.send_request(request, &mut out).expect("send");
     let mut events = Vec::new();
@@ -168,6 +207,12 @@ pub fn drive_client(request: &Request, pieces: &[&[u8]], limits: Limits) -> Vec<
                 framing: r.framing(),
             }),
             Ok(ClientEvent::Body(b)) => push_body(&mut events, b),
+            Ok(ClientEvent::Trailers(t)) => events.push(Ev::Trailers(fields_of(t))),
+            Ok(ClientEvent::Informational(r)) => events.push(Ev::Informational {
+                status: r.status(),
+                headers: fields_of(r.headers()),
+            }),
+            Ok(ClientEvent::Continue) => events.push(Ev::Continue),
             Ok(ClientEvent::ResponseEnd) => events.push(Ev::End),
             Ok(ClientEvent::NeedInput) => {
                 assert!(!eof, "NeedInput after EOF");

@@ -780,6 +780,123 @@ const ROWS: &[Row] = &[
             ensure(refused && idle, "caller-set framing field accepted")
         },
     },
+    Row {
+        section: "RFC 9110 15.2 (0.4)",
+        statement: "a server must not send a 1xx response to an HTTP/1.0 client",
+        check: || {
+            let mut conn = ServerConn::new();
+            let _ = conn.feed(b"GET / HTTP/1.0\r\n\r\n");
+            while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+            let mut out = Vec::new();
+            let hints = conn.send_informational(&Response::new(103), &mut out);
+            let cont = conn.send_continue(&mut out);
+            ensure(
+                hints == Err(HttpError::InterimNotAllowed)
+                    && cont == Err(HttpError::InterimNotAllowed)
+                    && out.is_empty(),
+                "1xx written to an HTTP/1.0 client",
+            )
+        },
+    },
+    Row {
+        section: "RFC 9110 15.2 (0.4)",
+        statement: "interim responses precede the final response, any number of them, and a client that did not ask for them skips them",
+        check: || {
+            let mut conn = ServerConn::new();
+            let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+            let mut out = Vec::new();
+            conn.send_informational(&Response::new(103), &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            conn.send_informational(&Response::new(102), &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            conn.respond(&Response::new(204), &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            let late = conn.send_informational(&Response::new(103), &mut Vec::new());
+            let events = client(&get(), &out);
+            ensure(
+                late == Err(HttpError::InterimNotAllowed)
+                    && matches!(events.first(), Some(Ev::Status { status: 204, .. })),
+                "interim after the final response, or not skipped",
+            )
+        },
+    },
+    Row {
+        section: "RFC 9110 10.1.1 (0.4)",
+        statement: "a client that sends 100-continue waits for 100 or a final status before the body; a final status means the body is not sent",
+        check: || {
+            let mut conn = ClientConn::new();
+            let mut out = Vec::new();
+            let r = Request::put("/")
+                .header("host", "a")
+                .content_length(3)
+                .expect_continue();
+            conn.send_request(&r, &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            let waiting = conn.is_waiting_for_continue();
+            let _ = conn.feed(b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n");
+            let final_first = matches!(conn.poll(), Ok(ClientEvent::Response(_)));
+            let refused = conn.send_body(b"abc", &mut out).is_err();
+            ensure(
+                waiting && final_first && refused,
+                "body sent after a final status",
+            )
+        },
+    },
+    Row {
+        section: "RFC 9110 10.1.1 (0.4)",
+        statement: "a server may answer an unknown expectation with 417; the expectation is reported, never acted on, and never changes framing",
+        check: || {
+            with_head(
+                b"POST / HTTP/1.1\r\nHost: a\r\nExpect: x-unknown\r\nContent-Length: 2\r\n\r\nhi",
+                |r| {
+                    ensure(
+                        r.has_unknown_expectation()
+                            && !r.expects_continue()
+                            && r.content_length() == Some(2),
+                        "unknown expectation not reported, or it changed framing",
+                    )
+                },
+            )
+        },
+    },
+    Row {
+        section: "RFC 9110 6.5.1 (0.4)",
+        statement: "a sender must not generate trailer fields that frame, route, authenticate, modify, or describe the message",
+        check: || {
+            let mut conn = ServerConn::new();
+            let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+            let mut out = Vec::new();
+            conn.respond(&Response::new(200).chunked(), &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            let refused = [
+                "content-length",
+                "host",
+                "authorization",
+                "set-cookie",
+                "content-type",
+            ]
+            .iter()
+            .all(|n| {
+                conn.end_body_with_trailers(&[(n, b"v")], &mut out)
+                    == Err(HttpError::TrailerNotAllowed)
+            });
+            ensure(refused, "a forbidden trailer field was sent")
+        },
+    },
+    Row {
+        section: "RFC 9110 6.5 (0.4)",
+        statement: "trailer fields may be discarded and never change how the message was framed",
+        check: || {
+            let input = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nContent-Length: 99\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n";
+            let events = serve(input);
+            ensure(
+                heads(&events).len() == 2 && events.contains(&Ev::Body(b"hi".to_vec())),
+                "a trailer changed framing",
+            )
+        },
+    },
 ];
 
 #[test]

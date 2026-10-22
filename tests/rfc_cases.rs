@@ -648,13 +648,20 @@ fn test_limit_cases_at_the_boundary() {
         v.extend_from_slice(b"\r\n\r\n");
         v
     };
+    // The one long line is allowed by a raised field-line budget, so only
+    // the section budget is under test here.
+    let long_lines = Limits::new().with_max_field_line(16 * 1024);
     assert!(matches!(
-        drive_server(&[&section(16 * 1024)], Limits::new())[0],
+        drive_server(&[&section(16 * 1024)], long_lines)[0],
         Ev::Head { .. }
     ));
+    let over = drive_server(&[&section(16 * 1024 + 1)], long_lines);
+    assert_eq!(over.last(), Some(&Ev::Err(HttpError::HeadersTooLarge)));
+    // With the default 8 KiB field-line budget the same line is refused as a
+    // line, before the section budget is reached (E-46).
     assert_eq!(
-        common::server_error(&section(16 * 1024 + 1)),
-        Some(HttpError::HeadersTooLarge)
+        common::server_error(&section(16 * 1024)),
+        Some(HttpError::FieldLineTooLong)
     );
 
     // Body: exactly the limit passes.

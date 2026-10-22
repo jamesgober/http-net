@@ -13,6 +13,94 @@
 
 ---
 
+## [0.4.0] - 2026-10-21
+
+Extended: trailers and interim responses both ways, the client side of
+`Expect: 100-continue`, keep-alive control and progress for drivers, a
+cached `Date`, per-line and trailer budgets, and total deadlines in the
+blocking adapter. See `docs/MIGRATION.md` for what a 0.3 user can notice.
+
+### Added
+
+- Trailers both ways. `ServerConn::set_report_trailers` and
+  `ClientConn::set_report_trailers` report a non-empty trailer section as
+  `ServerEvent::Trailers` / `ClientEvent::Trailers` before the end event;
+  `ServerConn::end_body_with_trailers` and
+  `ClientConn::end_body_with_trailers` send one after a chunked body,
+  refusing the fields RFC 9110 section 6.5.1 keeps out of trailers with the
+  new `HttpError::TrailerNotAllowed`.
+- Interim responses both ways. `ServerConn::send_informational` sends a
+  1xx other than 100 and 101 (for example `103 Early Hints`) before the
+  final response; `ClientConn::set_report_informational` reports them as
+  `ClientEvent::Informational`; `ResponseHead::is_informational`.
+- The client side of `Expect: 100-continue`: `Request::expect_continue`,
+  `ClientConn::is_waiting_for_continue`, `ClientEvent::Continue`. A final
+  status instead of `100` refuses the promised body and closes the
+  connection after the response.
+- Driver controls: `ServerConn::set_keep_alive` and `keep_alive`,
+  `requests_served`, and `progress` with the new `Progress` enum (also
+  `ClientConn::progress`, `ClientConn::is_reusable`).
+- `HttpDate` and `DateCache` (IMF-fixdate, formatted at most once per
+  second; the caller supplies the time) and
+  `ServerConn::respond_with_date`.
+- `RequestHead::header_list`, `ResponseHead::header_list`, and the
+  `ListElements` iterator; `RequestHead::upgrade_protocols` (the offered
+  protocols, `h2c` left out); `RequestHead::has_unknown_expectation`.
+- `status_allows_body`.
+- `Limits::with_max_field_line` / `max_field_line` (8 KiB by default),
+  `with_max_trailer_bytes` / `max_trailer_bytes`,
+  `with_max_trailer_fields` / `max_trailer_fields` (both following the
+  header budgets until set), `with_max_interim` / `max_interim` (16).
+- Errors: `FieldLineTooLong` (431), `TooManyInterim`, `InterimNotAllowed`,
+  `TrailerNotAllowed`.
+- Blocking adapter: `blocking::serve` (bind and serve in one call),
+  `blocking::post`, `blocking::now_date` (a per-thread `DateCache` over the
+  system clock), `Client::request` (any `Request` to an `http://` URL),
+  `Client::with_deadline` (one total deadline per exchange),
+  `ServerConfig::with_response_deadline` (60 s to write one response) and
+  `with_max_requests_per_connection`, `Connection::with_response_deadline`,
+  and `Connection::send_informational`.
+- Examples `early_hints` and `trailers`.
+
+### Changed
+
+- One field line may be at most 8 KiB by default (`FieldLineTooLong`); in
+  0.3 a single line could use the whole 16 KiB header section. Raise it
+  with `Limits::with_max_field_line`.
+- `ServerConn::send_continue` reports `InterimNotAllowed` (was
+  `InvalidState`) for an HTTP/1.0 request, after the body began or a
+  response started, and when sent twice.
+- The client stops after `max_interim` interim responses to one request
+  (`TooManyInterim`), as well as at the header byte budget.
+- Outgoing messages may no longer set `trailer`, `keep-alive`, or
+  `proxy-connection`, and responses may not set `te` (`ReservedHeader`):
+  they belong to the connection (RFC 9110 sections 7.6.1, 10.1.4).
+- `Limits::buffer_capacity` accounts for a trailer budget larger than the
+  header budget; with the defaults it is unchanged (64 KiB).
+- The blocking server answers a request with an expectation other than
+  `100-continue` with `417 Expectation Failed` (and closes) instead of
+  ignoring it; `date` comes from a per-second cache instead of being
+  formatted for every response.
+
+### Security
+
+- The blocking server's total response deadline (60 s by default) stops a
+  client that reads one byte at a time from holding a worker thread during
+  a large response (threat T-26); before, only each write had a timeout.
+- The blocking client's `with_deadline` bounds a whole exchange, so a slow
+  server cannot hold a caller past it.
+- `dev/PLAN.md` records the 0.4 decisions (D-13 to D-20), among them
+  keeping the shared grammar internal until `parse-net` is published.
+
+### Fixed
+
+- List fields are split with a quote-aware walker: a comma inside a quoted
+  string no longer ends an element (the behaviour of the shared grammar
+  crate `parse-net`). No message 0.3 accepted reads differently; this
+  removes a latent differential between the two crates.
+
+---
+
 ## [0.3.0] - 2026-10-21
 
 Core, with the design lock revisited: `docs/API.md` now describes the
@@ -209,7 +297,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/http-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/http-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/http-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/http-net/releases/tag/v0.1.0

@@ -145,23 +145,23 @@ Exit criteria:
 - [x] Benchmarks within 5% of the 0.2.0 baseline (interleaved A/B on one machine: largest consistent difference about +2%, head and pipelined benchmarks).
 - [x] Local gate and CI green; release routine completed.
 
-## v0.4.0 - Extended
-- [ ] Budgets: per-field-line limit (`FieldLineTooLong`), separate trailer budgets, interim response count (`TooManyInterim`).
-- [ ] `ServerConn`: `set_keep_alive`, `keep_alive`, `requests_served`, `progress` (`Progress`), `respond_with_date`, `send_informational` (103 Early Hints), `end_body_with_trailers`, `set_report_trailers` (`ServerEvent::Trailers`); `send_continue` reports `InterimNotAllowed`.
-- [ ] Views: `header_list` and `ListElements`; `has_unknown_expectation`; `upgrade_protocols`; `ResponseHead::is_informational`; `status_allows_body`.
-- [ ] `HttpDate`, `DateCache`, `blocking::now_date` (the formatter moves out of `blocking`; the core takes the time from the caller).
-- [ ] `ClientConn`: `Request::expect_continue` and `is_waiting_for_continue` (`ClientEvent::Continue`), `set_report_informational` (`ClientEvent::Informational`), `set_report_trailers`, `end_body_with_trailers`, `is_reusable`, `progress`.
-- [ ] Error variants `FieldLineTooLong`, `TooManyInterim`, `InterimNotAllowed`, `TrailerNotAllowed`; `ReservedHeader` list extended.
-- [ ] Blocking: total response-write deadline and request cap in `ServerConfig`, automatic 417 and cached `date` in `Server`, `Connection::send_informational`, `Client::request` and `with_deadline`, `blocking::post`, `blocking::serve`.
-- [ ] `parse-net` wired for the shared grammar (OD-1) if its approved version is published; otherwise the move waits for v0.5.0 and this file records why.
+## v0.4.0 - Extended (DONE, 2026-10-21)
+- [x] Budgets: per-field-line limit (`FieldLineTooLong`), separate trailer budgets, interim response count (`TooManyInterim`).
+- [x] `ServerConn`: `set_keep_alive`, `keep_alive`, `requests_served`, `progress` (`Progress`), `respond_with_date`, `send_informational` (103 Early Hints), `end_body_with_trailers`, `set_report_trailers` (`ServerEvent::Trailers`); `send_continue` reports `InterimNotAllowed`.
+- [x] Views: `header_list` and `ListElements`; `has_unknown_expectation`; `upgrade_protocols`; `ResponseHead::is_informational`; `status_allows_body`.
+- [x] `HttpDate`, `DateCache`, `blocking::now_date` (the formatter moves out of `blocking`; the core takes the time from the caller).
+- [x] `ClientConn`: `Request::expect_continue` and `is_waiting_for_continue` (`ClientEvent::Continue`), `set_report_informational` (`ClientEvent::Informational`), `set_report_trailers`, `end_body_with_trailers`, `is_reusable`, `progress`.
+- [x] Error variants `FieldLineTooLong`, `TooManyInterim`, `InterimNotAllowed`, `TrailerNotAllowed`; `ReservedHeader` list extended.
+- [x] Blocking: total response-write deadline and request cap in `ServerConfig`, automatic 417 and cached `date` in `Server`, `Connection::send_informational`, `Client::request` and `with_deadline`, `blocking::post`, `blocking::serve`.
+- [x] `parse-net` wired for the shared grammar (OD-1) if its approved version is published; otherwise the move waits and this file records why. **Moved:** `parse-net` is not published, so the grammar stays internal behind the API shape `parse-net` specifies (the quote-aware list walker and the IMF-fixdate formatter); the switch happens in the first version after `parse-net` publishes an approved release (dev/PLAN.md D-13).
 
 Exit criteria:
-- [ ] Trailers and interim responses round-trip in property tests, both directions.
-- [ ] Client `Expect` flows tested: `100` first, final status first, caller sends without waiting.
-- [ ] Blocking: response deadline socket test (slow reader) and 417 test green; `Client::request` and deadline tests green.
-- [ ] `parse-net` equality tests green and `request_head` within 1% of the pre-move baseline, or the move deferred with the reason recorded.
-- [ ] Benchmarks within 5% of 0.3.0.
-- [ ] Release routine completed.
+- [x] Trailers and interim responses round-trip in property tests, both directions.
+- [x] Client `Expect` flows tested: `100` first, final status first, caller sends without waiting.
+- [x] Blocking: response deadline socket test (slow reader) and 417 test green; `Client::request` and deadline tests green.
+- [x] `parse-net` equality tests green and `request_head` within 1% of the pre-move baseline, or the move deferred with the reason recorded. (Deferred: D-13.)
+- [x] Benchmarks within 5% of 0.3.0.
+- [x] Release routine completed.
 
 ## v0.5.0 - Feature complete
 - [ ] Client pipelining (`Limits::pipeline_depth`, `outstanding`, `can_send`).

@@ -171,9 +171,52 @@ pub const fn status_class(status: u16) -> Option<StatusClass> {
     })
 }
 
+/// Whether a response with `status` to a request with `request` method can
+/// carry a body (RFC 9112 section 6.3, rules 1 and 2): false for 1xx, 204,
+/// 304, any response to `HEAD`, and a 2xx to `CONNECT` (which turns the
+/// connection into a tunnel). For proxies and clients deciding how to read
+/// or forward a response.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{Method, status_allows_body};
+///
+/// assert!(status_allows_body(200, Method::Get));
+/// assert!(!status_allows_body(200, Method::Head));
+/// assert!(!status_allows_body(304, Method::Get));
+/// assert!(!status_allows_body(200, Method::Connect));
+/// assert!(status_allows_body(407, Method::Connect));
+/// ```
+#[must_use]
+pub const fn status_allows_body(status: u16, request: crate::Method) -> bool {
+    !(matches!(request, crate::Method::Head)
+        || (status >= 100 && status < 200)
+        || status == 204
+        || status == 304
+        || (matches!(request, crate::Method::Connect) && status >= 200 && status < 300))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_status_allows_body_follows_rfc_9112_6_3() {
+        use crate::Method;
+        for status in 100..200 {
+            assert!(!status_allows_body(status, Method::Get));
+        }
+        for m in [Method::Get, Method::Post, Method::Other] {
+            assert!(status_allows_body(200, m));
+            assert!(!status_allows_body(204, m));
+            assert!(!status_allows_body(304, m));
+            assert!(status_allows_body(500, m));
+        }
+        assert!(!status_allows_body(500, Method::Head));
+        assert!(!status_allows_body(299, Method::Connect));
+        assert!(status_allows_body(300, Method::Connect));
+    }
 
     #[test]
     fn test_reason_phrase_registry_has_every_iana_code() {

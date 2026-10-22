@@ -238,10 +238,10 @@ fn test_send_continue_then_body_then_final_response() {
     conn.send_continue(&mut out).unwrap();
     assert_eq!(out, b"HTTP/1.1 100 Continue\r\n\r\n");
     // Only once per request.
-    assert!(matches!(
+    assert_eq!(
         conn.send_continue(&mut out),
-        Err(HttpError::InvalidState(_))
-    ));
+        Err(HttpError::InterimNotAllowed)
+    );
     assert!(matches!(conn.poll().unwrap(), ServerEvent::NeedInput));
     let _ = conn.feed(b"abc");
     assert!(matches!(conn.poll().unwrap(), ServerEvent::Body(b"abc")));
@@ -264,20 +264,20 @@ fn test_send_continue_refused_out_of_place() {
     // HTTP/1.0 clients must never get a 1xx (RFC 9110 section 15.2).
     let _ = conn.feed(b"POST / HTTP/1.0\r\nContent-Length: 1\r\n\r\n");
     first_request(&mut conn).unwrap();
-    assert!(matches!(
+    assert_eq!(
         conn.send_continue(&mut out),
-        Err(HttpError::InvalidState(_))
-    ));
+        Err(HttpError::InterimNotAllowed)
+    );
     // After the final response has started.
     let mut conn = ServerConn::new();
     let _ = conn.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n");
     first_request(&mut conn).unwrap();
     conn.respond(&Response::new(413), &mut out).unwrap();
     out.clear();
-    assert!(matches!(
+    assert_eq!(
         conn.send_continue(&mut out),
-        Err(HttpError::InvalidState(_))
-    ));
+        Err(HttpError::InterimNotAllowed)
+    );
     assert!(out.is_empty());
 }
 
@@ -447,7 +447,8 @@ fn test_trailer_count_and_size_are_limited() {
 
 #[test]
 fn test_client_interim_flood_is_budgeted() {
-    // Interim responses count against the header budget, so a server
+    // T-31: interim responses are budgeted by count (`max_interim`, 16 by
+    // default) and together by bytes (the header budget), so a server
     // cannot keep a client busy forever without ever answering.
     let one = b"HTTP/1.1 100 Continue\r\n\r\n";
     let flood = one.repeat(2000);
@@ -456,7 +457,30 @@ fn test_client_interim_flood_is_budgeted() {
         &[&flood],
         Limits::new(),
     );
+    assert_eq!(events.last(), Some(&Ev::Err(HttpError::TooManyInterim)));
+    let events = drive_client(
+        &Request::get("/").header("host", "a"),
+        &[&flood],
+        Limits::new().with_max_interim(u16::MAX),
+    );
     assert_eq!(events.last(), Some(&Ev::Err(HttpError::HeadersTooLarge)));
+    // Exactly `max_interim` interim responses are fine; one more is not.
+    let mut at = one.repeat(16);
+    at.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+    let events = drive_client(
+        &Request::get("/").header("host", "a"),
+        &[&at],
+        Limits::new(),
+    );
+    assert!(events.contains(&Ev::End), "{events:?}");
+    let mut over = one.repeat(17);
+    over.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+    let events = drive_client(
+        &Request::get("/").header("host", "a"),
+        &[&over],
+        Limits::new(),
+    );
+    assert_eq!(events.last(), Some(&Ev::Err(HttpError::TooManyInterim)));
 
     // A handful of interim responses is normal (100, 103) and still works.
     let mut ok = one.repeat(3);

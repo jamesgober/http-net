@@ -26,6 +26,10 @@ const RESERVED: &[&str] = &[
     "transfer-encoding",
     "connection",
     "upgrade",
+    "trailer",
+    "keep-alive",
+    "proxy-connection",
+    "te",
 ];
 
 fn token() -> impl Strategy<Value = String> {
@@ -513,5 +517,196 @@ proptest! {
             panic!("expected a request: {events:?}");
         };
         prop_assert_eq!(*keep_alive, !close && !http10);
+    }
+}
+
+/// Names RFC 9110 section 6.5.1 keeps out of trailers (and the crate
+/// refuses).
+const TRAILER_FORBIDDEN: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "host",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-connection",
+    "expect",
+    "max-forwards",
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    "cookie",
+    "set-cookie",
+    "content-type",
+    "content-encoding",
+    "content-range",
+    "cache-control",
+    "expires",
+    "date",
+    "location",
+    "retry-after",
+    "vary",
+    "age",
+];
+
+fn trailer_name() -> impl Strategy<Value = String> {
+    token().prop_filter("not allowed in trailers", |n| {
+        !TRAILER_FORBIDDEN.iter().any(|r| r.eq_ignore_ascii_case(n))
+    })
+}
+
+fn trailers_of(events: &[Ev]) -> Option<&Vec<(String, Vec<u8>)>> {
+    events.iter().find_map(|e| match e {
+        Ev::Trailers(t) => Some(t),
+        _ => None,
+    })
+}
+
+/// An interim status and its fields.
+type Interim = (u16, Vec<(String, Vec<u8>)>);
+
+fn as_pairs(trailers: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+    trailers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_slice()))
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// FR-19 / FR-35: request trailers written by `ClientConn` arrive at
+    /// `ServerConn` unchanged, after the body, at any split.
+    #[test]
+    fn prop_request_trailers_round_trip(
+        body in proptest::collection::vec(any::<u8>(), 0..200),
+        chunks in proptest::collection::vec(0usize..64, 0..6),
+        trailers in proptest::collection::vec((trailer_name(), field_value()), 0..6),
+        cuts in proptest::collection::vec(any::<usize>(), 0..12),
+    ) {
+        let mut client = ClientConn::new();
+        let mut wire = Vec::new();
+        client
+            .send_request(&Request::post("/up").header("host", "a").chunked(), &mut wire)
+            .unwrap();
+        for piece in pieces(&body, &chunks) {
+            client.send_body(piece, &mut wire).unwrap();
+        }
+        client.end_body_with_trailers(&as_pairs(&trailers), &mut wire).unwrap();
+        let opts = common::Opts { report_trailers: true, report_informational: false };
+        let events = common::drive_server_opts(&split(&wire, &cuts), Limits::new(), opts);
+        prop_assert_eq!(body_of(&events), body);
+        if trailers.is_empty() {
+            prop_assert!(trailers_of(&events).is_none());
+        } else {
+            prop_assert_eq!(trailers_of(&events), Some(&trailers));
+        }
+        let end = events.iter().position(|e| *e == Ev::End).unwrap();
+        if let Some(t) = events.iter().position(|e| matches!(e, Ev::Trailers(_))) {
+            prop_assert_eq!(t + 1, end);
+        }
+    }
+
+    /// FR-19 / FR-35: response trailers written by `ServerConn` arrive at
+    /// `ClientConn` unchanged, at any split.
+    #[test]
+    fn prop_response_trailers_round_trip(
+        body in proptest::collection::vec(any::<u8>(), 0..200),
+        chunks in proptest::collection::vec(0usize..64, 0..6),
+        trailers in proptest::collection::vec((trailer_name(), field_value()), 1..6),
+        cuts in proptest::collection::vec(any::<usize>(), 0..12),
+    ) {
+        let mut server = ServerConn::new();
+        let _ = server.feed(b"GET / HTTP/1.1\r\nHost: a\r\nTE: trailers\r\n\r\n");
+        while !matches!(server.poll().unwrap(), ServerEvent::RequestEnd) {}
+        let mut wire = Vec::new();
+        server.respond(&Response::new(200).chunked(), &mut wire).unwrap();
+        for piece in pieces(&body, &chunks) {
+            server.send_body(piece, &mut wire).unwrap();
+        }
+        server.end_body_with_trailers(&as_pairs(&trailers), &mut wire).unwrap();
+        let opts = common::Opts { report_trailers: true, report_informational: false };
+        let request = Request::get("/").header("host", "a");
+        let events = common::drive_client_opts(&request, &split(&wire, &cuts), Limits::new(), opts);
+        prop_assert_eq!(body_of(&events), body);
+        prop_assert_eq!(trailers_of(&events), Some(&trailers));
+        prop_assert!(events.contains(&Ev::End));
+    }
+
+    /// FR-34 / FR-39: interim responses sent by `ServerConn` reach a
+    /// reporting `ClientConn` in order with their fields, and are skipped by
+    /// a default one; the final response is the same either way.
+    #[test]
+    fn prop_interim_responses_round_trip(
+        interims in proptest::collection::vec(
+            (102u16..=199, proptest::collection::vec((field_name(), field_value()), 0..3)),
+            1..=5,
+        ),
+        cuts in proptest::collection::vec(any::<usize>(), 0..12),
+    ) {
+        let mut server = ServerConn::new();
+        let _ = server.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+        while !matches!(server.poll().unwrap(), ServerEvent::RequestEnd) {}
+        let mut wire = Vec::new();
+        for (status, fields) in &interims {
+            let mut interim = Response::new(*status);
+            for (n, v) in fields {
+                interim = interim.header(n, v);
+            }
+            server.send_informational(&interim, &mut wire).unwrap();
+        }
+        server.respond(&Response::text(200, "final"), &mut wire).unwrap();
+        let request = Request::get("/").header("host", "a");
+        let on = common::Opts { report_trailers: false, report_informational: true };
+        let reported = common::drive_client_opts(&request, &split(&wire, &cuts), Limits::new(), on);
+        let seen: Vec<Interim> = reported
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Informational { status, headers } => Some((*status, headers.clone())),
+                _ => None,
+            })
+            .collect();
+        let sent: Vec<Interim> = interims.clone();
+        prop_assert_eq!(seen, sent);
+        let skipped = drive_client(&request, &split(&wire, &cuts), Limits::new());
+        let any_reported = skipped.iter().any(|e| matches!(e, Ev::Informational { .. }));
+        prop_assert!(!any_reported);
+        let finals = |events: &[Ev]| -> Vec<Ev> {
+            events
+                .iter()
+                .filter(|e| !matches!(e, Ev::Informational { .. }))
+                .cloned()
+                .collect()
+        };
+        prop_assert_eq!(finals(&reported), finals(&skipped));
+        prop_assert_eq!(body_of(&skipped), b"final".to_vec());
+    }
+
+    /// FR-36: `DateCache` gives what direct formatting gives, for any
+    /// sequence of seconds across the whole IMF-fixdate range.
+    #[test]
+    fn prop_date_cache_equals_direct_formatting(
+        seconds in proptest::collection::vec(
+            prop_oneof![0u64..=253_402_300_799, 1_700_000_000u64..1_700_000_005],
+            1..40,
+        ),
+    ) {
+        let mut cache = http_net::DateCache::new();
+        for s in seconds {
+            let direct = http_net::HttpDate::from_unix_seconds(s);
+            prop_assert_eq!(*cache.update(s), direct);
+            prop_assert_eq!(*cache.current(), direct);
+            prop_assert_eq!(direct.as_bytes().len(), 29);
+            prop_assert!(direct.as_str().ends_with(" GMT"));
+        }
     }
 }

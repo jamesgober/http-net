@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::{
     error::HttpError,
-    head::{BodyFraming, HeadKind, HeadScanner, Progress, find_line},
+    head::{BodyFraming, HeadKind, HeadScanner, Scan, find_line},
     limits::Limits,
     syntax::{hex_value, is_ows, is_qdtext, is_tchar, push_decimal, push_hex},
 };
@@ -16,19 +16,31 @@ const MAX_CHUNK_DIGITS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    Length { remaining: u64 },
+    Length {
+        remaining: u64,
+    },
     ChunkSize,
-    ChunkData { remaining: u64 },
+    ChunkData {
+        remaining: u64,
+    },
     ChunkDataEnd,
     Trailers,
+    /// The trailer section (the first `len` unread bytes) was reported; it
+    /// is consumed on the next step.
+    TrailersReady {
+        len: usize,
+    },
     UntilClose,
     Done,
 }
 
 /// One decoding step's result. Data is the first `n` unread bytes, which the
-/// caller emits and then consumes.
+/// caller emits and then consumes. Trailers are the first `n` unread bytes,
+/// with their fields in the trailer scanner; the caller reports them and
+/// leaves them unconsumed.
 pub(crate) enum Step {
     Data(usize),
+    Trailers,
     Done,
     NeedMore,
 }
@@ -54,8 +66,10 @@ impl Decoder {
 
     /// Whether the whole body has been decoded (always, for a message
     /// without one).
-    pub(crate) fn is_done(&self) -> bool {
-        self.state == State::Done
+    /// Whether every byte of the message has been read: done, or only the
+    /// already-received trailer section is left to hand over.
+    pub(crate) fn is_read(&self) -> bool {
+        matches!(self.state, State::Done | State::TrailersReady { .. })
     }
 
     pub(crate) fn start(&mut self, framing: BodyFraming) {
@@ -72,19 +86,27 @@ impl Decoder {
 
     /// Advances over `unread`, consuming framing bytes through `consume` and
     /// stopping at the first data run or when more input is needed.
-    /// `trailers` scans the trailer section (its fields are not stored).
+    /// `trailers` scans the trailer section; with `report` its fields are
+    /// stored and a non-empty section is returned as [`Step::Trailers`]
+    /// before [`Step::Done`], otherwise they are validated and discarded.
     pub(crate) fn step(
         &mut self,
         unread: &[u8],
         eof: bool,
         limits: &Limits,
         trailers: &mut HeadScanner,
+        report: bool,
         consume: &mut usize,
     ) -> Result<Step, HttpError> {
         loop {
             let input = unread.get(*consume..).unwrap_or(&[]);
             match self.state {
                 State::Done => return Ok(Step::Done),
+                State::TrailersReady { len } => {
+                    *consume += len;
+                    self.state = State::Done;
+                    return Ok(Step::Done);
+                }
                 State::Length { remaining } | State::ChunkData { remaining } => {
                     if input.is_empty() {
                         return if eof {
@@ -147,7 +169,7 @@ impl Decoder {
                     *consume += self.scan;
                     self.scan = 0;
                     if size == 0 {
-                        trailers.reset_lines();
+                        trailers.reset();
                         self.state = State::Trailers;
                         continue;
                     }
@@ -175,13 +197,19 @@ impl Decoder {
                     _ => return Err(HttpError::InvalidChunkTerminator),
                 },
                 State::Trailers => {
-                    match trailers.advance(input, limits, HeadKind::Trailer, false)? {
-                        Progress::Done(n) => {
+                    match trailers.advance(input, limits, HeadKind::Trailer, report)? {
+                        Scan::Done(n) if report && !trailers.fields.is_empty() => {
+                            // Framing bytes before the section are consumed
+                            // now, so the section starts the unread input.
+                            self.state = State::TrailersReady { len: n };
+                            return Ok(Step::Trailers);
+                        }
+                        Scan::Done(n) => {
                             *consume += n;
                             self.state = State::Done;
                             return Ok(Step::Done);
                         }
-                        Progress::Partial => {
+                        Scan::Partial => {
                             return if eof {
                                 Err(HttpError::UnexpectedEof)
                             } else {
@@ -357,13 +385,22 @@ mod tests {
         let mut body = Vec::new();
         loop {
             let mut consumed = 0;
-            let step = d.step(&input[pos..], true, limits, &mut trailers, &mut consumed)?;
+            let step = d.step(
+                &input[pos..],
+                true,
+                limits,
+                &mut trailers,
+                true,
+                &mut consumed,
+            )?;
             pos += consumed;
             match step {
                 Step::Data(n) => {
                     body.extend_from_slice(&input[pos..pos + n]);
                     pos += n;
                 }
+                // Reported trailers are consumed on the next step.
+                Step::Trailers => assert!(!trailers.fields.is_empty()),
                 Step::Done => return Ok(body),
                 Step::NeedMore => return Err(HttpError::UnexpectedEof),
             }

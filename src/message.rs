@@ -31,13 +31,81 @@ pub(crate) enum OutBody {
     Chunked,
 }
 
-/// Validates a field and appends `name: value\r\n`.
-fn push_field(
-    fields: &mut Vec<u8>,
-    name: &str,
-    value: &[u8],
-    reserved: &[&str],
+/// Fields RFC 9110 section 6.5.1 keeps out of trailers: those that frame
+/// the message, route or authenticate it, modify the request, control the
+/// response, or describe the content. A recipient may process a trailer
+/// after the body, too late for any of them. Reviewed once per version.
+const TRAILER_FORBIDDEN: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "host",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-connection",
+    "expect",
+    "max-forwards",
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    "cookie",
+    "set-cookie",
+    "content-type",
+    "content-encoding",
+    "content-range",
+    "cache-control",
+    "expires",
+    "date",
+    "location",
+    "retry-after",
+    "vary",
+    "age",
+];
+
+/// Validates outgoing trailer fields (all of them, before anything is
+/// written), then appends the last chunk and the trailer section:
+/// `0\r\n`, the fields, and the blank line.
+pub(crate) fn push_last_chunk_with_trailers(
+    out: &mut Vec<u8>,
+    trailers: &[(&str, &[u8])],
 ) -> Result<(), HttpError> {
+    check_trailers(trailers)?;
+    out.extend_from_slice(b"0\r\n");
+    for &(name, value) in trailers {
+        write_field(out, name, value);
+    }
+    out.extend_from_slice(b"\r\n");
+    Ok(())
+}
+
+/// Validates outgoing trailer fields without writing them. Also used for a
+/// body whose trailers are dropped (HTTP/1.0 close-delimited, `HEAD`), so a
+/// call fails the same way whatever framing the peer forced.
+pub(crate) fn check_trailers(trailers: &[(&str, &[u8])]) -> Result<(), HttpError> {
+    for &(name, value) in trailers {
+        if TRAILER_FORBIDDEN
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+        {
+            return Err(HttpError::TrailerNotAllowed);
+        }
+        check_field(name, value, &[])?;
+    }
+    Ok(())
+}
+
+/// Checks one outgoing field: a token name that is not `reserved`, and a
+/// value without control bytes or surrounding whitespace.
+fn check_field(name: &str, value: &[u8], reserved: &[&str]) -> Result<(), HttpError> {
     if !is_token(name.as_bytes()) {
         return Err(HttpError::InvalidHeaderName);
     }
@@ -49,25 +117,49 @@ fn push_field(
         // it keeps what is sent equal to what is received.
         return Err(HttpError::InvalidHeaderValue);
     }
-    check_field_value(value)?;
-    fields.extend_from_slice(name.as_bytes());
-    fields.extend_from_slice(b": ");
-    fields.extend_from_slice(value);
-    fields.extend_from_slice(b"\r\n");
+    check_field_value(value)
+}
+
+fn write_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Validates a field and appends `name: value\r\n`.
+fn push_field(
+    fields: &mut Vec<u8>,
+    name: &str,
+    value: &[u8],
+    reserved: &[&str],
+) -> Result<(), HttpError> {
+    check_field(name, value, reserved)?;
+    write_field(fields, name, value);
     Ok(())
 }
 
+/// Fields the connection owns: framing, connection management, and the
+/// hop-by-hop fields of RFC 9110 section 7.6.1. A response also may not set
+/// `te`, which only a request can carry (section 10.1.4).
 const RESPONSE_RESERVED: &[&str] = &[
     "content-length",
     "transfer-encoding",
     "connection",
     "upgrade",
+    "trailer",
+    "keep-alive",
+    "proxy-connection",
+    "te",
 ];
 const REQUEST_RESERVED: &[&str] = &[
     "content-length",
     "transfer-encoding",
     "connection",
     "upgrade",
+    "trailer",
+    "keep-alive",
+    "proxy-connection",
 ];
 
 /// A response for a [`ServerConn`](crate::ServerConn) to send.
@@ -421,6 +513,7 @@ pub struct Request {
     pub(crate) close: bool,
     pub(crate) upgrade: bool,
     pub(crate) has_host: bool,
+    pub(crate) expect_continue: bool,
     error: Option<HttpError>,
 }
 
@@ -457,6 +550,7 @@ impl Request {
             close: false,
             upgrade: false,
             has_host: false,
+            expect_continue: false,
             error,
         }
     }
@@ -610,6 +704,43 @@ impl Request {
     #[must_use]
     pub fn close(mut self) -> Self {
         self.close = true;
+        self
+    }
+
+    /// Sends `expect: 100-continue` and holds the body back until the
+    /// server agrees (RFC 9110 section 10.1.1): for large uploads the
+    /// server may refuse from the head alone. The body must be streamed
+    /// ([`content_length`](Self::content_length) or
+    /// [`chunked`](Self::chunked)); send it with
+    /// [`ClientConn::send_body`](crate::ClientConn::send_body) after
+    /// [`ClientEvent::Continue`](crate::ClientEvent::Continue), or after a
+    /// wait of your choosing. A final status instead means the server does
+    /// not want the body: it must not be sent, and the connection closes
+    /// after the response.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, HttpError, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// let mut out = Vec::new();
+    /// let upload = Request::put("/f").header("host", "a").content_length(9).expect_continue();
+    /// conn.send_request(&upload, &mut out)?;
+    /// assert!(out.ends_with(b"expect: 100-continue\r\ncontent-length: 9\r\n\r\n"));
+    /// let _ = conn.feed(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n");
+    /// assert!(matches!(conn.poll()?, ClientEvent::Response(r) if r.status() == 413));
+    /// assert!(matches!(conn.send_body(b"too large", &mut out), Err(HttpError::InvalidState(_))));
+    /// assert!(matches!(conn.poll()?, ClientEvent::ResponseEnd));
+    /// assert!(matches!(conn.poll()?, ClientEvent::Closed));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn expect_continue(mut self) -> Self {
+        if self.error.is_none() && !self.expect_continue {
+            self.expect_continue = true;
+            self.fields.extend_from_slice(b"expect: 100-continue\r\n");
+        }
         self
     }
 

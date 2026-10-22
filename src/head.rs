@@ -17,8 +17,8 @@ use crate::{
     method::Method,
     redact::{FieldName, FieldValue},
     syntax::{
-        check_field_value, find_byte, is_host_value, is_ows, is_reason, is_target_chars, is_tchar,
-        is_token, list_elements, parse_decimal, trim_ows,
+        ListSplit, check_field_value, find_byte, is_host_value, is_ows, is_reason, is_target_chars,
+        is_tchar, is_token, list_elements, parse_decimal, trim_ows,
     },
 };
 
@@ -61,7 +61,7 @@ pub(crate) enum HeadKind {
     Trailer,
 }
 
-pub(crate) enum Progress {
+pub(crate) enum Scan {
     Partial,
     /// The head is complete; the value is its length including the blank line.
     Done(usize),
@@ -138,16 +138,6 @@ impl HeadScanner {
         self.fields.clear();
     }
 
-    /// Resets only the line state, for a trailer section, keeping the head's
-    /// stored fields readable.
-    pub(crate) fn reset_lines(&mut self) {
-        self.scan = 0;
-        self.line_start = 0;
-        self.skipped = 0;
-        self.field_bytes = 0;
-        self.count = 0;
-    }
-
     pub(crate) fn start_line(&self) -> Span {
         self.start_line.unwrap_or_default()
     }
@@ -159,7 +149,12 @@ impl HeadScanner {
         limits: &Limits,
         kind: HeadKind,
         store: bool,
-    ) -> Result<Progress, HttpError> {
+    ) -> Result<Scan, HttpError> {
+        let (section_bytes, section_fields) = if kind == HeadKind::Trailer {
+            (limits.max_trailer_bytes(), limits.max_trailer_fields())
+        } else {
+            (limits.max_header_bytes(), limits.max_headers())
+        };
         loop {
             let in_start = kind != HeadKind::Trailer && self.start_line.is_none();
             let (budget, too_long) = if in_start {
@@ -168,14 +163,18 @@ impl HeadScanner {
                     HttpError::StartLineTooLong,
                 )
             } else {
-                (
-                    limits.max_header_bytes().saturating_sub(self.field_bytes),
-                    HttpError::HeadersTooLarge,
-                )
+                // One line may not exceed the field-line budget, nor what is
+                // left of the section; whichever is smaller decides the error.
+                let section = section_bytes.saturating_sub(self.field_bytes);
+                if limits.max_field_line() < section {
+                    (limits.max_field_line(), HttpError::FieldLineTooLong)
+                } else {
+                    (section, HttpError::HeadersTooLarge)
+                }
             };
             let Some(end) = find_line(msg, self.line_start, &mut self.scan, budget, too_long)?
             else {
-                return Ok(Progress::Partial);
+                return Ok(Scan::Partial);
             };
             let start = self.line_start;
             let line = msg.get(start..end).unwrap_or(&[]);
@@ -199,15 +198,15 @@ impl HeadScanner {
                 continue;
             }
             if line.is_empty() {
-                return Ok(Progress::Done(self.scan));
+                return Ok(Scan::Done(self.scan));
             }
             self.field_bytes += line_len;
             // Every field line must leave room for the blank line that ends
             // the section, so the section as a whole fits the budget.
-            if self.field_bytes + 2 > limits.max_header_bytes() {
+            if self.field_bytes + 2 > section_bytes {
                 return Err(HttpError::HeadersTooLarge);
             }
-            if self.count >= limits.max_headers() {
+            if self.count >= section_fields {
                 return Err(HttpError::TooManyHeaders);
             }
             let field = parse_field(line, start)?;
@@ -401,6 +400,8 @@ struct FieldFacts {
     /// An `Upgrade` element other than `h2c`.
     upgrade_offer: bool,
     expect_continue: bool,
+    /// An `Expect` element other than `100-continue`.
+    expect_other: bool,
     hosts: usize,
     host: Option<Span>,
 }
@@ -456,8 +457,13 @@ fn scan_fields(head: &[u8], fields: &[Field]) -> Result<FieldFacts, HttpError> {
             facts.host = Some(field.value);
         } else if name.eq_ignore_ascii_case(b"expect") {
             // RFC 9110 section 10.1.1: the expectation is case-insensitive.
-            facts.expect_continue |=
-                list_elements(value).any(|e| e.eq_ignore_ascii_case(b"100-continue"));
+            for e in list_elements(value) {
+                if e.eq_ignore_ascii_case(b"100-continue") {
+                    facts.expect_continue = true;
+                } else {
+                    facts.expect_other = true;
+                }
+            }
         }
     }
     Ok(facts)
@@ -499,6 +505,7 @@ pub(crate) struct RequestInfo {
     pub(crate) keep_alive: bool,
     pub(crate) upgrade: bool,
     pub(crate) expect_continue: bool,
+    unknown_expectation: bool,
     host: Option<Span>,
     /// The authority of an absolute-form target, which replaces `Host`.
     authority: Option<Span>,
@@ -519,6 +526,7 @@ impl RequestInfo {
         keep_alive: false,
         upgrade: false,
         expect_continue: false,
+        unknown_expectation: false,
         host: None,
         authority: None,
         origin: Span { start: 0, end: 0 },
@@ -662,6 +670,9 @@ pub(crate) fn interpret_request(
         upgrade: version == Version::Http11 && facts.upgrade_token && facts.upgrade_offer,
         // RFC 9110 section 10.1.1: ignored in HTTP/1.0, and meaningless
         // without a body to wait for.
+        // Reported for any version, so the caller can answer 417 (RFC 9110
+        // section 10.1.1 MAY); it never changes framing.
+        unknown_expectation: facts.expect_other,
         expect_continue: version == Version::Http11
             && facts.expect_continue
             && framing != BodyFraming::None,
@@ -795,6 +806,15 @@ pub struct Headers<'a> {
     fields: slice::Iter<'a, Field>,
 }
 
+impl<'a> Headers<'a> {
+    pub(crate) fn new(head: &'a [u8], fields: &'a [Field]) -> Self {
+        Self {
+            head,
+            fields: fields.iter(),
+        }
+    }
+}
+
 impl<'a> Iterator for Headers<'a> {
     type Item = (&'a str, &'a [u8]);
 
@@ -885,6 +905,71 @@ impl fmt::Debug for HeaderValues<'_, '_> {
         f.debug_list()
             .entries(self.clone().map(|value| FieldValue { name, value }))
             .finish()
+    }
+}
+
+/// Iterator over the elements of a list field (`#rule`) across every line
+/// with one name: what [`RequestHead::header_list`],
+/// [`ResponseHead::header_list`], and [`RequestHead::upgrade_protocols`]
+/// return. Elements are trimmed of whitespace, empty ones are skipped, and
+/// a comma inside a quoted string does not split an element.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{ServerConn, ServerEvent};
+///
+/// let mut conn = ServerConn::new();
+/// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, X-Trace\r\n\r\n");
+/// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+/// let options: Vec<&[u8]> = req.header_list("connection").collect();
+/// assert_eq!(options, [&b"keep-alive"[..], b"X-Trace"]);
+/// ```
+#[derive(Clone)]
+pub struct ListElements<'a, 'n> {
+    head: &'a [u8],
+    fields: slice::Iter<'a, Field>,
+    name: &'n [u8],
+    current: ListSplit<'a>,
+    skip_h2c: bool,
+}
+
+impl<'a> Iterator for ListElements<'a, '_> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(e) = self.current.next() {
+                if self.skip_h2c && is_h2c(e) {
+                    continue;
+                }
+                return Some(e);
+            }
+            let (head, name) = (self.head, self.name);
+            let field = self
+                .fields
+                .find(|f| f.name.get(head).eq_ignore_ascii_case(name))?;
+            self.current = list_elements(field.value.get(head));
+        }
+    }
+}
+
+impl fmt::Debug for ListElements<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.name;
+        f.debug_list()
+            .entries(self.clone().map(|value| FieldValue { name, value }))
+            .finish()
+    }
+}
+
+fn list_values<'a, 'n>(head: &'a [u8], fields: &'a [Field], name: &'n str) -> ListElements<'a, 'n> {
+    ListElements {
+        head,
+        fields: fields.iter(),
+        name: name.as_bytes(),
+        current: list_elements(&[]),
+        skip_h2c: false,
     }
 }
 
@@ -1297,6 +1382,72 @@ impl<'a> RequestHead<'a> {
         self.info.upgrade
     }
 
+    /// Whether the request carries an expectation other than
+    /// `100-continue` (any `Expect` list element, any HTTP version), which
+    /// a server may answer with `417 Expectation Failed` (RFC 9110 section
+    /// 10.1.1). The core never answers it by itself; the blocking server
+    /// does. The expectation never changes how the body is framed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"PUT /f HTTP/1.1\r\nHost: a\r\nExpect: 100-continue, x-fast\r\nContent-Length: 1\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// assert!(req.expects_continue());
+    /// assert!(req.has_unknown_expectation());
+    /// ```
+    #[must_use]
+    pub fn has_unknown_expectation(&self) -> bool {
+        self.info.unknown_expectation
+    }
+
+    /// The protocols the request's `Upgrade` field offers, in order, as
+    /// product tokens (`websocket`, `foo/2`), across every `Upgrade` line;
+    /// `h2c` is left out (it is never an offer). Empty unless
+    /// [`is_upgrade`](Self::is_upgrade).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: h2c, websocket/13, irc\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// let offered: Vec<&[u8]> = req.upgrade_protocols().collect();
+    /// assert_eq!(offered, [&b"websocket/13"[..], b"irc"]);
+    /// ```
+    #[must_use]
+    pub fn upgrade_protocols(&self) -> ListElements<'a, 'static> {
+        let mut list = list_values(self.head, self.fields, "upgrade");
+        list.skip_h2c = true;
+        if !self.info.upgrade {
+            list.fields = [].iter();
+        }
+        list
+    }
+
+    /// The elements of a comma-separated list field (`#rule`, RFC 9110
+    /// section 5.6.1) across every line with this name, in order, trimmed
+    /// of whitespace, empty elements skipped. A comma inside a quoted
+    /// string does not split an element.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nAccept: text/html, ,\r\nAccept: x/y;q=\"0.5,1\"\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// let accept: Vec<&[u8]> = req.header_list("accept").collect();
+    /// assert_eq!(accept, [&b"text/html"[..], b"x/y;q=\"0.5,1\""]);
+    /// ```
+    #[must_use]
+    pub fn header_list<'n>(&self, name: &'n str) -> ListElements<'a, 'n> {
+        list_values(self.head, self.fields, name)
+    }
+
     /// Whether the request's `Upgrade` field offers `protocol` (see
     /// [`Response::switching_protocols`](crate::Response::switching_protocols)).
     pub(crate) fn offers(&self, protocol: &[u8]) -> bool {
@@ -1495,6 +1646,42 @@ impl<'a> ResponseHead<'a> {
         self.info.content_length
     }
 
+    /// The elements of a list field across every line with this name (see
+    /// [`RequestHead::header_list`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ClientConn, ClientEvent, Request};
+    /// # let mut conn = ClientConn::new();
+    /// # conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new()).unwrap();
+    /// # let _ = conn.feed(b"HTTP/1.1 200 OK\r\nVary: accept\r\nVary: origin, cookie\r\nContent-Length: 0\r\n\r\n");
+    /// # let ClientEvent::Response(resp) = conn.poll().unwrap() else { panic!() };
+    /// assert_eq!(resp.header_list("vary").count(), 3);
+    /// ```
+    #[must_use]
+    pub fn header_list<'n>(&self, name: &'n str) -> ListElements<'a, 'n> {
+        list_values(self.head, self.fields, name)
+    }
+
+    /// Whether this is an interim (1xx) response head, as reported by
+    /// [`ClientEvent::Informational`](crate::ClientEvent::Informational).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ClientConn, ClientEvent, Request};
+    /// # let mut conn = ClientConn::new();
+    /// # conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new()).unwrap();
+    /// # let _ = conn.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    /// # let ClientEvent::Response(resp) = conn.poll().unwrap() else { panic!() };
+    /// assert!(!resp.is_informational());
+    /// ```
+    #[must_use]
+    pub fn is_informational(&self) -> bool {
+        (100..200).contains(&self.info.status)
+    }
+
     /// How the response body is delimited (accounts for `HEAD` requests and
     /// bodiless status codes).
     ///
@@ -1553,8 +1740,8 @@ mod tests {
     fn scan(msg: &[u8], kind: HeadKind) -> Result<(HeadScanner, usize), HttpError> {
         let mut s = HeadScanner::new();
         match s.advance(msg, &Limits::new(), kind, true)? {
-            Progress::Done(n) => Ok((s, n)),
-            Progress::Partial => Err(HttpError::UnexpectedEof),
+            Scan::Done(n) => Ok((s, n)),
+            Scan::Partial => Err(HttpError::UnexpectedEof),
         }
     }
 
@@ -1565,12 +1752,12 @@ mod tests {
         for end in 1..msg.len() {
             assert!(matches!(
                 s.advance(&msg[..end], &Limits::new(), HeadKind::Request, true),
-                Ok(Progress::Partial)
+                Ok(Scan::Partial)
             ));
         }
         assert!(matches!(
             s.advance(msg, &Limits::new(), HeadKind::Request, true),
-            Ok(Progress::Done(n)) if n == msg.len()
+            Ok(Scan::Done(n)) if n == msg.len()
         ));
         assert_eq!(s.fields.len(), 1);
     }

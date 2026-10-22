@@ -7,12 +7,20 @@ use crate::{
     buffer::Buffer,
     error::HttpError,
     head::{
-        Asked, HeadKind, HeadScanner, Progress, ResponseHead, ResponseInfo, interpret_response,
+        Asked, HeadKind, HeadScanner, Headers, ResponseHead, ResponseInfo, Scan, interpret_response,
     },
     limits::Limits,
-    message::{OutBody, Request},
+    message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
     method::Method,
+    server::Progress,
 };
+
+/// The error for sending a body the server declined (a final status in
+/// answer to `Expect: 100-continue`).
+const REFUSED: HttpError = HttpError::InvalidState(
+    "the server answered with a final status instead of 100 Continue; \
+     the body must not be sent",
+);
 
 /// What a [`ClientConn`] has for the caller after [`poll`](ClientConn::poll).
 ///
@@ -39,14 +47,31 @@ use crate::{
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ClientEvent<'a> {
-    /// The response head arrived (interim 1xx responses other than 101 are
-    /// skipped; together they count against
-    /// [`Limits::max_header_bytes`](crate::Limits::max_header_bytes)). Its
-    /// body follows as [`Body`](ClientEvent::Body) events, then
-    /// [`ResponseEnd`](ClientEvent::ResponseEnd).
+    /// The final response head arrived. Its body follows as
+    /// [`Body`](ClientEvent::Body) events, then
+    /// [`ResponseEnd`](ClientEvent::ResponseEnd). Interim (1xx) responses
+    /// before it are skipped unless
+    /// [`set_report_informational`](ClientConn::set_report_informational)
+    /// asked for them; either way they count against
+    /// [`Limits::max_interim`](crate::Limits::max_interim) and, together,
+    /// [`Limits::max_header_bytes`](crate::Limits::max_header_bytes).
     Response(ResponseHead<'a>),
+    /// An interim response other than `101` (for example `103 Early Hints`,
+    /// or `102 Processing`), only with
+    /// [`set_report_informational(true)`](ClientConn::set_report_informational).
+    /// The final response follows.
+    Informational(ResponseHead<'a>),
+    /// The server answered `100 Continue` to a request built with
+    /// [`Request::expect_continue`](crate::Request::expect_continue): send
+    /// the body now.
+    Continue,
     /// A run of body bytes, after chunked decoding.
     Body(&'a [u8]),
+    /// The response's trailer fields, just before
+    /// [`ResponseEnd`](ClientEvent::ResponseEnd): only with
+    /// [`set_report_trailers(true)`](ClientConn::set_report_trailers) and a
+    /// non-empty trailer section.
+    Trailers(Headers<'a>),
     /// The response is complete.
     ResponseEnd,
     /// More input is needed (or, for a body that runs until close,
@@ -67,6 +92,9 @@ pub enum ClientEvent<'a> {
 enum State {
     Idle,
     Head,
+    /// An interim head was reported and is still pinned; the next poll
+    /// drops it and waits for the next head.
+    Interim,
     Body,
     Complete,
     Upgraded,
@@ -117,10 +145,22 @@ pub struct ClientConn {
     state: State,
     req: ReqWrite,
     keep_alive: bool,
-    /// Bytes of interim (1xx) heads skipped for the current request. They
+    /// Bytes of interim (1xx) heads seen for the current request. They
     /// count against the header budget so that a server cannot keep the
     /// client parsing forever without answering.
     interim_bytes: usize,
+    /// Interim heads seen for the current request, against `max_interim`.
+    interim_count: u16,
+    report_interim: bool,
+    report_trailers: bool,
+    /// The request was sent with `Expect: 100-continue` and neither a `100`,
+    /// a final response, nor body bytes have happened since.
+    waiting_continue: bool,
+    /// A final response arrived while waiting for `100`: the promised body
+    /// must not be sent, and the connection closes after the response.
+    body_refused: bool,
+    /// The request body was declared chunked (trailers allowed).
+    req_chunked: bool,
 }
 
 impl Default for ClientConn {
@@ -180,6 +220,12 @@ impl ClientConn {
             req: ReqWrite::Sent,
             keep_alive: true,
             interim_bytes: 0,
+            interim_count: 0,
+            report_interim: false,
+            report_trailers: false,
+            waiting_continue: false,
+            body_refused: false,
+            req_chunked: false,
         }
     }
 
@@ -263,12 +309,23 @@ impl ClientConn {
     /// on methods that do not expect one); a streamed body continues with
     /// [`send_body`](Self::send_body) and [`end_body`](Self::end_body).
     ///
+    /// A request built with [`Request::expect_continue`] is sent head first:
+    /// [`is_waiting_for_continue`](Self::is_waiting_for_continue) is true
+    /// until the server answers `100 Continue` (reported as
+    /// [`ClientEvent::Continue`]: then send the body), a final status (then
+    /// the body must not be sent and the connection closes after the
+    /// response), or the caller sends the body anyway (RFC 9110 section
+    /// 10.1.1 allows it after a wait of its choosing).
+    ///
     /// # Errors
     ///
     /// - the first error recorded by the [`Request`] builder;
     /// - [`HttpError::MissingHost`] when the request has no `host` header;
-    /// - [`HttpError::InvalidState`] when a request is already outstanding
-    ///   or the connection is closed.
+    /// - [`HttpError::InvalidState`] when a request is already outstanding,
+    ///   the connection is closed, or an `expect_continue` request has no
+    ///   streamed body (`content_length` or `chunked`);
+    /// - [`HttpError::UnexpectedData`] when response bytes nobody asked for
+    ///   are buffered.
     ///
     /// # Examples
     ///
@@ -299,6 +356,14 @@ impl ClientConn {
         }
         if !request.has_host {
             return Err(HttpError::MissingHost);
+        }
+        if request.expect_continue && matches!(request.body, OutBody::Full(_)) {
+            // The point of the expectation is to hold the body back until
+            // the server agrees; a full body would be written at once.
+            return Err(HttpError::InvalidState(
+                "expect_continue needs a streamed body (content_length or chunked), \
+                 sent after ClientEvent::Continue",
+            ));
         }
         let method = request.method_kind;
         let expects_body = matches!(method, Method::Post | Method::Put | Method::Patch);
@@ -337,20 +402,28 @@ impl ClientConn {
         };
         self.upgrade_asked = request.upgrade;
         self.keep_alive = !request.close;
+        self.req_chunked = matches!(request.body, OutBody::Chunked);
+        self.waiting_continue = request.expect_continue;
+        self.body_refused = false;
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
         self.interim_bytes = 0;
+        self.interim_count = 0;
         self.state = State::Head;
         Ok(())
     }
 
     /// Writes body bytes of a streamed request.
     ///
+    /// Sending body bytes while waiting for `100 Continue` ends the wait.
+    ///
     /// # Errors
     ///
     /// [`HttpError::BodyLengthMismatch`] past the declared length;
-    /// [`HttpError::InvalidState`] when no streamed request is in progress.
+    /// [`HttpError::InvalidState`] when no streamed request is in progress,
+    /// or when the server answered an `expect_continue` request with a final
+    /// status (the body must not be sent then).
     ///
     /// # Examples
     ///
@@ -365,8 +438,15 @@ impl ClientConn {
     /// assert!(out.ends_with(b"4\r\npart\r\n0\r\n\r\n"));
     /// ```
     pub fn send_body(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), HttpError> {
+        if self.body_refused {
+            return Err(REFUSED);
+        }
         match &mut self.req {
-            ReqWrite::Streaming(encoder) => encoder.write(data, out),
+            ReqWrite::Streaming(encoder) => {
+                encoder.write(data, out)?;
+                self.waiting_continue = false;
+                Ok(())
+            }
             ReqWrite::Sent => Err(HttpError::InvalidState("no streamed request in progress")),
         }
     }
@@ -392,14 +472,55 @@ impl ClientConn {
     /// assert!(out.ends_with(b"\r\n\r\nok"));
     /// ```
     pub fn end_body(&mut self, out: &mut Vec<u8>) -> Result<(), HttpError> {
-        match &mut self.req {
-            ReqWrite::Streaming(encoder) => {
-                encoder.finish(out)?;
-                self.req = ReqWrite::Sent;
-                Ok(())
-            }
-            ReqWrite::Sent => Err(HttpError::InvalidState("no streamed request in progress")),
+        self.end_body_with_trailers(&[], out)
+    }
+
+    /// Ends a streamed chunked request body with a trailer section (see
+    /// [`ServerConn::end_body_with_trailers`](crate::ServerConn::end_body_with_trailers)
+    /// for the fields that are refused).
+    ///
+    /// # Errors
+    ///
+    /// [`HttpError::TrailerNotAllowed`] for a forbidden field or a body
+    /// that is not chunked; the field errors of
+    /// [`Request::header`]; otherwise as [`end_body`](Self::end_body).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// let mut out = Vec::new();
+    /// conn.send_request(&Request::put("/f").header("host", "a").chunked(), &mut out)?;
+    /// conn.send_body(b"data", &mut out)?;
+    /// conn.end_body_with_trailers(&[("content-digest", b"sha-256=:x:")], &mut out)?;
+    /// assert!(out.ends_with(b"0\r\ncontent-digest: sha-256=:x:\r\n\r\n"));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn end_body_with_trailers(
+        &mut self,
+        trailers: &[(&str, &[u8])],
+        out: &mut Vec<u8>,
+    ) -> Result<(), HttpError> {
+        if self.body_refused {
+            return Err(REFUSED);
         }
+        let ReqWrite::Streaming(encoder) = &mut self.req else {
+            return Err(HttpError::InvalidState("no streamed request in progress"));
+        };
+        if !trailers.is_empty() && !self.req_chunked {
+            return Err(HttpError::TrailerNotAllowed);
+        }
+        if *encoder == Encoder::Chunked {
+            push_last_chunk_with_trailers(out, trailers)?;
+        } else {
+            check_trailers(trailers)?;
+            encoder.finish(out)?;
+        }
+        self.req = ReqWrite::Sent;
+        self.waiting_continue = false;
+        Ok(())
     }
 
     /// Advances the response parser and reports what happened.
@@ -433,11 +554,13 @@ impl ClientConn {
                     return Ok(ClientEvent::Idle);
                 }
                 State::Head => return self.poll_head(),
+                State::Interim => {
+                    self.next_head();
+                    self.state = State::Head;
+                }
                 State::Body => return self.poll_body(),
                 State::Complete => {
-                    let reusable =
-                        self.keep_alive && self.info.keep_alive && self.req == ReqWrite::Sent;
-                    if reusable {
+                    if self.reusable() {
                         self.state = State::Idle;
                     } else {
                         self.state = State::Closed;
@@ -458,11 +581,11 @@ impl ClientConn {
                 .advance(self.buf.from(start), &self.limits, HeadKind::Response, true)
                 .map_err(|e| self.fail(e))?;
             let len = match progress {
-                Progress::Partial if self.buf.is_eof() => {
+                Scan::Partial if self.buf.is_eof() => {
                     return Err(self.fail(HttpError::UnexpectedEof));
                 }
-                Progress::Partial => return Ok(ClientEvent::NeedInput),
-                Progress::Done(len) => len,
+                Scan::Partial => return Ok(ClientEvent::NeedInput),
+                Scan::Done(len) => len,
             };
             let info = interpret_response(
                 self.buf.from(start),
@@ -485,24 +608,56 @@ impl ClientConn {
                 self.asked.connect && (200..300).contains(&status)
             };
             if switched {
+                self.waiting_continue = false;
                 self.state = State::Upgraded;
             } else if (100..200).contains(&status) {
-                // Interim response (100 Continue, 103 Early Hints): skip it
-                // and keep waiting for the final one.
+                // Interim response (100 Continue, 103 Early Hints): budgeted
+                // by count and by bytes, so a server cannot keep the client
+                // parsing forever without a final answer.
+                self.interim_count = self.interim_count.saturating_add(1);
+                if self.interim_count > self.limits.max_interim() {
+                    return Err(self.fail(HttpError::TooManyInterim));
+                }
                 self.interim_bytes = self.interim_bytes.saturating_add(len);
                 if self.interim_bytes > self.limits.max_header_bytes() {
                     return Err(self.fail(HttpError::HeadersTooLarge));
                 }
-                self.buf.unpin();
-                self.buf.pin_at_pos();
-                self.scanner.reset();
+                if status == 100 && self.waiting_continue {
+                    self.waiting_continue = false;
+                    self.next_head();
+                    return Ok(ClientEvent::Continue);
+                }
+                if self.report_interim {
+                    self.state = State::Interim;
+                    return Ok(ClientEvent::Informational(self.view()));
+                }
+                self.next_head();
                 continue;
             } else {
+                if self.waiting_continue {
+                    // RFC 9110 section 10.1.1: a final status instead of 100
+                    // means the server does not want the body. A promised
+                    // body that is never sent leaves the request unfinished,
+                    // so the connection closes after this response.
+                    self.waiting_continue = false;
+                    self.body_refused = self.req != ReqWrite::Sent;
+                }
                 self.decoder.start(info.framing);
                 self.state = State::Body;
             }
             return Ok(ClientEvent::Response(self.view()));
         }
+    }
+
+    /// Drops the current (interim) head and waits for the next one.
+    fn next_head(&mut self) {
+        self.buf.unpin();
+        self.buf.pin_at_pos();
+        self.scanner.reset();
+    }
+
+    fn reusable(&self) -> bool {
+        self.keep_alive && self.info.keep_alive && self.req == ReqWrite::Sent && !self.body_refused
     }
 
     fn poll_body(&mut self) -> Result<ClientEvent<'_>, HttpError> {
@@ -512,6 +667,7 @@ impl ClientConn {
             self.buf.is_eof(),
             &self.limits,
             &mut self.trailers,
+            self.report_trailers,
             &mut framing_bytes,
         );
         self.buf.consume(framing_bytes);
@@ -521,6 +677,10 @@ impl ClientConn {
                 self.buf.consume(n);
                 Ok(ClientEvent::Body(self.buf.range(start, start + n)))
             }
+            Step::Trailers => Ok(ClientEvent::Trailers(Headers::new(
+                self.buf.unread(),
+                &self.trailers.fields,
+            ))),
             Step::Done => {
                 self.state = State::Complete;
                 Ok(ClientEvent::ResponseEnd)
@@ -595,6 +755,151 @@ impl ClientConn {
     #[must_use]
     pub fn remaining_input(&self) -> &[u8] {
         self.buf.unread()
+    }
+
+    /// When `true`, each interim response other than `101` (for example
+    /// `103 Early Hints`) is reported as [`ClientEvent::Informational`]
+    /// before the final response; when `false` (the default) they are
+    /// skipped. Interim responses count against
+    /// [`Limits::max_interim`](crate::Limits::max_interim) either way.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// conn.set_report_informational(true);
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = conn.feed(b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n");
+    /// let ClientEvent::Informational(hints) = conn.poll()? else { panic!() };
+    /// assert_eq!(hints.status(), 103);
+    /// assert_eq!(hints.header("link"), Some(&b"</a.css>; rel=preload"[..]));
+    /// assert!(matches!(conn.poll()?, ClientEvent::Response(r) if r.status() == 204));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn set_report_informational(&mut self, report: bool) {
+        self.report_interim = report;
+    }
+
+    /// When `true`, a response's trailer fields are kept (bounded by the
+    /// trailer budgets of [`Limits`]) and reported as
+    /// [`ClientEvent::Trailers`] just before [`ClientEvent::ResponseEnd`];
+    /// when `false` (the default) they are validated and discarded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// conn.set_report_trailers(true);
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = conn.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nServer-Timing: db;dur=5\r\n\r\n");
+    /// let mut saw = false;
+    /// loop {
+    ///     match conn.poll()? {
+    ///         ClientEvent::Trailers(t) => saw = t.len() == 1,
+    ///         ClientEvent::ResponseEnd => break,
+    ///         _ => {}
+    ///     }
+    /// }
+    /// assert!(saw);
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn set_report_trailers(&mut self, report: bool) {
+        self.report_trailers = report;
+    }
+
+    /// Whether a request built with
+    /// [`Request::expect_continue`](crate::Request::expect_continue) is
+    /// still waiting: no `100 Continue`, no final response, and no body
+    /// bytes sent yet. A client may stop waiting on its own timer and send
+    /// the body anyway (RFC 9110 section 10.1.1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// let mut out = Vec::new();
+    /// let upload = Request::put("/big").header("host", "a").content_length(4).expect_continue();
+    /// conn.send_request(&upload, &mut out)?;
+    /// assert!(conn.is_waiting_for_continue());
+    /// let _ = conn.feed(b"HTTP/1.1 100 Continue\r\n\r\n");
+    /// assert!(matches!(conn.poll()?, ClientEvent::Continue));
+    /// assert!(!conn.is_waiting_for_continue());
+    /// conn.send_body(b"data", &mut out)?;
+    /// conn.end_body(&mut out)?;
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn is_waiting_for_continue(&self) -> bool {
+        self.waiting_continue
+    }
+
+    /// Whether the connection can carry another request now: no request
+    /// is outstanding (or the last response completed) and both sides allow
+    /// keep-alive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// assert!(conn.is_reusable());
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// assert!(!conn.is_reusable());
+    /// let _ = conn.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    /// while !matches!(conn.poll()?, ClientEvent::ResponseEnd) {}
+    /// assert!(conn.is_reusable());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn is_reusable(&self) -> bool {
+        match self.state {
+            State::Idle => self.buf.unread().is_empty() && !self.buf.is_eof(),
+            State::Complete => self.reusable() && self.buf.unread().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// The connection's phase, for response deadlines: [`Progress::Idle`]
+    /// with no request outstanding, [`Progress::WritingBody`] while a
+    /// request body is streamed, [`Progress::AwaitingResponse`] until the
+    /// first byte of the response, then [`Progress::Head`] and
+    /// [`Progress::Body`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Progress, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// assert_eq!(conn.progress(), Progress::Idle);
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// assert_eq!(conn.progress(), Progress::AwaitingResponse);
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn progress(&self) -> Progress {
+        if matches!(self.req, ReqWrite::Streaming(_))
+            && !self.body_refused
+            && !matches!(self.state, State::Closed | State::Upgraded)
+        {
+            return Progress::WritingBody;
+        }
+        match self.state {
+            State::Idle => Progress::Idle,
+            State::Head if self.buf.from(self.buf.pin()).is_empty() => Progress::AwaitingResponse,
+            State::Head | State::Interim => Progress::Head,
+            State::Body => Progress::Body,
+            State::Complete if self.reusable() => Progress::Idle,
+            State::Complete | State::Closed => Progress::Closed,
+            State::Upgraded => Progress::Upgraded,
+        }
     }
 }
 

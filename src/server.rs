@@ -5,10 +5,13 @@ use alloc::vec::Vec;
 use crate::{
     body::{Decoder, Encoder, Step, push_framing},
     buffer::Buffer,
+    date::HttpDate,
     error::HttpError,
-    head::{HeadKind, HeadScanner, Progress, RequestHead, RequestInfo, Version, interpret_request},
+    head::{
+        HeadKind, HeadScanner, Headers, RequestHead, RequestInfo, Scan, Version, interpret_request,
+    },
     limits::Limits,
-    message::{OutBody, Response},
+    message::{OutBody, Response, check_trailers, push_last_chunk_with_trailers},
     method::Method,
     status::reason_phrase,
     syntax::push_decimal,
@@ -53,6 +56,12 @@ pub enum ServerEvent<'a> {
     Request(RequestHead<'a>),
     /// A run of body bytes, after chunked decoding.
     Body(&'a [u8]),
+    /// The request's trailer fields, just before
+    /// [`RequestEnd`](ServerEvent::RequestEnd): only with
+    /// [`set_report_trailers(true)`](ServerConn::set_report_trailers) and a
+    /// non-empty trailer section. They never change how the request was
+    /// framed. The values of credential fields are redacted in `Debug`.
+    Trailers(Headers<'a>),
     /// The request is complete. Send the response if it has not been sent.
     RequestEnd,
     /// More input is needed: read from the socket, then
@@ -86,6 +95,46 @@ enum RespState {
     Idle,
     Streaming(Encoder),
     Sent,
+}
+
+/// The phase of a connection, for drivers that run header-read, request,
+/// and response deadlines: what [`ServerConn::progress`] and
+/// [`ClientConn::progress`](crate::ClientConn::progress) report.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{Progress, ServerConn, ServerEvent};
+///
+/// let mut conn = ServerConn::new();
+/// assert_eq!(conn.progress(), Progress::Idle);
+/// let _ = conn.feed(b"GET / HTTP/1.1\r\n");
+/// assert!(matches!(conn.poll(), Ok(ServerEvent::NeedInput)));
+/// assert_eq!(conn.progress(), Progress::Head);
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Progress {
+    /// Between messages: no byte of the next one has been seen. Idle
+    /// keep-alive time belongs to this phase, so a request deadline should
+    /// not start here.
+    Idle,
+    /// Some bytes of a head have arrived; the head is not complete.
+    Head,
+    /// The head is complete and body bytes are still to come.
+    Body,
+    /// Server: the request is complete (or has no body left to read) and its
+    /// response is not finished. Client: the request was sent and nothing of
+    /// the response has arrived.
+    AwaitingResponse,
+    /// A streamed body is being written: the response on a server, the
+    /// request on a client.
+    WritingBody,
+    /// The connection belongs to another protocol.
+    Upgraded,
+    /// The connection is finished (or will be once the last response is
+    /// written).
+    Closed,
 }
 
 /// The server side of one HTTP/1.1 connection: a sans-IO state machine.
@@ -136,7 +185,16 @@ pub struct ServerConn {
     state: ReqState,
     resp: RespState,
     keep_alive: bool,
+    /// Cleared by `set_keep_alive(false)`: every later response closes.
+    allow_keep_alive: bool,
     continue_sent: bool,
+    /// A body byte of the current request was delivered.
+    body_seen: bool,
+    /// The response being streamed was declared chunked (trailers allowed,
+    /// even if an HTTP/1.0 client forced a close-delimited body).
+    resp_chunked: bool,
+    report_trailers: bool,
+    requests_served: u64,
 }
 
 impl Default for ServerConn {
@@ -195,7 +253,12 @@ impl ServerConn {
             state: ReqState::Head,
             resp: RespState::Idle,
             keep_alive: false,
+            allow_keep_alive: true,
             continue_sent: false,
+            body_seen: false,
+            resp_chunked: false,
+            report_trailers: false,
+            requests_served: 0,
         }
     }
 
@@ -299,7 +362,7 @@ impl ServerConn {
             match self.state {
                 ReqState::Head => return self.poll_head(),
                 ReqState::Body => {
-                    if self.resp == RespState::Sent && !self.decoder.is_done() {
+                    if self.resp == RespState::Sent && !self.decoder.is_read() {
                         // Answered before the body was read: the rest of the
                         // body cannot be trusted to frame the next request.
                         self.state = ReqState::Closed;
@@ -331,15 +394,15 @@ impl ServerConn {
             .advance(msg, &self.limits, HeadKind::Request, true)
             .map_err(|e| self.fail(e))?;
         let len = match progress {
-            Progress::Partial if self.buf.is_eof() => {
+            Scan::Partial if self.buf.is_eof() => {
                 if self.buf.from(start).is_empty() {
                     self.state = ReqState::Closed;
                     return Ok(ServerEvent::Closed);
                 }
                 return Err(self.fail(HttpError::UnexpectedEof));
             }
-            Progress::Partial => return Ok(ServerEvent::NeedInput),
-            Progress::Done(len) => len,
+            Scan::Partial => return Ok(ServerEvent::NeedInput),
+            Scan::Done(len) => len,
         };
         let info = interpret_request(
             self.buf.from(start),
@@ -364,6 +427,7 @@ impl ServerConn {
             self.buf.is_eof(),
             &self.limits,
             &mut self.trailers,
+            self.report_trailers,
             &mut framing_bytes,
         );
         self.buf.consume(framing_bytes);
@@ -371,8 +435,13 @@ impl ServerConn {
             Step::Data(n) => {
                 let start = self.buf.pos();
                 self.buf.consume(n);
+                self.body_seen = true;
                 Ok(ServerEvent::Body(self.buf.range(start, start + n)))
             }
+            Step::Trailers => Ok(ServerEvent::Trailers(Headers::new(
+                self.buf.unread(),
+                &self.trailers.fields,
+            ))),
             Step::Done => {
                 self.state = ReqState::Complete;
                 Ok(ServerEvent::RequestEnd)
@@ -394,6 +463,7 @@ impl ServerConn {
         self.resp = RespState::Idle;
         self.info = RequestInfo::EMPTY;
         self.continue_sent = false;
+        self.body_seen = false;
         self.state = ReqState::Head;
     }
 
@@ -407,7 +477,7 @@ impl ServerConn {
     /// exchange is complete, or the request has no body at all (a response
     /// given at [`ServerEvent::Request`] then leaves nothing unread).
     fn body_read(&self) -> bool {
-        self.state == ReqState::Complete || (self.state == ReqState::Body && self.decoder.is_done())
+        self.state == ReqState::Complete || (self.state == ReqState::Body && self.decoder.is_read())
     }
 
     fn view(&self) -> RequestHead<'_> {
@@ -512,6 +582,253 @@ impl ServerConn {
         self.respond_dated(response, None, out)
     }
 
+    /// As [`respond`](Self::respond), adding `date: <date>` unless the
+    /// response set its own `date` field. Keep a
+    /// [`DateCache`](crate::DateCache) per driver thread and pass
+    /// `cache.update(now)`: the value is reformatted once per second, not
+    /// once per response.
+    ///
+    /// # Errors
+    ///
+    /// As [`respond`](Self::respond).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{DateCache, Response, ServerConn, ServerEvent};
+    ///
+    /// let mut dates = DateCache::new();
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    /// let mut out = Vec::new();
+    /// conn.respond_with_date(&Response::new(204), dates.update(784_111_777), &mut out)?;
+    /// assert!(out.windows(35).any(|w| w == b"date: Sun, 06 Nov 1994 08:49:37 GMT"));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn respond_with_date(
+        &mut self,
+        response: &Response,
+        date: &HttpDate,
+        out: &mut Vec<u8>,
+    ) -> Result<(), HttpError> {
+        self.respond_dated(response, Some(date.as_bytes()), out)
+    }
+
+    /// Writes an interim (1xx) response other than `100` and `101`, for
+    /// example `103 Early Hints` with `link` fields, before the final
+    /// response. It may be sent more than once, for any request method,
+    /// at any point before the final response starts (RFC 9110 section
+    /// 15.2), but never to an HTTP/1.0 client. Only the status and the
+    /// fields are written; an interim response has no body and does not
+    /// change the connection.
+    ///
+    /// # Errors
+    ///
+    /// The first error recorded by the builder; [`HttpError::InvalidStatus`]
+    /// unless the status is in `102..=199`; [`HttpError::BodyNotAllowed`]
+    /// for a body; [`HttpError::InterimNotAllowed`] for an HTTP/1.0 request
+    /// or once the final response has started; [`HttpError::InvalidState`]
+    /// when there is no request (or after a parse error, an upgrade, or the
+    /// end of the connection).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    /// let mut out = Vec::new();
+    /// let hints = Response::new(103).header("link", "</style.css>; rel=preload; as=style");
+    /// conn.send_informational(&hints, &mut out)?;
+    /// conn.respond(&Response::text(200, "page"), &mut out)?;
+    /// assert!(out.starts_with(b"HTTP/1.1 103 Early Hints\r\nlink: </style.css>"));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn send_informational(
+        &mut self,
+        interim: &Response,
+        out: &mut Vec<u8>,
+    ) -> Result<(), HttpError> {
+        if let Some(e) = interim.error() {
+            return Err(e);
+        }
+        let status = interim.status();
+        if !(102..=199).contains(&status) {
+            return Err(HttpError::InvalidStatus);
+        }
+        if !matches!(&interim.body, OutBody::Full(b) if b.is_empty()) {
+            return Err(HttpError::BodyNotAllowed);
+        }
+        if !matches!(self.state, ReqState::Body | ReqState::Complete) {
+            return Err(HttpError::InvalidState(
+                "an interim response needs a request to answer",
+            ));
+        }
+        if self.info.version != Version::Http11 || self.resp != RespState::Idle {
+            return Err(HttpError::InterimNotAllowed);
+        }
+        out.extend_from_slice(b"HTTP/1.1 ");
+        push_decimal(out, u64::from(status));
+        out.push(b' ');
+        out.extend_from_slice(reason_phrase(status).as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(interim.fields());
+        out.extend_from_slice(b"\r\n");
+        Ok(())
+    }
+
+    /// Stops (`false`) or allows (`true`) keep-alive. With `false` the
+    /// current response, or the next one if it has not started, carries
+    /// `connection: close`, and the connection ends after it: the gentlest
+    /// way to shed load or to cap requests per connection. If the current
+    /// response has already been written, the connection ends after it.
+    /// `true` cannot keep open a connection the protocol requires to close
+    /// (the client asked, or body bytes were left unread).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    /// conn.set_keep_alive(false);
+    /// let mut out = Vec::new();
+    /// conn.respond(&Response::new(204), &mut out).unwrap();
+    /// assert!(out.windows(17).any(|w| w == b"connection: close"));
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Closed));
+    /// ```
+    pub fn set_keep_alive(&mut self, keep: bool) {
+        self.allow_keep_alive = keep;
+        if !keep && self.resp != RespState::Idle {
+            self.keep_alive = false;
+        }
+    }
+
+    /// Whether the connection can stay open after the current exchange, as
+    /// far as is known now: keep-alive is allowed (see
+    /// [`set_keep_alive`](Self::set_keep_alive)) and neither the request,
+    /// the response, nor an error requires a close.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// assert!(conn.keep_alive());
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// assert!(!conn.keep_alive());
+    /// ```
+    #[must_use]
+    pub fn keep_alive(&self) -> bool {
+        self.allow_keep_alive
+            && match self.state {
+                ReqState::Head => true,
+                ReqState::Body | ReqState::Complete => self.keep_alive,
+                ReqState::Upgraded | ReqState::Failed | ReqState::Closed => false,
+            }
+    }
+
+    /// The number of responses completed on this connection (full-body
+    /// responses when written, streamed ones at `end_body`), so a driver can
+    /// cap requests per connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    /// assert_eq!(conn.requests_served(), 0);
+    /// conn.respond(&Response::new(204), &mut Vec::new()).unwrap();
+    /// assert_eq!(conn.requests_served(), 1);
+    /// ```
+    #[must_use]
+    pub fn requests_served(&self) -> u64 {
+        self.requests_served
+    }
+
+    /// The connection's phase, for header-read, request, and response
+    /// deadlines. [`Progress::Head`] starts at the first byte of a request,
+    /// so idle keep-alive time (`Idle`) is never counted against a request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Progress, Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\nab");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Body(_)));
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::NeedInput));
+    /// assert_eq!(conn.progress(), Progress::Body);
+    /// let _ = conn.feed(b"cd");
+    /// while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    /// assert_eq!(conn.progress(), Progress::AwaitingResponse);
+    /// conn.respond(&Response::new(200).chunked(), &mut Vec::new()).unwrap();
+    /// assert_eq!(conn.progress(), Progress::WritingBody);
+    /// conn.end_body(&mut Vec::new()).unwrap();
+    /// assert_eq!(conn.progress(), Progress::Idle);
+    /// ```
+    #[must_use]
+    pub fn progress(&self) -> Progress {
+        if matches!(self.resp, RespState::Streaming(_)) {
+            return Progress::WritingBody;
+        }
+        match self.state {
+            ReqState::Head if self.buf.from(self.buf.pin()).is_empty() => Progress::Idle,
+            ReqState::Head => Progress::Head,
+            ReqState::Body if self.resp == RespState::Sent => Progress::Closed,
+            ReqState::Body if !self.decoder.is_read() => Progress::Body,
+            ReqState::Body => Progress::AwaitingResponse,
+            ReqState::Complete if self.resp != RespState::Sent => Progress::AwaitingResponse,
+            ReqState::Complete if self.keep_alive => Progress::Idle,
+            ReqState::Complete => Progress::Closed,
+            // One error response is still expected.
+            ReqState::Failed if self.resp == RespState::Idle => Progress::AwaitingResponse,
+            ReqState::Upgraded => Progress::Upgraded,
+            ReqState::Failed | ReqState::Closed => Progress::Closed,
+        }
+    }
+
+    /// When `true`, a request's trailer fields are kept (bounded by
+    /// [`Limits::max_trailer_fields`] and [`Limits::max_trailer_bytes`]) and
+    /// reported as [`ServerEvent::Trailers`] just before
+    /// [`ServerEvent::RequestEnd`]. When `false` (the default) they are
+    /// validated and discarded. Trailers never change how a message is
+    /// framed either way.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// conn.set_report_trailers(true);
+    /// let _ = conn.feed(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nDigest: sha-256=x\r\n\r\n");
+    /// let mut digest = None;
+    /// loop {
+    ///     match conn.poll().unwrap() {
+    ///         ServerEvent::Trailers(t) => digest = t.clone().find(|(n, _)| n.eq_ignore_ascii_case("digest")).map(|(_, v)| v.to_vec()),
+    ///         ServerEvent::RequestEnd => break,
+    ///         _ => {}
+    ///     }
+    /// }
+    /// assert_eq!(digest.as_deref(), Some(&b"sha-256=x"[..]));
+    /// ```
+    pub fn set_report_trailers(&mut self, report: bool) {
+        self.report_trailers = report;
+    }
+
     pub(crate) fn respond_dated(
         &mut self,
         response: &Response,
@@ -571,8 +888,13 @@ impl ServerConn {
             }
         }
 
-        let mut close = failed || response.close || !self.keep_alive || !self.body_read();
+        let mut close = failed
+            || response.close
+            || !self.keep_alive
+            || !self.allow_keep_alive
+            || !self.body_read();
         let head_only = method == Method::Head || bodiless || tunnel;
+        self.resp_chunked = matches!(response.body, OutBody::Chunked);
         let (mut encoder, declared) = match &response.body {
             OutBody::Full(b) => (
                 Encoder::Length {
@@ -619,6 +941,7 @@ impl ServerConn {
             OutBody::Full(b) => {
                 encoder.write(b, out)?;
                 self.resp = RespState::Sent;
+                self.requests_served += 1;
             }
             _ => self.resp = RespState::Streaming(encoder),
         }
@@ -642,10 +965,12 @@ impl ServerConn {
     ///
     /// # Errors
     ///
-    /// [`HttpError::InvalidState`] unless the current request is HTTP/1.1,
-    /// its body has not been read yet, no response has been started, and
-    /// `100 Continue` has not already been sent for it. RFC 9110 section
-    /// 15.2 forbids any 1xx to an HTTP/1.0 client.
+    /// [`HttpError::InterimNotAllowed`] for an HTTP/1.0 request (RFC 9110
+    /// section 15.2 forbids any 1xx to an HTTP/1.0 client), once a body byte
+    /// has been read or the whole body has arrived, once a response has
+    /// started, or when `100 Continue` was already sent for this request;
+    /// [`HttpError::InvalidState`] when no request is waiting for its body
+    /// (none has arrived, or the connection failed, closed, or upgraded).
     ///
     /// # Examples
     ///
@@ -662,16 +987,19 @@ impl ServerConn {
     /// # Ok::<(), http_net::HttpError>(())
     /// ```
     pub fn send_continue(&mut self, out: &mut Vec<u8>) -> Result<(), HttpError> {
-        if self.state != ReqState::Body
-            || self.decoder.is_done()
+        if !matches!(self.state, ReqState::Body | ReqState::Complete) {
+            return Err(HttpError::InvalidState(
+                "100 Continue needs a request whose body is still to come",
+            ));
+        }
+        if self.state == ReqState::Complete
+            || self.decoder.is_read()
+            || self.body_seen
             || self.resp != RespState::Idle
             || self.info.version != Version::Http11
             || self.continue_sent
         {
-            return Err(HttpError::InvalidState(
-                "100 Continue answers an HTTP/1.1 request whose body has not been read, \
-                 once, before the final response",
-            ));
+            return Err(HttpError::InterimNotAllowed);
         }
         self.continue_sent = true;
         out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -730,17 +1058,73 @@ impl ServerConn {
     /// assert_eq!(conn.end_body(&mut out), Err(HttpError::BodyLengthMismatch));
     /// ```
     pub fn end_body(&mut self, out: &mut Vec<u8>) -> Result<(), HttpError> {
-        match &mut self.resp {
-            RespState::Streaming(encoder) => {
-                encoder.finish(out)?;
-                if *encoder == Encoder::CloseDelimited {
-                    self.keep_alive = false;
-                }
-                self.resp = RespState::Sent;
-                Ok(())
-            }
-            _ => Err(HttpError::InvalidState("no streamed response in progress")),
+        self.end_body_with_trailers(&[], out)
+    }
+
+    /// Ends a streamed chunked body with a trailer section: the last chunk,
+    /// then `trailers` as fields. Every field is validated before anything
+    /// is written.
+    ///
+    /// Trailers are optional metadata a recipient may discard (RFC 9110
+    /// section 6.5), so when the body could not be chunked (an HTTP/1.0
+    /// client forced a close-delimited body) or is not sent at all (`HEAD`),
+    /// they are dropped with it and the call still succeeds: the handler
+    /// does not need to know which framing the client forced.
+    ///
+    /// # Errors
+    ///
+    /// [`HttpError::TrailerNotAllowed`] for a field RFC 9110 section 6.5.1
+    /// keeps out of trailers (framing, routing, authentication, request
+    /// modifiers, response control, content handling: `content-length`,
+    /// `host`, `authorization`, `set-cookie`, `content-type`, `date`, and
+    /// the rest of the list in `docs/API.md`) or for a body declared with
+    /// [`Response::content_length`]; the field errors of
+    /// [`Response::header`]; [`HttpError::BodyLengthMismatch`] and
+    /// [`HttpError::InvalidState`] as for [`end_body`](Self::end_body).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{HttpError, Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET /data HTTP/1.1\r\nHost: a\r\nTE: trailers\r\n\r\n");
+    /// while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    /// let mut out = Vec::new();
+    /// conn.respond(&Response::new(200).chunked(), &mut out)?;
+    /// conn.send_body(b"rows", &mut out)?;
+    /// assert_eq!(
+    ///     conn.end_body_with_trailers(&[("content-type", b"text/csv")], &mut out),
+    ///     Err(HttpError::TrailerNotAllowed)
+    /// );
+    /// conn.end_body_with_trailers(&[("server-timing", b"db;dur=53")], &mut out)?;
+    /// assert!(out.ends_with(b"4\r\nrows\r\n0\r\nserver-timing: db;dur=53\r\n\r\n"));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn end_body_with_trailers(
+        &mut self,
+        trailers: &[(&str, &[u8])],
+        out: &mut Vec<u8>,
+    ) -> Result<(), HttpError> {
+        let RespState::Streaming(encoder) = &mut self.resp else {
+            return Err(HttpError::InvalidState("no streamed response in progress"));
+        };
+        if !trailers.is_empty() && !self.resp_chunked {
+            return Err(HttpError::TrailerNotAllowed);
         }
+        match encoder {
+            Encoder::Chunked => push_last_chunk_with_trailers(out, trailers)?,
+            _ => {
+                check_trailers(trailers)?;
+                encoder.finish(out)?;
+            }
+        }
+        if *encoder == Encoder::CloseDelimited {
+            self.keep_alive = false;
+        }
+        self.resp = RespState::Sent;
+        self.requests_served += 1;
+        Ok(())
     }
 }
 
