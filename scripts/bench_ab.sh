@@ -77,6 +77,7 @@ done | awk '
             for (i = 1; i <= no; i++) o[i] = value[name, "old", i]
             for (i = 1; i <= nn; i++) n[i] = value[name, "new", i]
             mo = median(o, no); mn = median(n, nn)
-            printf "%-30s old %12.1f ns  new %12.1f ns  %+6.1f%%%s\n", name, mo, mn, 100 * (mn - mo) / mo, (mn - mo) / mo > 0.05 ? "  OVER THE 5% GATE" : ""
+            over = ((mn - mo) / mo > 0.05) ? "  OVER THE 5% GATE" : ""
+            printf "%-30s old %12.1f ns  new %12.1f ns  %+6.1f%%%s\n", name, mo, mn, 100 * (mn - mo) / mo, over
         }
     }'
