@@ -8,6 +8,7 @@
 /.dev             export-ignore
 /.github          export-ignore
 /docs             export-ignore
+/scripts          export-ignore
 /tests            export-ignore
 /.gitignore       export-ignore
 /.editorconfig    export-ignore

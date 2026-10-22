@@ -547,6 +547,44 @@ fn test_write_head_into_reused_vec_allocates_nothing() {
     assert_eq!(m.allocations, 0, "write_head allocated {m:?}");
 }
 
+/// A-224: writing only the head of a prebuilt full-body response, for a
+/// vectored send, allocates nothing and never copies the body.
+#[test]
+fn test_respond_head_only_allocates_nothing() {
+    let mut conn = ServerConn::new();
+    let response = Response::new(200)
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; 64 * 1024]);
+    let mut out = Vec::with_capacity(4096);
+    let mut run = |conn: &mut ServerConn| {
+        let mut fed = 0;
+        loop {
+            match conn.poll() {
+                Ok(ServerEvent::NeedInput) => fed += conn.feed(&BROWSER_GET[fed..]),
+                Ok(ServerEvent::Request(_)) => {}
+                Ok(ServerEvent::RequestEnd) => {
+                    out.clear();
+                    let plan = conn.respond_head_only(&response, &mut out);
+                    assert!(plan == Ok(BodyPlan::Raw), "respond_head_only failed");
+                    assert!(out.len() < 4096, "the body was copied");
+                    return;
+                }
+                Ok(other) => panic!("unexpected server event {other:?}"),
+                Err(e) => panic!("server refused a valid request: {e:?}"),
+            }
+        }
+    };
+    for _ in 0..64 {
+        run(&mut conn);
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            run(&mut conn);
+        }
+    });
+    assert_eq!(m.allocations, 0, "respond_head_only allocated {m:?}");
+}
+
 /// The standalone decoder (A-220): building one and decoding a body with
 /// extensions and trailers allocates nothing, the decoder included.
 #[test]

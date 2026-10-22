@@ -991,3 +991,34 @@ fn test_client_deadline_silent_server_times_out() {
     assert!(waited < Duration::from_secs(2), "waited {waited:?}");
     holder.join().unwrap();
 }
+
+fn large(req: &RequestHead<'_>, _body: &[u8]) -> Response {
+    // Over the 4 KiB threshold: the head and this body leave in one
+    // vectored write; a small body is copied after the head as before.
+    let size = if req.path() == "/large" { 300_000 } else { 100 };
+    let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    Response::new(200).body(body)
+}
+
+#[test]
+fn test_large_full_body_is_written_with_the_head_and_keeps_alive() {
+    let running = start(Server::bind("127.0.0.1:0").unwrap(), large);
+    let mut stream = connect(running.addr);
+    let mut conn = ClientConn::new();
+    let expected = |size: usize| (0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+    for (method, path, size) in [
+        ("GET", "/large", 300_000),
+        ("HEAD", "/large", 0),
+        ("GET", "/small", 100),
+        ("GET", "/large", 300_000),
+    ] {
+        let mut out = Vec::new();
+        conn.send_request(&Request::new(method, path).header("host", "x"), &mut out)
+            .unwrap();
+        stream.write_all(&out).unwrap();
+        let (status, body, close) = read_response(&mut stream, &mut conn);
+        assert_eq!((status, close), (200, false), "{method} {path}");
+        assert_eq!(body, expected(size), "{method} {path}");
+        assert!(matches!(conn.poll().unwrap(), ClientEvent::Idle));
+    }
+}

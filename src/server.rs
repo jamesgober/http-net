@@ -17,8 +17,7 @@ use crate::{
     },
     method::Method,
     preface::is_h2_preface,
-    status::reason_phrase,
-    syntax::push_decimal,
+    status::write_status_line,
     write::{BodyPlan, OutgoingBody, Output, ResponseHeadRef},
 };
 
@@ -666,6 +665,61 @@ impl ServerConn {
         self.respond_dated(response, Some(date.as_bytes()), out)
     }
 
+    /// As [`respond`](Self::respond), but writes only the head: for a
+    /// full-body response the caller then sends
+    /// [`Response::body_bytes`] itself, so head and body can leave in one
+    /// vectored write (`write_vectored`) without the body being copied into
+    /// `out`. The returned [`BodyPlan`] says what follows:
+    ///
+    /// - [`BodyPlan::Raw`]: send the body bytes, exactly as they are, right
+    ///   after the head; the response already counts as sent.
+    /// - [`BodyPlan::None`]: nothing (an empty body, `HEAD`, 204, 304, a
+    ///   tunnel).
+    /// - [`BodyPlan::Stream`]: a streamed response; continue with
+    ///   [`send_body`](Self::send_body) and [`end_body`](Self::end_body).
+    ///
+    /// # Errors
+    ///
+    /// As [`respond`](Self::respond); nothing is written on error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{BodyPlan, Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
+    /// let response = Response::new(200).body(vec![b'x'; 64 * 1024]);
+    /// let mut head = Vec::new();
+    /// let plan = conn.respond_head_only(&response, &mut head)?;
+    /// assert_eq!(plan, BodyPlan::Raw);
+    /// assert!(head.ends_with(b"content-length: 65536\r\n\r\n"));
+    /// // Send `head` and `response.body_bytes()` together, e.g. with
+    /// // `std::io::Write::write_vectored`.
+    /// assert_eq!(response.body_bytes().map(<[u8]>::len), Some(64 * 1024));
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn respond_head_only(
+        &mut self,
+        response: &Response,
+        out: &mut Vec<u8>,
+    ) -> Result<BodyPlan, HttpError> {
+        self.start_response(response, None, out)
+    }
+
+    /// [`respond_head_only`](Self::respond_head_only) with a `date` (the
+    /// blocking server's vectored path).
+    #[cfg(feature = "std")]
+    pub(crate) fn respond_head_dated(
+        &mut self,
+        response: &Response,
+        date: Option<&[u8]>,
+        out: &mut Vec<u8>,
+    ) -> Result<BodyPlan, HttpError> {
+        self.start_response(response, date, out)
+    }
+
     /// Writes an interim (1xx) response other than `100` and `101`, for
     /// example `103 Early Hints` with `link` fields, before the final
     /// response. It may be sent more than once, for any request method,
@@ -721,11 +775,7 @@ impl ServerConn {
         if self.info.version != Version::Http11 || self.resp != RespState::Idle {
             return Err(HttpError::InterimNotAllowed);
         }
-        out.extend_from_slice(b"HTTP/1.1 ");
-        push_decimal(out, u64::from(status));
-        out.push(b' ');
-        out.extend_from_slice(reason_phrase(status).as_bytes());
-        out.extend_from_slice(b"\r\n");
+        write_status_line(out, status);
         out.extend_from_slice(interim.fields());
         out.extend_from_slice(b"\r\n");
         Ok(())
@@ -1081,11 +1131,7 @@ impl ServerConn {
             OutgoingBody::Chunked => (Encoder::Chunked, None),
         };
 
-        out.put(b"HTTP/1.1 ");
-        push_decimal(out, u64::from(status));
-        out.put(b" ");
-        out.put(reason_phrase(status).as_bytes());
-        out.put(b"\r\n");
+        write_status_line(out, status);
         if !(bodiless || tunnel) {
             push_framing(out, encoder, declared);
         }

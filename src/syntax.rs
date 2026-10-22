@@ -150,6 +150,37 @@ pub(crate) fn trim_ows(mut s: &[u8]) -> &[u8] {
     s
 }
 
+/// The length of the run of printable ASCII (`0x20` to `0x7e`) at the start
+/// of `s`, eight bytes at a time: where the first control byte, DEL, or
+/// byte of `0x80` and above sits, or `s.len()`.
+#[inline]
+pub(crate) fn printable_run(s: &[u8]) -> usize {
+    let mut chunks = s.chunks_exact(8);
+    let mut base = 0usize;
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        let w = u64::from_le_bytes(word);
+        // As in `check_field_value`; a marker can be false only above a true
+        // one, so the lowest is exact.
+        let low = w.wrapping_sub(0x2020_2020_2020_2020) & !w & 0x8080_8080_8080_8080;
+        let del = {
+            let x = w ^ 0x7f7f_7f7f_7f7f_7f7f;
+            x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+        };
+        let marks = low | del | (w & 0x8080_8080_8080_8080);
+        if marks != 0 {
+            return base + (marks.trailing_zeros() / 8) as usize;
+        }
+        base += 8;
+    }
+    let rest = chunks.remainder();
+    base + rest
+        .iter()
+        .position(|b| !(0x20..0x7f).contains(b))
+        .unwrap_or(rest.len())
+}
+
 /// Validates a field value (already trimmed of OWS).
 ///
 /// A CR is reported as [`HttpError::BareCr`] because that is the smuggling
@@ -403,13 +434,19 @@ fn element_end(s: &[u8]) -> usize {
 #[inline]
 pub(crate) fn find_byte(needle: u8, hay: &[u8]) -> Option<usize> {
     let pattern = u64::from_le_bytes([needle; 8]);
-    let mut chunks = hay.chunks_exact(8);
-    let mut base = 0usize;
-    for chunk in &mut chunks {
+    let marks = |chunk: &[u8]| {
         let mut word = [0u8; 8];
         word.copy_from_slice(chunk);
         let x = u64::from_le_bytes(word) ^ pattern;
-        let found = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+        x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+    };
+    // Eight bytes per step. Sixteen (two words, one branch) measured about
+    // 12% slower on the head benchmarks: field lines are short (decision
+    // D-45).
+    let mut base = 0usize;
+    let mut chunks = hay.chunks_exact(8);
+    for chunk in &mut chunks {
+        let found = marks(chunk);
         if found != 0 {
             // The lowest set marker belongs to the first matching byte; the
             // borrow trick can only produce false markers above a true one.
@@ -458,7 +495,7 @@ pub(crate) fn push_decimal<O: Output + ?Sized>(out: &mut O, n: u64) {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     use super::*;
 
@@ -604,6 +641,39 @@ mod tests {
         }
         assert_eq!(find_byte(b'\n', b"\x0b\x0a"), Some(1));
         assert_eq!(find_byte(1, &[0x81, 0x01]), Some(1));
+    }
+
+    #[test]
+    fn test_find_byte_at_every_position_among_near_misses() {
+        // The bytes next to the needle in value (and with the high bit
+        // flipped) are the ones the borrow trick could mistake for it.
+        for needle in [0u8, 1, b'\n', b':', b';', 0x7f, 0x80, 0xff] {
+            let near = [
+                needle.wrapping_sub(1),
+                needle.wrapping_add(1),
+                needle ^ 0x80,
+                needle ^ 0x01,
+            ];
+            for len in 0..=50usize {
+                for filler in near {
+                    for at in (0..len).map(Some).chain([None]) {
+                        let mut hay = vec![filler; len];
+                        if let Some(i) = at {
+                            hay[i] = needle;
+                            // A second match later must not win.
+                            if i + 3 < len {
+                                hay[i + 3] = needle;
+                            }
+                        }
+                        assert_eq!(
+                            find_byte(needle, &hay),
+                            hay.iter().position(|&b| b == needle),
+                            "needle {needle:#x} filler {filler:#x} len {len} at {at:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! - `response_write`: serializing a response with five fields and a
 //!   1 KiB body, with `respond` and with `write_head` (borrowed fields).
 //! - `response_parse`: a client parsing a response with a 1 KiB body.
+//! - `linearity`: 4, 16, and 32 KiB heads fed whole and one byte at a time.
 
 use std::hint::black_box;
 
@@ -221,12 +222,71 @@ fn bench_response_parse(c: &mut Criterion) {
     group.finish();
 }
 
+/// A request head of about `size` bytes: the request line, `Host`, and
+/// 60-byte fields.
+fn large_head(size: usize) -> Vec<u8> {
+    let mut head = b"GET /linear HTTP/1.1\r\nHost: a\r\n".to_vec();
+    let mut i = 0;
+    while head.len() + 64 < size {
+        head.extend_from_slice(format!("X-Field-{i:04}: {:045}\r\n", i).as_bytes());
+        i += 1;
+    }
+    head.extend_from_slice(b"\r\n");
+    head
+}
+
+/// Parses `head` on `conn`, fed `step` bytes at a time.
+fn parse_fed(conn: &mut ServerConn, head: &[u8], step: usize, response: &Response) {
+    let mut fed = 0;
+    let mut out = Vec::with_capacity(256);
+    loop {
+        match conn.poll() {
+            Ok(ServerEvent::NeedInput) => {
+                let end = (fed + step).min(head.len());
+                fed += conn.feed(&head[fed..end]);
+            }
+            Ok(ServerEvent::RequestEnd) => {
+                out.clear();
+                conn.respond(response, &mut out).unwrap_or_default();
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+/// The linearity guard (spec section 11.2): a head fed one byte at a time
+/// costs a bounded multiple of the same head fed whole, at every size, so
+/// the scanner never re-reads what it has seen.
+fn bench_linearity(c: &mut Criterion) {
+    let limits = Limits::new()
+        .with_max_header_bytes(64 * 1024)
+        .with_max_headers(1024);
+    let response = Response::new(204);
+    let mut group = c.benchmark_group("linearity");
+    for size in [4 * 1024, 16 * 1024, 32 * 1024] {
+        let head = large_head(size);
+        group.throughput(Throughput::Bytes(head.len() as u64));
+        let mut conn = ServerConn::with_limits(limits);
+        group.bench_function(format!("whole_{}k", size / 1024), |b| {
+            b.iter(|| parse_fed(&mut conn, black_box(&head), usize::MAX, &response))
+        });
+        let mut conn = ServerConn::with_limits(limits);
+        group.bench_function(format!("byte_at_a_time_{}k", size / 1024), |b| {
+            b.iter(|| parse_fed(&mut conn, black_box(&head), 1, &response))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_request_head,
     bench_pipelined,
     bench_body,
     bench_response_write,
-    bench_response_parse
+    bench_response_parse,
+    bench_linearity
 );
 criterion_main!(benches);

@@ -177,16 +177,16 @@ Exit criteria:
 - [x] `OwnedRequestHead::from_parts` refuses every tampered-span case in its unit tests.
 - [x] Release routine completed.
 
-## v0.6.0 - Optimisation
-- [ ] `ServerConn::respond_head_only` (head-only write for vectored sends).
-- [ ] The hot-spot plan: 16-byte SWAR steps, combined LF search and value validation, length-first field-fact matching, a precomputed status-line table, the `Date` cache.
-- [ ] Comparison repository `http-net-bench` (httparse, hyper in memory, picohttpparser and llhttp report only); `docs/PERFORMANCE.md`.
+## v0.6.0 - Optimisation (DONE, 2026-10-22)
+- [x] `ServerConn::respond_head_only` (head-only write for vectored sends).
+- [x] The hot-spot plan, each item measured: a precomputed status-line table and one-pass fast paths for the common field and chunk lines kept; 16-byte SWAR steps, the combined whole-line pass, and length-first matching measured slower and dropped (`dev/PLAN.md` D-45 to D-53); the `Date` cache shipped in 0.4.
+- [x] Comparison repository [`http-net-bench`](https://github.com/jamesgober/http-net-bench) (H1 to H5 against httparse and hyper in memory; picohttpparser, llhttp, and H6 not run yet); `docs/PERFORMANCE.md`.
 
 Exit criteria:
-- [ ] Performance targets met on Linux x86_64, or the SIMD decision (OD-8) taken with the measured gap.
-- [ ] At least 20% faster than the best Rust competitor on the head-parse and full-exchange workloads at equal or stronger security, published; or the shortfall and its cause published with a recorded decision.
-- [ ] Byte-at-a-time linearity guard green.
-- [ ] Criterion baselines saved; the 5% regression gate documented and used for every later change.
+- [x] Performance targets met on Linux x86_64, or the SIMD decision (OD-8) taken with the measured gap: SWAR kept, at parity with httparse (D-54).
+- [x] At least 20% faster than the best Rust competitor on the head-parse and full-exchange workloads at equal or stronger security, published; or the shortfall and its cause published with a recorded decision: met on full exchanges, head parsing at parity, published (D-54).
+- [x] Byte-at-a-time linearity guard green.
+- [x] Criterion baselines saved; the 5% regression gate documented and used for every later change (`scripts/bench_ab.sh`, `docs/PERFORMANCE.md`).
 
 ## v0.7.0 - Hardening
 - [ ] Fuzz campaign: 24 CPU-hours per target, corpus stored outside the repository.

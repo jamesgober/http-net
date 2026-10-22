@@ -5,6 +5,23 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.5 to 0.6
+
+Nothing a 0.5 user can notice changes: every message is accepted or
+refused exactly as before, with the same errors, and every serialized byte
+is the same. 0.6 is faster (the common field line and chunk line are
+parsed in one pass, status lines come from a compile-time table); the
+general paths still decide every other input.
+
+The blocking server now writes full bodies over 4 KiB after the head with
+one vectored write instead of copying them; the bytes on the wire are the
+same.
+
+### Added in 0.6
+
+- `ServerConn::respond_head_only`: the head only, for a vectored send of
+  head and body.
+
 ## 0.4 to 0.5
 
 ### The HTTP/2 preface has its own error

@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -33,7 +33,7 @@ documentation = "https://docs.rs/http-net"
 authors = ["James Gober <me@jamesgober.com>"]
 
 # The fuzz crate and local tooling are not part of the published package.
-exclude = ["fuzz/", "dev/", ".github/"]
+exclude = ["fuzz/", "dev/", ".github/", "scripts/"]
 
 [package.metadata.docs.rs]
 all-features = true

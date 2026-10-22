@@ -1,9 +1,9 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.5.0`).** This file is the approved
+> and examples. **Status: pre-1.0 (`0.6.0`).** This file is the approved
 > design of the 1.0 surface: each item says the version it ships in. Items
-> marked **exists**, **0.3**, **0.4**, or **0.5** are in this build; items marked
+> marked **exists**, **0.3**, **0.4**, **0.5**, or **0.6** are in this build; items marked
 > with a later version are the plan and are not in the crate yet. The
 > surface may still change in the 0.x series and is frozen at `1.0.0`.
 
@@ -90,6 +90,7 @@
   - [`ChunkedDecoder`](#chunkeddecoder)
   - [`Output` and the borrowed writer](#output-and-the-borrowed-writer)
   - [`ServerConn::write_head` and `respond_into`](#serverconnwrite_head-and-respond_into)
+  - [`ServerConn::respond_head_only`](#serverconnrespond_head_only)
 - [Blocking adapter](#blocking-adapter)
   - [`blocking::Server`](#blockingserver)
   - [`blocking::serve`](#blockingserve)
@@ -154,20 +155,21 @@ Each entry gives the signature, what it does, its errors, and an example.
 | 0.3 | new in 0.3.0 |
 | 0.4 | new in 0.4.0 |
 | 0.5 | new in 0.5.0 |
-| 0.6, after 1.0 | planned; not in this build. Signatures are the approved design and may still be adjusted before they ship. |
+| 0.6 | new in 0.6.0 |
+| after 1.0 | planned; not in this build. Signatures are the approved design and may still be adjusted before they ship. |
 
 ## Installation
 
 ```toml
 [dependencies]
-http-net = "0.5"
+http-net = "0.6"
 ```
 
 `no_std` (the core needs `alloc` only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.5", default-features = false }
+http-net = { version = "0.6", default-features = false }
 ```
 
 ## Quick start
@@ -1093,7 +1095,7 @@ assert!(back.iter().all(|&b| b == 0));
 |---|---|---|---|
 | `write_head<O: Output>(&mut self, head: &ResponseHeadRef<'_>, date, out: &mut O) -> Result<BodyPlan, HttpError>` | allocation-free head writer from borrowed fields; see [`write_head`](#serverconnwrite_head-and-respond_into) | as `respond` | 0.5 |
 | `respond_into<O: Output>(&mut self, response, date, out: &mut O)`, `send_body_into`, `end_body_into` | `respond`, `send_body`, `end_body_with_trailers` over any `Output` | as `respond` | 0.5 |
-| `respond_head_only(&mut self, response, out) -> Result<BodyPlan, HttpError>` | writes only the head of a full-body response, so the driver can send head and body with one vectored write | as `respond` | 0.6 |
+| `respond_head_only(&mut self, response, out) -> Result<BodyPlan, HttpError>` | writes only the head of a full-body response, so the driver can send head and body with one vectored write; see [`respond_head_only`](#serverconnrespond_head_only) | as `respond` | 0.6 |
 
 ## `ServerEvent`
 
@@ -2304,7 +2306,7 @@ the connection cannot carry another request. **Ships:** exists;
 
 ## Tier 3: stateless parsers, chunked decoder, output
 
-New in 0.5 (`respond_head_only` is planned for 0.6), allocation-free, and
+New in 0.5 (`respond_head_only` in 0.6), allocation-free, and
 sharing code with the connections rather than copying it. The stateless
 parsers are described in [Stateless head parsers](#stateless-head-parsers).
 
@@ -2517,6 +2519,42 @@ assert_eq!(
     out,
     b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nx-request-id: 7f3a\r\n\r\nok"
 );
+# Ok::<(), http_net::HttpError>(())
+```
+
+### `ServerConn::respond_head_only`
+
+```rust,ignore
+pub fn respond_head_only(&mut self, response: &Response, out: &mut Vec<u8>)
+    -> Result<BodyPlan, HttpError>;
+```
+
+As `respond`, but writes only the head. For a full-body response the plan
+is `Raw`: the caller sends [`Response::body_bytes`](#response) right after
+the head, typically with one vectored write (`write_vectored` with the head
+and the body), so the body is never copied into `out`. The response counts
+as sent. `None` follows an empty body, `HEAD`, 204, 304, or a tunnel;
+`Stream` a streamed response, continued with `send_body` and `end_body`.
+The bytes written plus the body are exactly what `respond` writes, and the
+errors are the same, with nothing written on error. The blocking server
+uses it for full bodies over 4 KiB. Allocation-free with a reused `Vec`.
+**Ships:** 0.6.
+
+```rust
+use http_net::{BodyPlan, Response, ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET /file HTTP/1.1\r\nHost: a\r\n\r\n");
+while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
+let response = Response::new(200)
+    .header("content-type", "application/octet-stream")
+    .body(vec![0u8; 256 * 1024]);
+let mut head = Vec::new();
+assert_eq!(conn.respond_head_only(&response, &mut head)?, BodyPlan::Raw);
+assert!(head.len() < 128); // the head alone
+let body = response.body_bytes().unwrap_or_default();
+assert_eq!(body.len(), 256 * 1024);
+// socket.write_vectored(&[IoSlice::new(&head), IoSlice::new(body)])
 # Ok::<(), http_net::HttpError>(())
 ```
 

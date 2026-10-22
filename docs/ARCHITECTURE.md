@@ -93,6 +93,16 @@ line, one field line, or what is left of the section) is checked against the
 bytes seen before the scanner waits for more, so a peer cannot make the
 connection buffer past a budget by withholding the line end.
 
+Most field lines take a one-pass fast path when the whole line is already
+buffered: the name is walked with the byte-class table up to the colon,
+spaces are skipped, the value is checked eight bytes at a time for anything
+outside printable ASCII, and the line must end in CR LF. Any other shape (a
+tab or obs-text in the value, a control byte, a bare CR or LF, a fold, a
+line whose search began on earlier input) takes the general path above from
+the line's start, so the fast path changes speed, never the outcome. Chunk
+lines have the same arrangement: hex digits and CR LF in one pass,
+extensions and everything else through the general chunk-line parser.
+
 Field positions are stored as `u32` offsets (two spans, 16 bytes per field)
 relative to the message start, in a field index reused across messages.
 
