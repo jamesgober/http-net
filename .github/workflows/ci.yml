@@ -81,7 +81,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          [server_conn, client_conn, chunk_line, reference_diff, httparse_diff, builders]
+          [server_conn, client_conn, chunk_line, reference_diff, httparse_diff, builders, stateless_parse]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master

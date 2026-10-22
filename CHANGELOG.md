@@ -30,6 +30,35 @@
   obsolete line folding in response heads, replaced by spaces in place
   (RFC 9112 section 5.2); every other refusal stays.
 - Example `proxy_forward`.
+- Spans and raw heads (Tier 3): `Span` and `FieldSpan`, public `u32`
+  offsets into a head's bytes (`Span::get` returns an empty slice for a
+  span out of range and never panics); `RequestHead::raw` and
+  `ResponseHead::raw` return a `RawHead` with the head bytes and the spans
+  of the start line, method, target, version, status, and every field.
+- The head passport (OD-12): `RequestHead::copy_into` copies the head
+  bytes and field spans into caller-owned, reused vectors and returns
+  `HeadFacts`; `OwnedRequestHead::from_parts` rebuilds a view from them
+  after checking every span and the line structure (`InvalidState` for a
+  changed buffer), `view` reads it, and `into_parts` gives the vectors
+  back. `RequestHead::to_owned` makes an owned copy in one call. Once the
+  vectors have grown, the copy allocates nothing.
+- Stateless head parsers (Tier 3): `parse_request_head` and
+  `parse_response_head` read one head from a caller slice into a caller
+  array of field spans, with the same scanner and rules as the
+  connections, and no allocation. They return `Parsed::Complete` with
+  `ParsedRequest` / `ParsedResponse` and the head length, or
+  `Parsed::Partial`; a head with more fields than the array is
+  `TooManyHeaders`. `Asked` tells the response parser whether the request
+  was `HEAD` or `CONNECT`.
+- Example `passport`: a reader parses pipelined requests with the
+  stateless parser and passes copied heads through a passport pool to a
+  worker thread.
+- Tests: unit tests for every `from_parts` refusal; property tests that
+  the stateless parsers agree with `ServerConn` and `ClientConn` and that
+  a copied head rebuilds the same view; allocation tests for the
+  stateless parsers and `copy_into` into grown vectors (zero
+  allocations); fuzz target `stateless_parse` (oracle: equal to
+  `ServerConn` and `ClientConn`, copies rebuild) in the CI fuzz matrix.
 
 ### Changed
 

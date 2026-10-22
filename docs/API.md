@@ -59,6 +59,7 @@
 - [`Headers`](#headers)
 - [`HeaderValues` and `ListElements`](#headervalues-and-listelements)
 - [Spans, raw heads, owned heads](#spans-raw-heads-owned-heads)
+- [Stateless head parsers](#stateless-head-parsers)
 - [`Method`](#method)
 - [`MethodSet`](#methodset)
 - [`Version`](#version-1)
@@ -119,6 +120,8 @@ messages into a caller-owned `Vec<u8>`.
 | [`RequestHead`](#requesthead) | struct | Zero-copy view of a parsed request head. |
 | [`ResponseHead`](#responsehead) | struct | Zero-copy view of a parsed response head. |
 | [`Headers`](#headers), [`HeaderValues`](#headervalues-and-listelements) | structs | Iterators over a head's fields. |
+| [`Span`, `RawHead`, `OwnedRequestHead`](#spans-raw-heads-owned-heads) | structs | A head's bytes and the offsets of its parts; copied and owned heads. |
+| [`parse_request_head`, `parse_response_head`](#stateless-head-parsers) | fns | One head from a slice, without a connection. |
 | [`Response`](#response), [`Request`](#request) | structs | Outgoing messages (builders). |
 | [`Method`](#method), [`MethodSet`](#methodset) | enum, struct | Request methods and sets of them. |
 | [`Version`](#version-1), [`BodyFraming`](#bodyframing), [`TargetForm`](#targetform) | enums | Facts about a message. |
@@ -147,7 +150,8 @@ Each entry gives the signature, what it does, its errors, and an example.
 | exists; 0.3 | in 0.2.0, changed in 0.3.0 as described |
 | 0.3 | new in 0.3.0 |
 | 0.4 | new in 0.4.0 |
-| 0.5, 0.6, after 1.0 | planned; not in this build. Signatures are the approved design and may still be adjusted before they ship. |
+| 0.5 | new in 0.5.0 where this build has it (spans, raw and owned heads, stateless parsers); otherwise planned |
+| 0.6, after 1.0 | planned; not in this build. Signatures are the approved design and may still be adjusted before they ship. |
 
 ## Installation
 
@@ -1371,25 +1375,34 @@ assert_eq!(options, [&b"keep-alive"[..], b"X-Trace"]);
 
 ## Spans, raw heads, owned heads
 
-Planned for 0.5 (Tier 3): the zero-copy passport path for WASP and proxies.
+Tier 3: the zero-copy passport path for WASP and proxies. A view's head
+bytes and the offsets of its parts are public, so the head can be copied
+(or moved) somewhere else and read there without parsing it again. The
+example `passport` runs the whole path across two threads.
 
 ```rust,ignore
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span { pub start: u32, pub end: u32 }
-impl Span { pub fn get<'b>(&self, head: &'b [u8]) -> &'b [u8]; pub fn len(&self) -> u32; }
+impl Span {
+    pub fn get<'b>(&self, head: &'b [u8]) -> &'b [u8];
+    pub const fn len(&self) -> u32;
+    pub const fn is_empty(&self) -> bool;
+}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FieldSpan { pub name: Span, pub value: Span }
 
 impl<'a> RequestHead<'a> { pub fn raw(&self) -> RawHead<'a>; }
 impl<'a> ResponseHead<'a> { pub fn raw(&self) -> RawHead<'a>; }
+#[derive(Clone, Copy)]
+pub struct RawHead<'a> { /* private */ }
 impl<'a> RawHead<'a> {
     pub fn bytes(&self) -> &'a [u8];
     pub fn start_line(&self) -> Span;
-    pub fn method(&self) -> Span;
-    pub fn target(&self) -> Span;
+    pub fn method(&self) -> Span;   // request heads; empty for responses
+    pub fn target(&self) -> Span;   // request heads; empty for responses
     pub fn version(&self) -> Span;
-    pub fn status(&self) -> Span;
+    pub fn status(&self) -> Span;   // response heads; empty for requests
     pub fn fields(&self) -> &'a [FieldSpan];
 }
 
@@ -1397,19 +1410,174 @@ impl RequestHead<'_> {
     pub fn copy_into(&self, bytes: &mut Vec<u8>, fields: &mut Vec<FieldSpan>) -> Result<HeadFacts, HttpError>;
     pub fn to_owned(&self) -> OwnedRequestHead;
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadFacts { /* private */ }
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnedRequestHead { /* private */ }
 impl OwnedRequestHead {
     pub fn view(&self) -> RequestHead<'_>;
     pub fn from_parts(bytes: Vec<u8>, fields: Vec<FieldSpan>, facts: HeadFacts) -> Result<Self, HttpError>;
+    pub fn into_parts(self) -> (Vec<u8>, Vec<FieldSpan>, HeadFacts);
 }
 ```
 
 | Item | Behaviour | Ships |
 |---|---|---|
-| `Span`, `FieldSpan` | `u32` offsets relative to `RawHead::bytes()`; `get` returns an empty slice for an out-of-range span | 0.5 |
+| `Span`, `FieldSpan` | `u32` offsets relative to `RawHead::bytes()`; `get` returns an empty slice for an out-of-range span and never panics; a field's value span is OWS-trimmed | 0.5 |
 | `raw`, `RawHead` | the head bytes and spans behind a view; the bytes can be moved and the spans stay valid | 0.5 |
-| `copy_into`, `HeadFacts` | copies the head (one `memcpy`) and spans into caller-owned reused vectors and returns the interpreted facts, so a passport rebuilds a view without re-parsing (decision OD-12) | 0.5 |
-| `to_owned`, `OwnedRequestHead`, `view`, `from_parts` | an owned copy; `from_parts` re-validates every span (fail closed on a tampered passport buffer) | 0.5 |
+| `copy_into`, `HeadFacts` | copies the head (one copy) and spans into caller-owned reused vectors, cleared first, and returns the interpreted facts, so a passport rebuilds a view without re-parsing (decision OD-12); no allocation once the vectors have grown | 0.5 |
+| `to_owned`, `OwnedRequestHead`, `view`, `from_parts`, `into_parts` | an owned copy; `from_parts` re-validates every span and the line structure and refuses a tampered passport buffer with `InvalidState`; `into_parts` hands the vectors back for reuse | 0.5 |
 | `KnownField`, `known` | constant-time lookup of frequent fields through an index filled while parsing; kept only if it costs at most 2% on the head benchmark | after 1.0 |
+
+`RawHead::bytes()` runs from the first byte the connection kept for this
+head to the end of the blank line. A request may be preceded by empty
+lines (RFC 9112 section 2.2 lets a server ignore them); they stay in
+`bytes()` and `start_line()` begins after them, so every span is relative
+to the same slice. A copy keeps them too, and `from_parts` accepts them.
+
+```rust
+use http_net::{ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET /a?b HTTP/1.1\r\nHost: example.com\r\nAccept:  */* \r\n\r\n");
+let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+let raw = req.raw();
+let head = raw.bytes();
+assert_eq!(raw.method().get(head), b"GET");
+assert_eq!(raw.target().get(head), b"/a?b");
+assert_eq!(raw.version().get(head), b"HTTP/1.1");
+let accept = raw.fields()[1];
+assert_eq!(accept.name.get(head), b"Accept");
+assert_eq!(accept.value.get(head), b"*/*"); // trimmed
+assert_eq!(head.len(), 55);
+```
+
+The passport path: copy into reused vectors, rebuild a view anywhere,
+give the vectors back.
+
+```rust
+use http_net::{OwnedRequestHead, ServerConn, ServerEvent};
+
+let (mut bytes, mut fields) = (Vec::with_capacity(4096), Vec::with_capacity(64));
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET /x HTTP/1.1\r\nHost: a\r\nX-Trace: 7\r\n\r\n");
+let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+let facts = req.copy_into(&mut bytes, &mut fields)?;
+
+let owned = OwnedRequestHead::from_parts(bytes, fields, facts)?;
+assert_eq!(owned.view().header_str("x-trace"), Some("7"));
+let (bytes, fields, _) = owned.into_parts(); // back to the pool
+assert!(bytes.capacity() >= 4096 && fields.capacity() >= 64);
+# Ok::<(), http_net::HttpError>(())
+```
+
+A changed buffer is refused, never read:
+
+```rust
+use http_net::{HttpError, OwnedRequestHead, ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+let (mut bytes, mut fields) = (Vec::new(), Vec::new());
+let facts = req.copy_into(&mut bytes, &mut fields)?;
+fields[0].value.end += 4; // the value now runs past its line
+assert!(matches!(
+    OwnedRequestHead::from_parts(bytes, fields, facts),
+    Err(HttpError::InvalidState(_))
+));
+# Ok::<(), http_net::HttpError>(())
+```
+
+`from_parts` checks structure, not meaning: it does not recompute the
+framing facts (body length, keep-alive), which come from the same copy.
+A head built by hand from bytes the parser never saw should go through
+[`parse_request_head`](#stateless-head-parsers) instead.
+
+## Stateless head parsers
+
+Tier 3. One complete head from a caller slice, with the connection's exact
+rules (the same scanner and checks, not a copy of them), into a caller
+array of field spans. No state, no allocation, no buffer: for proxies,
+differential tests, and engines that frame messages themselves.
+
+```rust,ignore
+pub fn parse_request_head<'a>(input: &'a [u8], limits: &Limits, fields: &'a mut [FieldSpan])
+    -> Result<Parsed<ParsedRequest<'a>>, HttpError>;
+pub fn parse_response_head<'a>(input: &'a [u8], limits: &Limits, asked: Asked, fields: &'a mut [FieldSpan])
+    -> Result<Parsed<ParsedResponse<'a>>, HttpError>;
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum Parsed<T> { Complete { head: T, len: usize }, Partial }
+
+pub struct ParsedRequest<'a> { /* private */ }
+impl ParsedRequest<'_> {
+    pub fn view(&self) -> RequestHead<'_>;
+    pub fn facts(&self) -> HeadFacts;
+}
+pub struct ParsedResponse<'a> { /* private */ }
+impl ParsedResponse<'_> { pub fn view(&self) -> ResponseHead<'_>; }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Asked { pub head: bool, pub connect: bool }
+```
+
+| Item | Behaviour | Errors | Ships |
+|---|---|---|---|
+| `parse_request_head` | `Complete` with the view and the head's length (`input[len..]` is the body or the next head) once the blank line is in; `Partial` while it is not, where a connection would ask for more input | the connection's head errors; `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5 |
+| `parse_response_head` | as above for a response; `asked` says what the request was, which decides the framing (`HEAD` and a `2xx` to `CONNECT` have no body); interim (`1xx`) heads are returned like any other | the connection's head errors | 0.5 |
+| `Parsed`, `ParsedRequest`, `ParsedResponse` | the outcome and the parsed heads; `view()` gives the same accessors a connection's head has | none | 0.5 |
+| `Asked` | the request facts a response parser needs; `Asked::default()` is a plain request | none | 0.5 |
+
+The field array bounds the head as well as `Limits::max_headers`: with a
+smaller array, a head with more fields is `TooManyHeaders` rather than
+cut short.
+
+```rust
+use http_net::{FieldSpan, HttpError, Limits, Parsed, parse_request_head};
+
+let input = b"POST /api HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
+let mut fields = [FieldSpan::default(); 32];
+let Parsed::Complete { head, len } = parse_request_head(input, &Limits::default(), &mut fields)?
+else {
+    panic!("the head is complete");
+};
+assert_eq!(head.view().content_length(), Some(2));
+assert_eq!(&input[len..], b"hi");
+
+// Not all there yet.
+let mut fields = [FieldSpan::default(); 32];
+assert!(matches!(
+    parse_request_head(&input[..20], &Limits::default(), &mut fields)?,
+    Parsed::Partial
+));
+
+// Two fields, one slot.
+let mut one = [FieldSpan::default(); 1];
+assert_eq!(
+    parse_request_head(input, &Limits::default(), &mut one).unwrap_err(),
+    HttpError::TooManyHeaders
+);
+# Ok::<(), HttpError>(())
+```
+
+```rust
+use http_net::{Asked, BodyFraming, FieldSpan, Limits, Parsed, parse_response_head};
+
+let input = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+let mut fields = [FieldSpan::default(); 8];
+let asked = Asked { head: true, ..Asked::default() };
+let Parsed::Complete { head, .. } = parse_response_head(input, &Limits::default(), asked, &mut fields)?
+else {
+    panic!("the head is complete");
+};
+// The response to HEAD has no body, whatever Content-Length says.
+assert_eq!(head.view().framing(), BodyFraming::None);
+assert_eq!(head.view().content_length(), Some(5));
+# Ok::<(), http_net::HttpError>(())
+```
 
 ## `Method`
 
@@ -2128,15 +2296,10 @@ the connection cannot carry another request. **Ships:** exists;
 ## Tier 3: stateless parsers, chunked decoder, output
 
 Planned for 0.5 (0.6 for `respond_head_only`), allocation-free, sharing
-code with the connections rather than copying it.
+code with the connections rather than copying it. The stateless parsers
+ship in 0.5: see [Stateless head parsers](#stateless-head-parsers).
 
 ```rust,ignore
-pub fn parse_request_head<'a>(input: &'a [u8], limits: &Limits, fields: &'a mut [FieldSpan])
-    -> Result<Parsed<ParsedRequest<'a>>, HttpError>;
-pub fn parse_response_head<'a>(input: &'a [u8], limits: &Limits, asked: Asked, fields: &'a mut [FieldSpan])
-    -> Result<Parsed<ParsedResponse<'a>>, HttpError>;
-#[non_exhaustive] pub enum Parsed<T> { Complete { head: T, len: usize }, Partial }
-
 pub struct ChunkedDecoder { /* state, budgets */ }
 impl ChunkedDecoder {
     pub fn new(limits: &Limits) -> ChunkedDecoder;
@@ -2156,7 +2319,6 @@ pub fn is_h2_preface(input: &[u8]) -> Option<bool>;
 
 | Item | Behaviour | Ships |
 |---|---|---|
-| `parse_request_head`, `parse_response_head`, `Parsed`, `Asked` | one complete head from a caller slice into caller field storage, with the connection's exact rules; `Partial` when incomplete | 0.5 |
 | `ChunkedDecoder`, `ChunkStep` | standalone chunked decoding with explicit byte accounting, for proxy streaming and fetch-net | 0.5 |
 | `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` | where serialized bytes go (`Vec<u8>` or a caller type such as a zeroizing buffer), and a borrowed response description; `put` cannot fail (OD-2) | 0.5 |
 | `is_hop_by_hop` | `connection`, `keep-alive`, `proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`, and any name listed in `Connection` | 0.5 |

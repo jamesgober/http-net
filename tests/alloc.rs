@@ -13,7 +13,8 @@ use std::{
 };
 
 use http_net::{
-    ClientConn, ClientEvent, HttpError, Limits, Request, Response, ServerConn, ServerEvent,
+    Asked, ClientConn, ClientEvent, FieldSpan, HttpError, Limits, Parsed, Request, Response,
+    ServerConn, ServerEvent, parse_request_head, parse_response_head,
 };
 
 struct Counting;
@@ -624,4 +625,73 @@ fn test_server_reset_reuse_allocates_nothing() {
         }
     });
     assert_eq!(m.allocations, 0, "1,000 reset connections allocated {m:?}");
+}
+
+/// NFR-5: the stateless parsers allocate nothing at all, not even on the
+/// first call: the field records go into the caller's array.
+#[test]
+fn test_stateless_parsers_allocate_nothing_ever() {
+    let limits = Limits::new();
+    let mut fields = [FieldSpan::default(); 32];
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            for request in [BROWSER_GET, POST_LENGTH, POST_CHUNKED] {
+                let parsed = parse_request_head(request, &limits, &mut fields);
+                assert!(matches!(parsed, Ok(Parsed::Complete { .. })));
+            }
+            let parsed =
+                parse_request_head(b"GET / HTTP/1.1\r\nHost: a\r\nX: 1", &limits, &mut fields);
+            assert!(matches!(parsed, Ok(Parsed::Partial)));
+            let refused = parse_request_head(b"GET / HTTP/1.1\r\n\r\n", &limits, &mut fields);
+            assert_eq!(refused.err(), Some(HttpError::MissingHost));
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
+            let parsed = parse_response_head(response, &limits, Asked::default(), &mut fields);
+            assert!(matches!(parsed, Ok(Parsed::Complete { .. })));
+        }
+    });
+    assert_eq!(m.allocations, 0, "stateless parsing allocated {m:?}");
+}
+
+/// FR-43: copying heads out into a passport's reused vectors allocates
+/// nothing once the vectors have grown to the largest head.
+#[test]
+fn test_copy_into_reused_vectors_allocates_nothing() {
+    let mut conn = ServerConn::new();
+    let response = Response::new(204);
+    let mut out = Vec::with_capacity(4096);
+    let mut bytes = Vec::new();
+    let mut fields: Vec<FieldSpan> = Vec::new();
+    let mut copy_one = |conn: &mut ServerConn, out: &mut Vec<u8>, request: &[u8]| {
+        let mut fed = conn.feed(request);
+        loop {
+            match conn.poll() {
+                Ok(ServerEvent::Request(head)) => {
+                    let facts = head.copy_into(&mut bytes, &mut fields);
+                    assert!(facts.is_ok());
+                }
+                Ok(ServerEvent::NeedInput) => fed += conn.feed(&request[fed..]),
+                Ok(ServerEvent::Body(_)) => {}
+                Ok(ServerEvent::RequestEnd) => {
+                    out.clear();
+                    assert!(conn.respond(&response, out).is_ok());
+                    return;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    for _ in 0..64 {
+        for request in [BROWSER_GET, POST_LENGTH, POST_CHUNKED] {
+            copy_one(&mut conn, &mut out, request);
+        }
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            for request in [BROWSER_GET, POST_LENGTH, POST_CHUNKED] {
+                copy_one(&mut conn, &mut out, request);
+            }
+        }
+    });
+    assert_eq!(m.allocations, 0, "copying heads out allocated {m:?}");
 }
