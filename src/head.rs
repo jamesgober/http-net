@@ -261,6 +261,11 @@ impl HeadScanner {
         self.fields.clear();
     }
 
+    /// Fields scanned in the current section, stored or not.
+    pub(crate) fn field_count(&self) -> usize {
+        self.lines.count
+    }
+
     pub(crate) fn start_line(&self) -> Span {
         self.lines.start_line()
     }

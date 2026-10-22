@@ -11,11 +11,15 @@ use crate::{
         HeadKind, HeadScanner, Headers, RequestHead, RequestInfo, Scan, Version, interpret_request,
     },
     limits::Limits,
-    message::{OutBody, Response, check_trailers, push_last_chunk_with_trailers},
+    message::{
+        OutBody, Response, check_response_field, check_trailers, check_upgrade_protocol,
+        push_last_chunk_with_trailers, write_field,
+    },
     method::Method,
     preface::is_h2_preface,
     status::reason_phrase,
     syntax::push_decimal,
+    write::{BodyPlan, OutgoingBody, Output, ResponseHeadRef},
 };
 
 /// What a [`ServerConn`] has for the caller after [`poll`](ServerConn::poll).
@@ -979,15 +983,33 @@ impl ServerConn {
         self.buf.set_wipe(wipe);
     }
 
-    pub(crate) fn respond_dated(
+    pub(crate) fn respond_dated<O: Output + ?Sized>(
         &mut self,
         response: &Response,
         date: Option<&[u8]>,
-        out: &mut Vec<u8>,
+        out: &mut O,
     ) -> Result<(), HttpError> {
-        if let Some(e) = response.error() {
-            return Err(e);
+        let plan = self.start_response(&HeadSpec::from_response(response), date, out)?;
+        if plan == BodyPlan::Raw {
+            if let OutBody::Full(body) = &response.body {
+                out.put(body);
+            }
         }
+        Ok(())
+    }
+
+    /// Validates and writes a response head, and moves the connection to
+    /// the state it implies: the one code path behind `respond`,
+    /// `respond_into`, and `write_head`. Nothing is written on error.
+    pub(crate) fn start_response<O: Output + ?Sized>(
+        &mut self,
+        spec: &HeadSpec<'_>,
+        date: Option<&[u8]>,
+        out: &mut O,
+    ) -> Result<BodyPlan, HttpError> {
+        // Builder errors (a Response) or field errors (a borrowed head)
+        // come first, as when a Response is written.
+        let has_date = spec.check()?;
         let failed = self.state == ReqState::Failed;
         match self.state {
             ReqState::Body | ReqState::Complete | ReqState::Failed => {}
@@ -1001,9 +1023,14 @@ impl ServerConn {
         if self.resp != RespState::Idle {
             return Err(HttpError::InvalidState("a response was already started"));
         }
-        let status = response.status();
+        let status = spec.status;
         if !(100..=599).contains(&status) || ((100..200).contains(&status) && status != 101) {
             return Err(HttpError::InvalidStatus);
+        }
+        if spec.upgrade.is_some() && status != 101 {
+            return Err(HttpError::InvalidState(
+                "an upgrade protocol needs status 101",
+            ));
         }
         let (method, version) = if failed {
             (Method::Get, Version::Http11)
@@ -1012,16 +1039,14 @@ impl ServerConn {
         };
         let bodiless = (100..200).contains(&status) || status == 204 || status == 304;
         let tunnel = status == 101 || (method == Method::Connect && (200..300).contains(&status));
-        if bodiless || tunnel {
-            let empty = matches!(&response.body, OutBody::Full(b) if b.is_empty());
-            if !empty {
-                return Err(HttpError::BodyNotAllowed);
-            }
+        if (bodiless || tunnel) && !matches!(spec.body, OutgoingBody::Empty | OutgoingBody::Full(0))
+        {
+            return Err(HttpError::BodyNotAllowed);
         }
         if tunnel {
             let complete_upgrade =
                 self.body_read() && (self.info.upgrade || method == Method::Connect);
-            if !complete_upgrade || (status == 101 && !response.upgrade) || failed {
+            if !complete_upgrade || (status == 101 && spec.upgrade.is_none()) || failed {
                 return Err(HttpError::InvalidState(
                     "101 (or 2xx to CONNECT) must answer a complete upgrade request; \
                      build it with Response::switching_protocols",
@@ -1029,77 +1054,113 @@ impl ServerConn {
             }
             // RFC 9110 section 7.8: never switch to a protocol the client
             // did not offer.
-            if status == 101
-                && !response
-                    .upgrade_protocol()
-                    .is_some_and(|p| self.view().offers(p))
-            {
+            if status == 101 && !spec.upgrade.is_some_and(|p| self.view().offers(p)) {
                 return Err(HttpError::UpgradeNotOffered);
             }
         }
 
-        let mut close = failed
-            || response.close
-            || !self.keep_alive
-            || !self.allow_keep_alive
-            || !self.body_read();
+        let mut close =
+            failed || spec.close || !self.keep_alive || !self.allow_keep_alive || !self.body_read();
         let head_only = method == Method::Head || bodiless || tunnel;
-        self.resp_chunked = matches!(response.body, OutBody::Chunked);
-        let (mut encoder, declared) = match &response.body {
-            OutBody::Full(b) => (
-                Encoder::Length {
-                    remaining: b.len() as u64,
-                },
-                Some(b.len() as u64),
-            ),
-            OutBody::Length(n) => (Encoder::Length { remaining: *n }, Some(*n)),
-            OutBody::Chunked if version == Version::Http10 => {
+        self.resp_chunked = spec.body == OutgoingBody::Chunked;
+        let (mut encoder, declared) = match spec.body {
+            OutgoingBody::Empty => (Encoder::Length { remaining: 0 }, Some(0)),
+            OutgoingBody::Full(n) | OutgoingBody::Length(n) => {
+                (Encoder::Length { remaining: n }, Some(n))
+            }
+            OutgoingBody::Chunked if version == Version::Http10 => {
                 close = true;
                 (Encoder::CloseDelimited, None)
             }
-            OutBody::Chunked => (Encoder::Chunked, None),
+            OutgoingBody::Chunked => (Encoder::Chunked, None),
         };
 
-        out.extend_from_slice(b"HTTP/1.1 ");
+        out.put(b"HTTP/1.1 ");
         push_decimal(out, u64::from(status));
-        out.push(b' ');
-        out.extend_from_slice(reason_phrase(status).as_bytes());
-        out.extend_from_slice(b"\r\n");
+        out.put(b" ");
+        out.put(reason_phrase(status).as_bytes());
+        out.put(b"\r\n");
         if !(bodiless || tunnel) {
             push_framing(out, encoder, declared);
         }
         if tunnel {
             close = false;
         } else if close {
-            out.extend_from_slice(b"connection: close\r\n");
+            out.put(b"connection: close\r\n");
         } else if version == Version::Http10 {
-            out.extend_from_slice(b"connection: keep-alive\r\n");
+            out.put(b"connection: keep-alive\r\n");
         }
-        if let Some(date) = date.filter(|_| !response.has_date) {
-            out.extend_from_slice(b"date: ");
-            out.extend_from_slice(date);
-            out.extend_from_slice(b"\r\n");
+        if let Some(date) = date.filter(|_| !has_date) {
+            out.put(b"date: ");
+            out.put(date);
+            out.put(b"\r\n");
         }
-        out.extend_from_slice(response.fields());
-        out.extend_from_slice(b"\r\n");
+        spec.write_fields(out);
+        out.put(b"\r\n");
 
         if head_only {
             encoder = Encoder::Discard;
         }
         self.keep_alive = !close;
-        match &response.body {
-            OutBody::Full(b) => {
-                encoder.write(b, out)?;
+        let plan = match spec.body {
+            OutgoingBody::Empty | OutgoingBody::Full(_) => {
                 self.resp = RespState::Sent;
                 self.requests_served += 1;
+                match spec.body {
+                    OutgoingBody::Full(n) if n > 0 && !head_only => BodyPlan::Raw,
+                    _ => BodyPlan::None,
+                }
             }
-            _ => self.resp = RespState::Streaming(encoder),
-        }
+            OutgoingBody::Length(_) | OutgoingBody::Chunked => {
+                self.resp = RespState::Streaming(encoder);
+                BodyPlan::Stream
+            }
+        };
         if tunnel {
             self.state = ReqState::Upgraded;
         } else if failed {
             self.state = ReqState::Closed;
         }
+        Ok(plan)
+    }
+
+    /// Body bytes of a streamed response, into any output.
+    pub(crate) fn stream_body<O: Output + ?Sized>(
+        &mut self,
+        data: &[u8],
+        out: &mut O,
+    ) -> Result<(), HttpError> {
+        match &mut self.resp {
+            RespState::Streaming(encoder) => encoder.write(data, out),
+            _ => Err(HttpError::InvalidState("no streamed response in progress")),
+        }
+    }
+
+    /// The end of a streamed response, with optional trailers, into any
+    /// output.
+    pub(crate) fn finish_body<O: Output + ?Sized>(
+        &mut self,
+        trailers: &[(&str, &[u8])],
+        out: &mut O,
+    ) -> Result<(), HttpError> {
+        let RespState::Streaming(encoder) = &mut self.resp else {
+            return Err(HttpError::InvalidState("no streamed response in progress"));
+        };
+        if !trailers.is_empty() && !self.resp_chunked {
+            return Err(HttpError::TrailerNotAllowed);
+        }
+        match encoder {
+            Encoder::Chunked => push_last_chunk_with_trailers(out, trailers)?,
+            _ => {
+                check_trailers(trailers)?;
+                encoder.finish(out)?;
+            }
+        }
+        if *encoder == Encoder::CloseDelimited {
+            self.keep_alive = false;
+        }
+        self.resp = RespState::Sent;
+        self.requests_served += 1;
         Ok(())
     }
 
@@ -1180,10 +1241,7 @@ impl ServerConn {
     /// assert!(out.ends_with(b"7\r\nline 1\n\r\n0\r\n\r\n"));
     /// ```
     pub fn send_body(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), HttpError> {
-        match &mut self.resp {
-            RespState::Streaming(encoder) => encoder.write(data, out),
-            _ => Err(HttpError::InvalidState("no streamed response in progress")),
-        }
+        self.stream_body(data, out)
     }
 
     /// Ends a streamed response body (the last chunk for chunked encoding).
@@ -1256,25 +1314,103 @@ impl ServerConn {
         trailers: &[(&str, &[u8])],
         out: &mut Vec<u8>,
     ) -> Result<(), HttpError> {
-        let RespState::Streaming(encoder) = &mut self.resp else {
-            return Err(HttpError::InvalidState("no streamed response in progress"));
-        };
-        if !trailers.is_empty() && !self.resp_chunked {
-            return Err(HttpError::TrailerNotAllowed);
+        self.finish_body(trailers, out)
+    }
+}
+
+/// Where the fields of a head being written come from.
+#[derive(Clone, Copy)]
+pub(crate) enum SpecFields<'a> {
+    /// Already validated and serialized by a [`Response`] builder (including
+    /// the `connection` / `upgrade` lines of a 101).
+    Serialized(&'a [u8]),
+    /// Borrowed pairs from a [`ResponseHeadRef`](crate::ResponseHeadRef),
+    /// validated when the head is written.
+    Borrowed(&'a [(&'a str, &'a [u8])]),
+}
+
+/// A response head to write, from a [`Response`] or a
+/// [`ResponseHeadRef`](crate::ResponseHeadRef).
+pub(crate) struct HeadSpec<'a> {
+    status: u16,
+    fields: SpecFields<'a>,
+    body: OutgoingBody,
+    close: bool,
+    /// The protocol of a 101.
+    upgrade: Option<&'a [u8]>,
+    /// The builder's first error (serialized fields only).
+    error: Option<HttpError>,
+    /// A `date` field was set (serialized fields only; borrowed fields are
+    /// checked when written).
+    has_date: bool,
+}
+
+impl<'a> HeadSpec<'a> {
+    pub(crate) fn from_response(response: &'a Response) -> Self {
+        Self {
+            status: response.status(),
+            fields: SpecFields::Serialized(response.fields()),
+            body: match &response.body {
+                OutBody::Full(b) => OutgoingBody::Full(b.len() as u64),
+                OutBody::Length(n) => OutgoingBody::Length(*n),
+                OutBody::Chunked => OutgoingBody::Chunked,
+            },
+            close: response.close,
+            upgrade: response.upgrade_protocol(),
+            error: response.error(),
+            has_date: response.has_date,
         }
-        match encoder {
-            Encoder::Chunked => push_last_chunk_with_trailers(out, trailers)?,
-            _ => {
-                check_trailers(trailers)?;
-                encoder.finish(out)?;
+    }
+
+    pub(crate) fn from_ref(head: &ResponseHeadRef<'a>) -> Self {
+        Self {
+            status: head.status,
+            fields: SpecFields::Borrowed(head.fields),
+            body: head.body,
+            close: head.close,
+            upgrade: head.upgrade.map(str::as_bytes),
+            error: None,
+            has_date: false,
+        }
+    }
+
+    /// Validates what the builder did not: returns whether a `date` field
+    /// is set.
+    fn check(&self) -> Result<bool, HttpError> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        match self.fields {
+            SpecFields::Serialized(_) => Ok(self.has_date),
+            SpecFields::Borrowed(fields) => {
+                if let Some(protocol) = self.upgrade {
+                    check_upgrade_protocol(protocol)?;
+                }
+                let mut has_date = false;
+                for &(name, value) in fields {
+                    has_date |= check_response_field(name, value)?;
+                }
+                Ok(has_date)
             }
         }
-        if *encoder == Encoder::CloseDelimited {
-            self.keep_alive = false;
+    }
+
+    fn write_fields<O: Output + ?Sized>(&self, out: &mut O) {
+        match self.fields {
+            SpecFields::Serialized(bytes) => out.put(bytes),
+            SpecFields::Borrowed(fields) => {
+                if let Some(protocol) = self.upgrade {
+                    // The same lines, in the same place, as
+                    // Response::switching_protocols writes.
+                    out.put(b"connection: upgrade\r\nupgrade: ");
+                    out.put(protocol);
+                    out.put(b"\r\n");
+                }
+                for &(name, value) in fields {
+                    write_field(out, name, value);
+                }
+            }
         }
-        self.resp = RespState::Sent;
-        self.requests_served += 1;
-        Ok(())
     }
 }
 

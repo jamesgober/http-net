@@ -19,6 +19,7 @@ use crate::{
     method::Method,
     redact::{SerializedFields, serialized_fields},
     syntax::{check_field_value, is_protocol, is_token, trim_ows},
+    write::Output,
 };
 
 /// How an outgoing message's body is supplied.
@@ -75,17 +76,36 @@ const TRAILER_FORBIDDEN: &[&str] = &[
 /// Validates outgoing trailer fields (all of them, before anything is
 /// written), then appends the last chunk and the trailer section:
 /// `0\r\n`, the fields, and the blank line.
-pub(crate) fn push_last_chunk_with_trailers(
-    out: &mut Vec<u8>,
+pub(crate) fn push_last_chunk_with_trailers<O: Output + ?Sized>(
+    out: &mut O,
     trailers: &[(&str, &[u8])],
 ) -> Result<(), HttpError> {
     check_trailers(trailers)?;
-    out.extend_from_slice(b"0\r\n");
+    out.put(b"0\r\n");
     for &(name, value) in trailers {
         write_field(out, name, value);
     }
-    out.extend_from_slice(b"\r\n");
+    out.put(b"\r\n");
     Ok(())
+}
+
+/// Checks the protocol of a `101`: a token or a `name/version` product
+/// token, never `h2c` (RFC 9113 section 3.1).
+pub(crate) fn check_upgrade_protocol(protocol: &[u8]) -> Result<(), HttpError> {
+    if !is_protocol(protocol) {
+        Err(HttpError::InvalidHeaderValue)
+    } else if is_h2c(protocol) {
+        Err(HttpError::UpgradeNotOffered)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks one outgoing response field with the rules of
+/// [`Response::header`]; returns whether it is the `date` field.
+pub(crate) fn check_response_field(name: &str, value: &[u8]) -> Result<bool, HttpError> {
+    check_field(name, value, RESPONSE_RESERVED)?;
+    Ok(name.eq_ignore_ascii_case("date"))
 }
 
 /// Validates outgoing trailer fields without writing them. Also used for a
@@ -121,11 +141,11 @@ fn check_field(name: &str, value: &[u8], reserved: &[&str]) -> Result<(), HttpEr
     check_field_value(value)
 }
 
-fn write_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
-    out.extend_from_slice(name.as_bytes());
-    out.extend_from_slice(b": ");
-    out.extend_from_slice(value);
-    out.extend_from_slice(b"\r\n");
+pub(crate) fn write_field<O: Output + ?Sized>(out: &mut O, name: &str, value: &[u8]) {
+    out.put(name.as_bytes());
+    out.put(b": ");
+    out.put(value);
+    out.put(b"\r\n");
 }
 
 /// Validates a field and appends `name: value\r\n`.
@@ -290,12 +310,8 @@ impl Response {
     pub fn switching_protocols(protocol: &str) -> Self {
         let mut r = Self::new(101);
         r.upgrade = true;
-        if !is_protocol(protocol.as_bytes()) {
-            r.error = Some(HttpError::InvalidHeaderValue);
-            return r;
-        }
-        if is_h2c(protocol.as_bytes()) {
-            r.error = Some(HttpError::UpgradeNotOffered);
+        if let Err(e) = check_upgrade_protocol(protocol.as_bytes()) {
+            r.error = Some(e);
             return r;
         }
         r.fields
@@ -397,6 +413,34 @@ impl Response {
     pub fn close(mut self) -> Self {
         self.close = true;
         self
+    }
+
+    /// Resets the response to `Response::new(status)` while keeping the
+    /// allocation of its field storage, so one `Response` per connection
+    /// can be reused without allocating for every request. An owned body is
+    /// dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::Response;
+    ///
+    /// let mut r = Response::new(200).header("x-request", "1").close();
+    /// r.clear(204);
+    /// assert_eq!(r.status(), 204);
+    /// assert_eq!(r.header_value("x-request"), None);
+    /// assert!(!r.closes());
+    /// r = r.header("x-request", "2"); // reuses the field storage
+    /// assert_eq!(r.header_value("x-request"), Some(&b"2"[..]));
+    /// ```
+    pub fn clear(&mut self, status: u16) {
+        self.status = status;
+        self.fields.clear();
+        self.body = OutBody::Full(Cow::Borrowed(&[]));
+        self.close = false;
+        self.upgrade = false;
+        self.has_date = false;
+        self.error = None;
     }
 
     /// The status code.

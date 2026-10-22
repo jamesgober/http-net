@@ -1,12 +1,11 @@
 //! Body decoding (Content-Length, chunked, read-until-close) and encoding.
 
-use alloc::vec::Vec;
-
 use crate::{
     error::HttpError,
     head::{BodyFraming, HeadKind, HeadScanner, Scan, find_line},
     limits::Limits,
     syntax::{hex_value, is_ows, is_qdtext, is_tchar, push_decimal, push_hex},
+    write::Output,
 };
 
 /// The most hex digits a chunk size may have before it is certain to
@@ -45,6 +44,17 @@ pub(crate) enum Step {
     NeedMore,
 }
 
+/// What the decoder does with a trailer section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrailerMode {
+    /// Validate and consume it.
+    Discard,
+    /// Validate it, store its fields, and report it.
+    Store,
+    /// Validate it and report where it is, without storing its fields.
+    Locate,
+}
+
 pub(crate) struct Decoder {
     state: State,
     scan: usize,
@@ -64,12 +74,32 @@ impl Decoder {
         }
     }
 
-    /// Whether the whole body has been decoded (always, for a message
-    /// without one).
     /// Whether every byte of the message has been read: done, or only the
     /// already-received trailer section is left to hand over.
     pub(crate) fn is_read(&self) -> bool {
         matches!(self.state, State::Done | State::TrailersReady { .. })
+    }
+
+    /// Whether the whole body has been decoded and handed over.
+    pub(crate) fn is_done(&self) -> bool {
+        self.state == State::Done
+    }
+
+    /// The length of the trailer section reported by the last
+    /// [`Step::Trailers`] (zero otherwise).
+    pub(crate) fn trailer_len(&self) -> usize {
+        match self.state {
+            State::TrailersReady { len } => len,
+            _ => 0,
+        }
+    }
+
+    /// The caller consumed the reported trailer section itself: the body is
+    /// done without consuming it again on the next step.
+    pub(crate) fn take_trailers(&mut self) {
+        if let State::TrailersReady { .. } = self.state {
+            self.state = State::Done;
+        }
     }
 
     pub(crate) fn start(&mut self, framing: BodyFraming) {
@@ -98,6 +128,28 @@ impl Decoder {
         report: bool,
         consume: &mut usize,
     ) -> Result<Step, HttpError> {
+        let mode = if report {
+            TrailerMode::Store
+        } else {
+            TrailerMode::Discard
+        };
+        self.step_with(unread, eof, limits, trailers, mode, consume)
+    }
+
+    /// As [`step`](Self::step), with the trailer handling spelled out:
+    /// [`TrailerMode::Locate`] reports a non-empty trailer section as
+    /// [`Step::Trailers`] (its length in [`trailer_len`](Self::trailer_len))
+    /// without storing its fields, so nothing is allocated.
+    pub(crate) fn step_with(
+        &mut self,
+        unread: &[u8],
+        eof: bool,
+        limits: &Limits,
+        trailers: &mut HeadScanner,
+        mode: TrailerMode,
+        consume: &mut usize,
+    ) -> Result<Step, HttpError> {
+        let store = mode == TrailerMode::Store;
         loop {
             let input = unread.get(*consume..).unwrap_or(&[]);
             match self.state {
@@ -197,8 +249,10 @@ impl Decoder {
                     _ => return Err(HttpError::InvalidChunkTerminator),
                 },
                 State::Trailers => {
-                    match trailers.advance(input, limits, HeadKind::Trailer, report)? {
-                        Scan::Done(n) if report && !trailers.fields.is_empty() => {
+                    match trailers.advance(input, limits, HeadKind::Trailer, store)? {
+                        Scan::Done(n)
+                            if mode != TrailerMode::Discard && trailers.field_count() > 0 =>
+                        {
                             // Framing bytes before the section are consumed
                             // now, so the section starts the unread input.
                             self.state = State::TrailersReady { len: n };
@@ -319,7 +373,11 @@ pub(crate) enum Encoder {
 }
 
 impl Encoder {
-    pub(crate) fn write(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), HttpError> {
+    pub(crate) fn write<O: Output + ?Sized>(
+        &mut self,
+        data: &[u8],
+        out: &mut O,
+    ) -> Result<(), HttpError> {
         match self {
             Self::Length { remaining } => {
                 let n = data.len() as u64;
@@ -327,28 +385,28 @@ impl Encoder {
                     return Err(HttpError::BodyLengthMismatch);
                 }
                 *remaining -= n;
-                out.extend_from_slice(data);
+                out.put(data);
             }
             Self::Chunked => {
                 // An empty chunk would end the body, so it is skipped.
                 if !data.is_empty() {
                     push_hex(out, data.len() as u64);
-                    out.extend_from_slice(b"\r\n");
-                    out.extend_from_slice(data);
-                    out.extend_from_slice(b"\r\n");
+                    out.put(b"\r\n");
+                    out.put(data);
+                    out.put(b"\r\n");
                 }
             }
-            Self::CloseDelimited => out.extend_from_slice(data),
+            Self::CloseDelimited => out.put(data),
             Self::Discard => {}
         }
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), HttpError> {
+    pub(crate) fn finish<O: Output + ?Sized>(&mut self, out: &mut O) -> Result<(), HttpError> {
         match self {
             Self::Length { remaining } if *remaining != 0 => Err(HttpError::BodyLengthMismatch),
             Self::Chunked => {
-                out.extend_from_slice(b"0\r\n\r\n");
+                out.put(b"0\r\n\r\n");
                 Ok(())
             }
             _ => Ok(()),
@@ -357,13 +415,17 @@ impl Encoder {
 }
 
 /// Writes the framing header line(s) for a body.
-pub(crate) fn push_framing(out: &mut Vec<u8>, encoder: Encoder, declared_len: Option<u64>) {
+pub(crate) fn push_framing<O: Output + ?Sized>(
+    out: &mut O,
+    encoder: Encoder,
+    declared_len: Option<u64>,
+) {
     match (encoder, declared_len) {
-        (Encoder::Chunked, _) => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
+        (Encoder::Chunked, _) => out.put(b"transfer-encoding: chunked\r\n"),
         (_, Some(n)) => {
-            out.extend_from_slice(b"content-length: ");
+            out.put(b"content-length: ");
             push_decimal(out, n);
-            out.extend_from_slice(b"\r\n");
+            out.put(b"\r\n");
         }
         _ => {}
     }
@@ -371,6 +433,8 @@ pub(crate) fn push_framing(out: &mut Vec<u8>, encoder: Encoder, declared_len: Op
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
     fn decode_all(

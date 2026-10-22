@@ -87,6 +87,9 @@
 - [Tier 3: stateless parsers, chunked decoder, output](#tier-3-stateless-parsers-chunked-decoder-output)
   - [`is_hop_by_hop`](#is_hop_by_hop)
   - [`is_h2_preface`](#is_h2_preface)
+  - [`ChunkedDecoder`](#chunkeddecoder)
+  - [`Output` and the borrowed writer](#output-and-the-borrowed-writer)
+  - [`ServerConn::write_head` and `respond_into`](#serverconnwrite_head-and-respond_into)
 - [Blocking adapter](#blocking-adapter)
   - [`blocking::Server`](#blockingserver)
   - [`blocking::serve`](#blockingserve)
@@ -1086,8 +1089,8 @@ assert!(back.iter().all(|&b| b == 0));
 
 | Method | Behaviour | Errors | Ships |
 |---|---|---|---|
-| `write_head<O: Output>(&mut self, head: &ResponseHeadRef<'_>, date, out: &mut O) -> Result<BodyPlan, HttpError>` | allocation-free head writer from borrowed fields | as `respond` | 0.5 |
-| `respond_into<O: Output>(&mut self, response, date, out: &mut O)` | `respond` over any `Output` | as `respond` | 0.5 |
+| `write_head<O: Output>(&mut self, head: &ResponseHeadRef<'_>, date, out: &mut O) -> Result<BodyPlan, HttpError>` | allocation-free head writer from borrowed fields; see [`write_head`](#serverconnwrite_head-and-respond_into) | as `respond` | 0.5 |
+| `respond_into<O: Output>(&mut self, response, date, out: &mut O)`, `send_body_into`, `end_body_into` | `respond`, `send_body`, `end_body_with_trailers` over any `Output` | as `respond` | 0.5 |
 | `respond_head_only(&mut self, response, out) -> Result<BodyPlan, HttpError>` | writes only the head of a full-body response, so the driver can send head and body with one vectored write | as `respond` | 0.6 |
 
 ## `ServerEvent`
@@ -1857,10 +1860,14 @@ with `ReservedHeader`: the connection writes them.
 | `status(&self) -> u16`, `closes(&self) -> bool` | | exists |
 | `body_bytes(&self) -> Option<&[u8]>` | `None` for a streamed body | exists |
 | `header_value(&self, name: &str) -> Option<&[u8]>` | first added field with that name | exists |
-| `clear(&mut self, status: u16)` | reset for reuse, keeping the field allocation | 0.5 |
+| `clear(&mut self, status: u16)` | reset for reuse, keeping the field allocation: no fields, an empty body, no close, no upgrade, no remembered error | 0.5 |
 
 ```rust
 use http_net::Response;
+
+let mut reused = Response::new(404).header("x-a", "1").close();
+reused.clear(200);
+assert_eq!((reused.status(), reused.closes(), reused.header_value("x-a")), (200, false, None));
 
 let asset = Response::new(200)
     .header("content-type", "text/css")
@@ -2308,10 +2315,20 @@ impl ChunkedDecoder {
     pub fn total(&self) -> u64;
 }
 
+#[non_exhaustive] pub enum ChunkStep {
+    Data { skip: usize, len: usize }, NeedMore { consumed: usize },
+    Trailers { skip: usize, len: usize }, Done { consumed: usize } }
+
 pub trait Output { fn put(&mut self, bytes: &[u8]); fn reserve(&mut self, additional: usize) {} }
 impl Output for Vec<u8>;
+impl<O: Output + ?Sized> Output for &mut O;
 pub struct ResponseHeadRef<'a> { pub status: u16, pub fields: &'a [(&'a str, &'a [u8])],
     pub body: OutgoingBody, pub close: bool, pub upgrade: Option<&'a str> }
+impl<'a> ResponseHeadRef<'a> {
+    pub const fn new(status: u16, fields: &'a [(&'a str, &'a [u8])], body: OutgoingBody) -> Self;
+}
+#[non_exhaustive] pub enum OutgoingBody { Empty, Full(u64), Length(u64), Chunked }
+#[non_exhaustive] pub enum BodyPlan { None, Raw, Stream }
 
 pub fn is_hop_by_hop(name: &str, connection_options: ListElements<'_, '_>) -> bool;
 pub fn is_h2_preface(input: &[u8]) -> Option<bool>;
@@ -2364,6 +2381,141 @@ assert_eq!(is_h2_preface(b"GET / HTTP/1.1\r\n"), Some(false));
 let mut conn = ServerConn::new();
 let _ = conn.feed(PREFACE);
 assert_eq!(conn.poll().unwrap_err(), HttpError::Http2Preface);
+```
+
+### `ChunkedDecoder`
+
+Decodes a chunked body from bytes the caller holds (a proxy streaming a
+body through, a client on another buffer). It runs the connection's own
+decoder, so the grammar and the budgets are the connection's: at most 16
+hex digits in a size, checked arithmetic, the extension grammar and the
+per-message extension budget, `max_body` checked before each chunk's data,
+the CRLF after the data, and the trailer section validated against
+`max_trailer_bytes` and `max_trailer_fields`. Nothing is allocated, the
+decoder included.
+
+| Step | Meaning | What to do |
+|---|---|---|
+| `Data { skip, len }` | `skip` framing bytes, then `len` bytes of body (never 0) | consume `skip + len`, call again with what follows |
+| `NeedMore { consumed }` | the framing so far is valid but incomplete | drop `consumed`, keep the rest, append input, call again |
+| `Trailers { skip, len }` | `skip` framing bytes, then a validated trailer section of `len` bytes (its field lines and the final CRLF); only for a section with at least one field | consume `skip + len`; the next call reports `Done { consumed: 0 }` |
+| `Done { consumed }` | the body ends after `consumed` bytes; what follows is the next message | stop |
+
+`eof` says no more input will come: a body still open then fails with
+`UnexpectedEof`. Errors are the connection's (`InvalidChunkSize`,
+`ExtensionsTooLarge`, `BodyTooLarge`, `TrailersTooLarge`,
+`InvalidHeaderName`, and so on). `total()` counts the data bytes delivered;
+`is_done()` is true once `Done` has been reported.
+
+```rust
+use http_net::{ChunkStep, ChunkedDecoder, Limits};
+
+let wire = b"5;name=a\r\nhello\r\n0\r\nDigest: x\r\n\r\nGET / HTTP/1.1\r\n";
+let mut decoder = ChunkedDecoder::new(&Limits::new());
+let (mut pos, mut body) = (0, Vec::new());
+loop {
+    match decoder.decode(&wire[pos..], false)? {
+        ChunkStep::Data { skip, len } => {
+            body.extend_from_slice(&wire[pos + skip..pos + skip + len]);
+            pos += skip + len;
+        }
+        ChunkStep::Trailers { skip, len } => {
+            assert_eq!(&wire[pos + skip..pos + skip + len], b"Digest: x\r\n\r\n");
+            pos += skip + len;
+        }
+        ChunkStep::Done { consumed } => {
+            pos += consumed;
+            break;
+        }
+        ChunkStep::NeedMore { .. } => unreachable!("the whole body is here"),
+        _ => unreachable!(),
+    }
+}
+assert_eq!(body, b"hello");
+assert_eq!(decoder.total(), 5);
+assert!(decoder.is_done());
+assert_eq!(&wire[pos..], b"GET / HTTP/1.1\r\n");
+# Ok::<(), http_net::HttpError>(())
+```
+
+### `Output` and the borrowed writer
+
+`Output` is where serialized bytes go: a `Vec<u8>`, or a caller type such as
+a zeroizing buffer, a slab, or a byte counter. `put` cannot fail (decision
+OD-2): a sink with a fixed capacity records the overflow itself and reports
+it after the call. `reserve` is a hint and may be ignored. `&mut O` is an
+`Output` for any `O: Output`, so a sink can be passed down without being
+moved.
+
+`ResponseHeadRef` describes a response head with borrowed fields, so a head
+whose fields change per response is written without building a `Response`.
+The fields are checked exactly as `Response::header` checks them (a token
+name, no reserved name, no control bytes, no surrounding whitespace), and a
+`date` field means the connection adds none. `upgrade` names the protocol of
+a `101` and writes `connection: upgrade` and `upgrade: <protocol>` before the
+fields, as `Response::switching_protocols` does. It is a plain struct, built
+with a literal or with `ResponseHeadRef::new` (no close, no upgrade).
+
+`OutgoingBody` gives the framing:
+
+| `OutgoingBody` | Framing written | Plan |
+|---|---|---|
+| `Empty` | `content-length: 0` where a body is allowed | `None` |
+| `Full(n)` | `content-length: n`; the caller writes the `n` bytes | `Raw` (`None` when `n` is 0 or for `HEAD`) |
+| `Length(n)` | `content-length: n`; stream exactly `n` bytes | `Stream` |
+| `Chunked` | `transfer-encoding: chunked` (close-delimited to HTTP/1.0) | `Stream` |
+
+`BodyPlan` says what follows the head:
+
+| `BodyPlan` | Meaning |
+|---|---|
+| `None` | the response is complete |
+| `Raw` | write the `Full(n)` body bytes yourself, right after the head; the connection already counts the response as sent |
+| `Stream` | continue with `send_body_into` / `end_body_into` (or the `Vec` forms); for `HEAD` the connection drops the bytes, as `respond` does |
+
+### `ServerConn::write_head` and `respond_into`
+
+```rust,ignore
+pub fn write_head<O: Output + ?Sized>(&mut self, head: &ResponseHeadRef<'_>, date: Option<&HttpDate>,
+    out: &mut O) -> Result<BodyPlan, HttpError>;
+pub fn respond_into<O: Output + ?Sized>(&mut self, response: &Response, date: Option<&HttpDate>,
+    out: &mut O) -> Result<(), HttpError>;
+pub fn send_body_into<O: Output + ?Sized>(&mut self, data: &[u8], out: &mut O) -> Result<(), HttpError>;
+pub fn end_body_into<O: Output + ?Sized>(&mut self, trailers: &[(&str, &[u8])], out: &mut O)
+    -> Result<(), HttpError>;
+```
+
+`write_head` writes the bytes `respond` writes for the equivalent `Response`
+and fails the same way, through the same code: the same state rules, the
+same framing, the same `connection` handling, the same upgrade checks
+(`101` needs `upgrade`, `upgrade` needs `101`, a protocol the client did not
+offer is `UpgradeNotOffered`, a body other than `Empty` or `Full(0)` on a
+1xx, 204, 304, or tunnel status is `BodyNotAllowed`). On an error nothing is
+written. `date` is
+added unless the fields set one. With a reused `Vec` it allocates nothing.
+
+`respond_into` is `respond_with_date` over any `Output`. `send_body_into`
+and `end_body_into` are `send_body` and `end_body_with_trailers` over any
+`Output`.
+
+```rust
+use http_net::{BodyPlan, OutgoingBody, ResponseHeadRef, ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n");
+while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
+
+let request_id = b"7f3a";
+let fields: [(&str, &[u8]); 2] = [("content-type", b"text/plain"), ("x-request-id", request_id)];
+let mut out = Vec::new();
+let plan = conn.write_head(&ResponseHeadRef::new(200, &fields, OutgoingBody::Full(2)), None, &mut out)?;
+assert_eq!(plan, BodyPlan::Raw);
+out.extend_from_slice(b"ok");
+assert_eq!(
+    out,
+    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nx-request-id: 7f3a\r\n\r\nok"
+);
+# Ok::<(), http_net::HttpError>(())
 ```
 
 ---

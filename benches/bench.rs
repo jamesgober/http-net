@@ -6,13 +6,16 @@
 //! - `body_1mib`: a 1 MiB body, `Content-Length` and chunked (4 KiB
 //!   chunks), fed in 16 KiB reads.
 //! - `response_write`: serializing a response with five fields and a
-//!   1 KiB body.
+//!   1 KiB body, with `respond` and with `write_head` (borrowed fields).
 //! - `response_parse`: a client parsing a response with a 1 KiB body.
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use http_net::{ClientConn, ClientEvent, Limits, Request, Response, ServerConn, ServerEvent};
+use http_net::{
+    BodyPlan, ClientConn, ClientEvent, Limits, OutgoingBody, Request, Response, ResponseHeadRef,
+    ServerConn, ServerEvent,
+};
 
 const BROWSER_GET: &[u8] = b"GET /assets/app.3f9a1c.js?v=2 HTTP/1.1\r\n\
 Host: 127.0.0.1:53817\r\n\
@@ -139,6 +142,50 @@ fn bench_response_write(c: &mut Criterion) {
             while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
             out.clear();
             conn.respond(&response, &mut out).unwrap_or_default();
+            black_box(out.len())
+        })
+    });
+    // The same response through the Tier-3 writer: borrowed fields, the
+    // body appended by the caller after a `Raw` plan.
+    let body = vec![b'x'; 1024];
+    let fields: [(&str, &[u8]); 5] = [
+        ("content-type", b"application/javascript"),
+        ("cache-control", b"max-age=31536000, immutable"),
+        ("x-content-type-options", b"nosniff"),
+        ("referrer-policy", b"no-referrer"),
+        ("cross-origin-resource-policy", b"same-origin"),
+    ];
+    let head = ResponseHeadRef::new(200, &fields, OutgoingBody::Full(body.len() as u64));
+    group.bench_function("write_head_five_fields_1k_body", |b| {
+        let mut conn = ServerConn::new();
+        let mut out = Vec::with_capacity(4096);
+        b.iter(|| {
+            let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+            out.clear();
+            if conn.write_head(&head, None, &mut out) == Ok(BodyPlan::Raw) {
+                out.extend_from_slice(&body);
+            }
+            black_box(out.len())
+        })
+    });
+    // What `write_head` replaces when the fields change per response: a
+    // `Response` built for each one (the body borrowed, so only the field
+    // block allocates).
+    static BODY: [u8; 1024] = [b'x'; 1024];
+    group.bench_function("build_and_respond_five_fields_1k_body", |b| {
+        let mut conn = ServerConn::new();
+        let mut out = Vec::with_capacity(4096);
+        b.iter(|| {
+            let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            while !matches!(conn.poll(), Ok(ServerEvent::RequestEnd)) {}
+            out.clear();
+            let mut response = Response::new(200);
+            for (name, value) in fields {
+                response = response.header(name, value);
+            }
+            conn.respond(&response.body(&BODY[..]), &mut out)
+                .unwrap_or_default();
             black_box(out.len())
         })
     });

@@ -104,6 +104,7 @@ extern crate alloc;
 
 mod body;
 mod buffer;
+mod chunked;
 mod client;
 mod date;
 mod error;
@@ -118,11 +119,13 @@ mod redact;
 mod server;
 pub mod status;
 mod syntax;
+mod write;
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod blocking;
 
+pub use chunked::{ChunkStep, ChunkedDecoder};
 pub use client::{ClientConn, ClientEvent, ClientLeniency};
 pub use date::{DateCache, HttpDate};
 pub use error::HttpError;
@@ -141,6 +144,7 @@ pub use raw::{
 };
 pub use server::{Progress, ServerConn, ServerEvent};
 pub use status::{StatusClass, reason_phrase, status_allows_body, status_class};
+pub use write::{BodyPlan, OutgoingBody, Output, ResponseHeadRef};
 
 /// The crate version, as published (`CARGO_PKG_VERSION`).
 ///

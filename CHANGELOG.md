@@ -59,12 +59,32 @@
   stateless parsers and `copy_into` into grown vectors (zero
   allocations); fuzz target `stateless_parse` (oracle: equal to
   `ServerConn` and `ClientConn`, copies rebuild) in the CI fuzz matrix.
+- `Output`: where serialized bytes go, a `Vec<u8>` or a caller type (a
+  zeroizing buffer, a slab, a counter). `put` cannot fail; `reserve` is a
+  hint. `&mut O` is an `Output` for any `O: Output`.
+- The borrowed writer: `ServerConn::write_head` writes a response head from
+  a `ResponseHeadRef` (borrowed fields, an `OutgoingBody`, `close`, an
+  optional upgrade protocol) to any `Output` and returns a `BodyPlan`. It
+  writes the bytes `respond` writes for the equivalent `Response` and fails
+  the same way, and allocates nothing with a reused `Vec`.
+- `ServerConn::respond_into`, `send_body_into`, `end_body_into`:
+  `respond_with_date`, `send_body`, `end_body_with_trailers` over any
+  `Output`.
+- `Response::clear`: reset a response for reuse, keeping its field
+  allocation.
+- `ChunkedDecoder` and `ChunkStep`: a standalone chunked-body decoder over
+  caller-owned bytes, with explicit byte accounting and the connection's
+  grammar and budgets. It shares the connection's decoder and allocates
+  nothing.
 
 ### Changed
 
 - A connection that starts with the HTTP/2 connection preface is refused
   with `Http2Preface` instead of `UnsupportedVersion` (both answer 505). The
   check runs only before a connection's first request.
+- `respond`, `send_body`, `end_body`, and `end_body_with_trailers` now run
+  through the generic `Output` code; their behaviour and output are
+  unchanged.
 
 ---
 

@@ -13,8 +13,9 @@ use std::{
 };
 
 use http_net::{
-    Asked, ClientConn, ClientEvent, FieldSpan, HttpError, Limits, Parsed, Request, Response,
-    ServerConn, ServerEvent, parse_request_head, parse_response_head,
+    Asked, BodyPlan, ChunkStep, ChunkedDecoder, ClientConn, ClientEvent, FieldSpan, HttpDate,
+    HttpError, Limits, OutgoingBody, Parsed, Request, Response, ResponseHeadRef, ServerConn,
+    ServerEvent, parse_request_head, parse_response_head,
 };
 
 struct Counting;
@@ -497,6 +498,85 @@ fn test_server_reported_trailers_steady_state_allocates_nothing() {
         }
     });
     assert_eq!(m.allocations, 0, "requests with trailers allocated {m:?}");
+}
+
+/// The Tier-3 writer (A-210): a head of five borrowed fields written into a
+/// reused `Vec` allocates nothing, request after request.
+#[test]
+fn test_write_head_into_reused_vec_allocates_nothing() {
+    let mut conn = ServerConn::new();
+    let fields: [(&str, &[u8]); 5] = [
+        ("content-type", b"application/json"),
+        ("cache-control", b"no-store"),
+        ("server", b"http-net"),
+        ("x-request-id", b"0123456789abcdef"),
+        ("vary", b"accept-encoding"),
+    ];
+    let head = ResponseHeadRef::new(200, &fields, OutgoingBody::Full(13));
+    let date = HttpDate::from_unix_seconds(1_700_000_000);
+    let mut out = Vec::with_capacity(4096);
+    let mut run = |conn: &mut ServerConn| {
+        let mut fed = 0;
+        loop {
+            match conn.poll() {
+                Ok(ServerEvent::NeedInput) => {
+                    assert!(fed < BROWSER_GET.len(), "server wants more input");
+                    fed += conn.feed(&BROWSER_GET[fed..]);
+                }
+                Ok(ServerEvent::Request(_)) => {}
+                Ok(ServerEvent::RequestEnd) => {
+                    out.clear();
+                    let plan = conn.write_head(&head, Some(&date), &mut out);
+                    assert!(plan == Ok(BodyPlan::Raw), "write_head failed");
+                    out.extend_from_slice(b"{\"ok\":true}\r\n");
+                    return;
+                }
+                Ok(other) => panic!("unexpected server event {other:?}"),
+                Err(e) => panic!("server refused a valid request: {e:?}"),
+            }
+        }
+    };
+    for _ in 0..64 {
+        run(&mut conn);
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            run(&mut conn);
+        }
+    });
+    assert_eq!(m.allocations, 0, "write_head allocated {m:?}");
+}
+
+/// The standalone decoder (A-220): building one and decoding a body with
+/// extensions and trailers allocates nothing, the decoder included.
+#[test]
+fn test_chunked_decoder_allocates_nothing() {
+    const WIRE: &[u8] =
+        b"5;name=a\r\nhello\r\n6\r\n world\r\n0\r\nX-Checksum: 42\r\nX-Trace: 1\r\n\r\nNEXT";
+    let limits = Limits::new();
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            let mut decoder = ChunkedDecoder::new(&limits);
+            let (mut pos, mut body) = (0, 0);
+            loop {
+                match decoder.decode(&WIRE[pos..], false) {
+                    Ok(ChunkStep::Data { skip, len }) => {
+                        body += len;
+                        pos += skip + len;
+                    }
+                    Ok(ChunkStep::Trailers { skip, len }) => pos += skip + len,
+                    Ok(ChunkStep::Done { consumed }) => {
+                        pos += consumed;
+                        break;
+                    }
+                    Ok(other) => panic!("unexpected step {other:?}"),
+                    Err(e) => panic!("decoder refused a valid body: {e:?}"),
+                }
+            }
+            assert!(body == 11 && &WIRE[pos..] == b"NEXT");
+        }
+    });
+    assert_eq!(m.allocations, 0, "ChunkedDecoder allocated {m:?}");
 }
 
 const RESPONSE_HINTS_TRAILERS: &[u8] = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </b.js>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nServer-Timing: db;dur=5\r\n\r\n";
