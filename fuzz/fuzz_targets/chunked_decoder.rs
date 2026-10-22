@@ -3,12 +3,14 @@
 //! `ServerConn` and decoded by `ChunkedDecoder` at fuzzer-chosen splits,
 //! must give the same body, the same trailers and the same error, and the
 //! bytes left after the body must parse on a fresh connection exactly as
-//! they did after the body on the first.
+//! they did after the body on the first (except that only a fresh
+//! connection refuses the HTTP/2 preface, which it checks before its first
+//! request).
 
 #![no_main]
 
 use arbitrary::Arbitrary;
-use http_net::{ChunkStep, ChunkedDecoder, Limits};
+use http_net::{ChunkStep, ChunkedDecoder, HttpError, Limits, is_h2_preface};
 use http_net_fuzz::{Ev, Options, drive_server_with, split};
 use libfuzzer_sys::fuzz_target;
 
@@ -138,10 +140,20 @@ fuzz_target!(|input: Input<'_>| {
 
     if let Some(rest) = rest {
         let next = drive_server_with(&[&rest], limits, opts);
-        assert_eq!(
-            &by_conn[end + 1..],
-            &next[..],
-            "the bytes after the body differ"
-        );
+        if is_h2_preface(&rest) == Some(true) {
+            // A fresh connection checks for the HTTP/2 preface before its
+            // first request; the first connection, past a request, does not.
+            assert_eq!(
+                next.first(),
+                Some(&Ev::Err(HttpError::Http2Preface)),
+                "a fresh connection missed the preface"
+            );
+        } else {
+            assert_eq!(
+                &by_conn[end + 1..],
+                &next[..],
+                "the bytes after the body differ"
+            );
+        }
     }
 });
