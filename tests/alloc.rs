@@ -450,3 +450,102 @@ fn test_endless_chunks_stay_bounded_under_a_large_body_budget() {
     assert_eq!(err, None);
     assert_bounded(&limits, &m);
 }
+
+const POST_TRAILERS: &[u8] = b"POST /api/upload HTTP/1.1\r\nHost: app.example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nContent-Digest: sha-256=:x:\r\nX-Rows: 1\r\n\r\n";
+
+/// NFR-4 with trailers reported (FR-19): the trailer index is reused like
+/// the field index, so 10,000 requests with trailers allocate nothing after
+/// warm-up.
+#[test]
+fn test_server_reported_trailers_steady_state_allocates_nothing() {
+    let mut conn = ServerConn::new();
+    conn.set_report_trailers(true);
+    let response = Response::new(204);
+    let mut out = Vec::with_capacity(4096);
+    let mut run = |conn: &mut ServerConn| {
+        let mut fed = 0;
+        let mut trailers = 0;
+        loop {
+            match conn.poll() {
+                Ok(ServerEvent::NeedInput) => {
+                    assert!(
+                        fed < POST_TRAILERS.len(),
+                        "server wants input after the request"
+                    );
+                    fed += conn.feed(&POST_TRAILERS[fed..]);
+                }
+                Ok(ServerEvent::Request(_) | ServerEvent::Body(_)) => {}
+                Ok(ServerEvent::Trailers(t)) => trailers += t.len(),
+                Ok(ServerEvent::RequestEnd) => {
+                    out.clear();
+                    conn.respond(&response, &mut out).expect("respond");
+                    assert!(trailers == 2, "trailers not reported");
+                    return;
+                }
+                Ok(other) => panic!("unexpected server event {other:?}"),
+                Err(e) => panic!("server refused a valid request: {e:?}"),
+            }
+        }
+    };
+    for _ in 0..64 {
+        run(&mut conn);
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            run(&mut conn);
+        }
+    });
+    assert_eq!(m.allocations, 0, "requests with trailers allocated {m:?}");
+}
+
+const RESPONSE_HINTS_TRAILERS: &[u8] = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </b.js>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nServer-Timing: db;dur=5\r\n\r\n";
+
+/// NFR-4 on the client with interim responses and trailers reported
+/// (FR-39, FR-19): nothing is allocated per response after warm-up.
+#[test]
+fn test_client_reported_interim_and_trailers_steady_state_allocates_nothing() {
+    let mut conn = ClientConn::new();
+    conn.set_report_informational(true);
+    conn.set_report_trailers(true);
+    let request = Request::get("/page").header("host", "app.example.com");
+    let mut out = Vec::with_capacity(4096);
+    let mut run = |conn: &mut ClientConn| {
+        out.clear();
+        conn.send_request(&request, &mut out).expect("send");
+        let mut fed = 0;
+        let (mut hints, mut trailers, mut ended) = (0, 0, false);
+        loop {
+            match conn.poll() {
+                Ok(ClientEvent::NeedInput) => {
+                    assert!(
+                        fed < RESPONSE_HINTS_TRAILERS.len(),
+                        "client wants more input"
+                    );
+                    fed += conn.feed(&RESPONSE_HINTS_TRAILERS[fed..]);
+                }
+                Ok(ClientEvent::Informational(_)) => hints += 1,
+                Ok(ClientEvent::Trailers(t)) => trailers += t.len(),
+                Ok(ClientEvent::Response(_) | ClientEvent::Body(_)) => {}
+                Ok(ClientEvent::ResponseEnd) => ended = true,
+                Ok(ClientEvent::Idle) => {
+                    assert!(ended && hints == 2 && trailers == 1);
+                    return;
+                }
+                Ok(other) => panic!("unexpected client event {other:?}"),
+                Err(e) => panic!("client refused a valid response: {e:?}"),
+            }
+        }
+    };
+    for _ in 0..64 {
+        run(&mut conn);
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            run(&mut conn);
+        }
+    });
+    assert_eq!(
+        m.allocations, 0,
+        "responses with hints and trailers allocated {m:?}"
+    );
+}

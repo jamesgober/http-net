@@ -54,9 +54,14 @@ pub enum HttpError {
     /// The header section exceeds
     /// [`Limits::max_header_bytes`](crate::Limits::max_header_bytes). Answer 431.
     HeadersTooLarge,
-    /// More header (or trailer) fields than
-    /// [`Limits::max_headers`](crate::Limits::max_headers). Answer 431.
+    /// More header fields than
+    /// [`Limits::max_headers`](crate::Limits::max_headers), or more trailer
+    /// fields than [`Limits::max_trailer_fields`](crate::Limits::max_trailer_fields).
+    /// Answer 431.
     TooManyHeaders,
+    /// One field line is longer than
+    /// [`Limits::max_field_line`](crate::Limits::max_field_line). Answer 431.
+    FieldLineTooLong,
     /// A carriage return that is not followed by a line feed. Refused because
     /// recipients disagree on what it means, which is a smuggling vector.
     BareCr,
@@ -123,9 +128,14 @@ pub enum HttpError {
     /// A `101 Switching Protocols` (or a 2xx to `CONNECT`) arrived for a
     /// request that did not ask to switch.
     UnexpectedUpgrade,
+    /// The client received more interim (1xx) responses to one request
+    /// than [`Limits::max_interim`](crate::Limits::max_interim): a server
+    /// that never sends its final response. Close the connection.
+    TooManyInterim,
     /// An outgoing message tried to set a header the connection owns
-    /// (`content-length`, `transfer-encoding`, `connection`, `upgrade`); use
-    /// the builder methods instead.
+    /// (`content-length`, `transfer-encoding`, `connection`, `upgrade`,
+    /// `trailer`, `keep-alive`, `proxy-connection`, and `te` on a response);
+    /// use the builder methods instead.
     ReservedHeader,
     /// A body was given for a status that cannot carry one (1xx, 204, 304).
     BodyNotAllowed,
@@ -138,6 +148,16 @@ pub enum HttpError {
     /// deprecates. Also raised by `Request::upgrade("h2c")`. Answer with a
     /// protocol the client offered, or with a normal response.
     UpgradeNotOffered,
+    /// An interim (1xx) response the connection may not send now: to an
+    /// HTTP/1.0 request (RFC 9110 section 15.2 forbids it), after the final
+    /// response started, or a `100 Continue` after the body began or twice.
+    /// Skip the interim response.
+    InterimNotAllowed,
+    /// An outgoing trailer field that RFC 9110 section 6.5.1 keeps out of
+    /// trailers (framing, routing, authentication, request modifiers,
+    /// response control, content handling), or trailers on a body that is
+    /// not chunked. Send the field in the header section instead.
+    TrailerNotAllowed,
     /// A call made in the wrong state, for example `respond` twice for one
     /// request. The text names the rule that was broken.
     InvalidState(&'static str),
@@ -161,7 +181,7 @@ impl HttpError {
     pub const fn status(&self) -> Option<u16> {
         match self {
             Self::StartLineTooLong => Some(414),
-            Self::HeadersTooLarge | Self::TooManyHeaders => Some(431),
+            Self::HeadersTooLarge | Self::TooManyHeaders | Self::FieldLineTooLong => Some(431),
             Self::BodyTooLarge => Some(413),
             Self::UnsupportedVersion => Some(505),
             Self::UnsupportedTransferEncoding => Some(501),
@@ -191,10 +211,13 @@ impl HttpError {
             | Self::UnexpectedEof
             | Self::UnexpectedData
             | Self::UnexpectedUpgrade
+            | Self::TooManyInterim
             | Self::ReservedHeader
             | Self::BodyNotAllowed
             | Self::BodyLengthMismatch
             | Self::UpgradeNotOffered
+            | Self::InterimNotAllowed
+            | Self::TrailerNotAllowed
             | Self::InvalidState(_) => None,
         }
     }
@@ -225,6 +248,8 @@ impl HttpError {
                 | Self::BodyNotAllowed
                 | Self::BodyLengthMismatch
                 | Self::UpgradeNotOffered
+                | Self::InterimNotAllowed
+                | Self::TrailerNotAllowed
                 | Self::InvalidState(_)
         )
     }
@@ -260,6 +285,8 @@ impl HttpError {
                 | Self::BodyNotAllowed
                 | Self::BodyLengthMismatch
                 | Self::UpgradeNotOffered
+                | Self::InterimNotAllowed
+                | Self::TrailerNotAllowed
                 | Self::InvalidState(_)
         )
     }
@@ -277,6 +304,7 @@ impl fmt::Display for HttpError {
             Self::StartLineTooLong => "start line exceeds the configured limit",
             Self::HeadersTooLarge => "header section exceeds the configured byte limit",
             Self::TooManyHeaders => "more header fields than the configured limit",
+            Self::FieldLineTooLong => "a field line exceeds the configured limit",
             Self::BareCr => "carriage return not followed by line feed",
             Self::BareLf => "line feed not preceded by carriage return",
             Self::ObsFold => "field line starts with whitespace (obsolete line folding)",
@@ -302,11 +330,18 @@ impl fmt::Display for HttpError {
             Self::UnexpectedEof => "connection closed in the middle of a message",
             Self::UnexpectedData => "data received when no message was expected",
             Self::UnexpectedUpgrade => "protocol switch that the request did not ask for",
+            Self::TooManyInterim => "more interim responses than the configured limit",
             Self::ReservedHeader => {
                 "header is managed by the connection; use the builder method instead"
             }
             Self::BodyNotAllowed => "this status code cannot carry a body",
             Self::BodyLengthMismatch => "streamed body length differs from the declared length",
+            Self::InterimNotAllowed => {
+                "interim response not allowed now (HTTP/1.0 peer, after the final response,                  or 100 Continue after the body began)"
+            }
+            Self::TrailerNotAllowed => {
+                "field not allowed in trailers, or trailers on a body that is not chunked"
+            }
             Self::UpgradeNotOffered => {
                 "101 names a protocol the request did not offer (or h2c); \
                  answer with an offered protocol or a normal response"
@@ -345,6 +380,7 @@ mod tests {
         HttpError::StartLineTooLong,
         HttpError::HeadersTooLarge,
         HttpError::TooManyHeaders,
+        HttpError::FieldLineTooLong,
         HttpError::BareCr,
         HttpError::BareLf,
         HttpError::ObsFold,
@@ -368,10 +404,13 @@ mod tests {
         HttpError::UnexpectedEof,
         HttpError::UnexpectedData,
         HttpError::UnexpectedUpgrade,
+        HttpError::TooManyInterim,
         HttpError::ReservedHeader,
         HttpError::BodyNotAllowed,
         HttpError::BodyLengthMismatch,
         HttpError::UpgradeNotOffered,
+        HttpError::InterimNotAllowed,
+        HttpError::TrailerNotAllowed,
         HttpError::InvalidState("rule"),
     ];
 

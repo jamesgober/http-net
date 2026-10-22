@@ -8,13 +8,19 @@
 //! - the connection never asks for input while its buffer is full;
 //! - the buffered input never exceeds the buffer capacity;
 //! - after a parse error, `poll` reports only `Closed`, whatever is fed;
-//! - after a server-side parse error exactly one response can be sent.
+//! - after a server-side parse error exactly one response can be sent;
+//! - trailers and interim responses are reported only when asked for;
+//! - an interim response to an HTTP/1.1 request is accepted, to an HTTP/1.0
+//!   one refused;
+//! - with keep-alive switched off, the connection ends after one response;
+//! - `requests_served` counts every answered request.
 
 // Shared with the integration tests, so both differential checks use one
 // reference.
 #[path = "../../tests/common/reference.rs"]
 pub mod reference;
 
+use arbitrary::Arbitrary;
 use http_net::{
     BodyFraming, ClientConn, ClientEvent, HttpError, Limits, Request, Response, ServerConn,
     ServerEvent, Version,
@@ -43,10 +49,45 @@ pub enum Ev {
         framing: BodyFraming,
     },
     Body(Vec<u8>),
+    Trailers(Vec<(String, Vec<u8>)>),
+    Informational {
+        status: u16,
+        headers: Vec<(String, Vec<u8>)>,
+    },
+    Continue,
     End,
     Upgraded(Vec<u8>),
     Closed,
     Err(HttpError),
+}
+
+/// What a driver asks the connection for beyond the defaults, chosen by the
+/// fuzzer.
+#[derive(Arbitrary, Clone, Copy, Debug, Default)]
+pub struct Options {
+    pub report_trailers: bool,
+    pub report_informational: bool,
+    /// Server: switch keep-alive off before answering.
+    pub keep_alive_off: bool,
+    /// Server: send a `103` before each answer.
+    pub send_hints: bool,
+}
+
+/// Fuzzer-chosen budgets; `None` fields keep the defaults.
+#[derive(Arbitrary, Clone, Copy, Debug)]
+pub struct RawLimits {
+    pub line: u16,
+    pub headers: u16,
+    pub count: u8,
+    pub body: u16,
+    pub field_line: Option<u16>,
+    pub trailer_bytes: Option<u16>,
+    pub trailer_fields: Option<u8>,
+    pub interim: Option<u8>,
+}
+
+fn fields_of<'a>(it: impl Iterator<Item = (&'a str, &'a [u8])>) -> Vec<(String, Vec<u8>)> {
+    it.map(|(n, v)| (n.to_string(), v.to_vec())).collect()
 }
 
 fn push_body(events: &mut Vec<Ev>, chunk: &[u8]) {
@@ -75,29 +116,38 @@ pub fn split<'a>(input: &'a [u8], cuts: &[u16]) -> Vec<&'a [u8]> {
     pieces
 }
 
-/// Limits from four fuzzer-chosen numbers; `None` keeps the defaults.
-pub fn limits_from(raw: Option<(u16, u16, u8, u16)>) -> Limits {
-    match raw {
-        None => Limits::new(),
-        Some((line, headers, count, body)) => Limits::new()
-            .with_max_start_line(usize::from(line))
-            .with_max_header_bytes(usize::from(headers))
-            .with_max_headers(usize::from(count))
-            .with_max_body(u64::from(body)),
+/// Limits from fuzzer-chosen numbers; `None` keeps the defaults.
+pub fn limits_from(raw: Option<RawLimits>) -> Limits {
+    let Some(raw) = raw else {
+        return Limits::new();
+    };
+    let mut limits = Limits::new()
+        .with_max_start_line(usize::from(raw.line))
+        .with_max_header_bytes(usize::from(raw.headers))
+        .with_max_headers(usize::from(raw.count))
+        .with_max_body(u64::from(raw.body));
+    if let Some(n) = raw.field_line {
+        limits = limits.with_max_field_line(usize::from(n));
     }
+    if let Some(n) = raw.trailer_bytes {
+        limits = limits.with_max_trailer_bytes(usize::from(n));
+    }
+    if let Some(n) = raw.trailer_fields {
+        limits = limits.with_max_trailer_fields(usize::from(n));
+    }
+    if let Some(n) = raw.interim {
+        limits = limits.with_max_interim(u16::from(n));
+    }
+    limits
 }
 
-/// The first protocol an upgrade request offers, skipping `h2c`, so the
-/// driver answers with a protocol the client asked for.
-fn offered_protocol(upgrade: Option<&[u8]>) -> Option<String> {
-    let value = upgrade?;
-    value
-        .split(|&b| b == b',')
-        .map(|e| {
-            let s = std::str::from_utf8(e).unwrap_or("");
-            s.trim_matches(|c| c == ' ' || c == '\t').to_string()
-        })
-        .find(|p| !p.is_empty() && !p.eq_ignore_ascii_case("h2c"))
+/// The first protocol an upgrade request offers (`h2c` is never offered),
+/// so the driver answers with a protocol the client asked for.
+fn offered_protocol(r: &http_net::RequestHead<'_>) -> Option<String> {
+    r.upgrade_protocols()
+        .next()
+        .and_then(|p| std::str::from_utf8(p).ok())
+        .map(str::to_string)
 }
 
 /// Answers the current request: 101 for an upgrade (with the first
@@ -140,22 +190,40 @@ fn check_server_after_error(conn: &mut ServerConn, rest: &[&[u8]]) {
 /// Feeds `pieces` to a server connection, answering every request, then
 /// signals EOF. Returns the events.
 pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
+    drive_server_with(pieces, limits, Options::default())
+}
+
+/// As [`drive_server`], with fuzzer-chosen options and their oracles.
+pub fn drive_server_with(pieces: &[&[u8]], limits: Limits, opts: Options) -> Vec<Ev> {
     let cap = limits.buffer_capacity();
     let mut conn = ServerConn::with_limits(limits);
+    conn.set_report_trailers(opts.report_trailers);
     let mut out = Vec::new();
     let mut events = Vec::new();
     let mut next = 0;
     let mut pending: &[u8] = &[];
     let mut eof = false;
     let mut protocol: Option<String> = None;
+    let mut version = Version::Http11;
+    let mut answered = 0u64;
     for _ in 0..MAX_STEPS {
+        // Getters never panic and never claim more than the state allows.
+        let _ = conn.progress();
+        let _ = conn.keep_alive();
         match conn.poll() {
             Ok(ServerEvent::Request(r)) => {
                 protocol = if r.is_upgrade() {
-                    offered_protocol(r.header("upgrade"))
+                    offered_protocol(&r)
                 } else {
                     None
                 };
+                version = r.version();
+                let _ = (r.has_unknown_expectation(), r.content_length(), r.target_form());
+                assert!(
+                    r.upgrade_protocols()
+                        .all(|p| !p.eq_ignore_ascii_case(b"h2c") && !p.is_empty()),
+                    "h2c or an empty element offered"
+                );
                 events.push(Ev::Head {
                     method: r.method_str().to_string(),
                     target: r.target().to_string(),
@@ -170,10 +238,30 @@ pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
                 });
             }
             Ok(ServerEvent::Body(b)) => push_body(&mut events, b),
+            Ok(ServerEvent::Trailers(t)) => {
+                assert!(opts.report_trailers, "trailers reported without asking");
+                assert!(t.clone().next().is_some(), "an empty trailer section was reported");
+                events.push(Ev::Trailers(fields_of(t)));
+            }
             Ok(ServerEvent::RequestEnd) => {
                 events.push(Ev::End);
                 out.clear();
+                if opts.send_hints {
+                    let sent = conn.send_informational(&Response::new(103), &mut out);
+                    match version {
+                        Version::Http11 => assert!(sent.is_ok(), "103 to HTTP/1.1 refused: {sent:?}"),
+                        _ => assert_eq!(sent, Err(HttpError::InterimNotAllowed)),
+                    }
+                }
+                if opts.keep_alive_off {
+                    conn.set_keep_alive(false);
+                }
                 answer(&mut conn, protocol.as_deref(), &mut out);
+                answered += 1;
+                assert_eq!(conn.requests_served(), answered, "requests_served miscounted");
+                if opts.keep_alive_off {
+                    assert!(!conn.keep_alive(), "keep-alive still on after set_keep_alive(false)");
+                }
             }
             Ok(ServerEvent::NeedInput) => {
                 assert!(!eof, "NeedInput after EOF");
@@ -224,8 +312,22 @@ pub fn drive_server(pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
 /// Sends `request` on a client connection, feeds `pieces` as the response,
 /// then EOF. Returns the events.
 pub fn drive_client(request: &Request, pieces: &[&[u8]], limits: Limits) -> Vec<Ev> {
+    drive_client_with(request, pieces, limits, Options::default())
+}
+
+/// As [`drive_client`], with fuzzer-chosen options and their oracles. A
+/// request built with `expect_continue` and a 4-byte streamed body gets its
+/// body sent at `Continue`.
+pub fn drive_client_with(
+    request: &Request,
+    pieces: &[&[u8]],
+    limits: Limits,
+    opts: Options,
+) -> Vec<Ev> {
     let cap = limits.buffer_capacity();
     let mut conn = ClientConn::with_limits(limits);
+    conn.set_report_trailers(opts.report_trailers);
+    conn.set_report_informational(opts.report_informational);
     let mut out = Vec::new();
     if let Err(e) = conn.send_request(request, &mut out) {
         panic!("a valid request was refused: {e:?}");
@@ -235,7 +337,27 @@ pub fn drive_client(request: &Request, pieces: &[&[u8]], limits: Limits) -> Vec<
     let mut pending: &[u8] = &[];
     let mut eof = false;
     for _ in 0..MAX_STEPS {
+        let _ = (conn.progress(), conn.is_reusable(), conn.is_waiting_for_continue());
         match conn.poll() {
+            Ok(ClientEvent::Informational(r)) => {
+                assert!(opts.report_informational, "interim reported without asking");
+                assert!(r.is_informational() && r.status() != 101);
+                events.push(Ev::Informational {
+                    status: r.status(),
+                    headers: fields_of(r.headers()),
+                });
+            }
+            Ok(ClientEvent::Continue) => {
+                events.push(Ev::Continue);
+                assert!(!conn.is_waiting_for_continue());
+                conn.send_body(b"data", &mut out).expect("body after 100");
+                conn.end_body(&mut out).expect("end after 100");
+            }
+            Ok(ClientEvent::Trailers(t)) => {
+                assert!(opts.report_trailers, "trailers reported without asking");
+                assert!(t.clone().next().is_some(), "an empty trailer section was reported");
+                events.push(Ev::Trailers(fields_of(t)));
+            }
             Ok(ClientEvent::Response(r)) => events.push(Ev::Status {
                 status: r.status(),
                 headers: r

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.3.0</code>).</strong> The core is in place and the 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.4.0</code>).</strong> The core and the extended protocol features (trailers, interim responses, the client side of <code>Expect: 100-continue</code>, driver controls) are in place, and the 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -42,6 +42,7 @@
 - A **[`ClientConn`](./docs/API.md#clientconn)** is the mirror image: `send_request` writes a **[`Request`](./docs/API.md#request)**, `poll` reports the response as **[`ClientEvent`](./docs/API.md#clientevent)**s.
 - **[`RequestHead`](./docs/API.md#requesthead)** and **[`ResponseHead`](./docs/API.md#responsehead)** are zero-copy views of a parsed head.
 - **[`Limits`](./docs/API.md#limits)** bounds every buffer; **[`HttpError`](./docs/API.md#httperror)** says exactly what was refused and which status to answer with, and [`Response::from_error`](./docs/API.md#responsefrom_error) builds that answer.
+- Both connections carry **trailers** (reported on request, sent with `end_body_with_trailers`) and **interim responses** (`send_informational` for `103 Early Hints`; reported to the client on request), and the client can send **`Expect: 100-continue`** and hold its body back. **[`Progress`](./docs/API.md#progress)**, `set_keep_alive`, and `requests_served` give drivers what they need for deadlines and load shedding; **[`DateCache`](./docs/API.md#httpdate-and-datecache)** formats `Date` once per second.
 - **[`Method`](./docs/API.md#method)** and **[`MethodSet`](./docs/API.md#methodset)** classify methods (safe, idempotent, a bit set for routers and `Allow`); [`reason_phrase`](./docs/API.md#reason_phrase) and the [`status`](./docs/API.md#status-constants) constants cover the whole IANA status registry.
 - The **[`blocking`](./docs/API.md#blocking-adapter)** module (feature `std`) drives both over `std::net`: a bounded thread-per-connection `Server`, a per-connection `Connection`, and `get`.
 
@@ -71,14 +72,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.3"
+http-net = "0.4"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.3", default-features = false }
+http-net = { version = "0.4", default-features = false }
 ```
 
 <hr>
@@ -160,12 +161,14 @@ assert_eq!(conn.remaining_input(), b"\x81\x85"); // the first bytes of the first
 |---|---|---|
 | request line, status line, chunk-size line | 8 KiB | `StartLineTooLong` (414) / `ChunkLineTooLong` (400) |
 | header section | 16 KiB | `HeadersTooLarge` (431) |
-| header fields (trailer fields counted separately) | 100 | `TooManyHeaders` (431) |
+| one field line (headers and trailers) | 8 KiB | `FieldLineTooLong` (431) |
+| header fields | 100 | `TooManyHeaders` (431) |
+| trailer section and trailer fields | the header budgets, unless set | `HeadersTooLarge` / `TooManyHeaders` |
 | body | 1 MiB | `BodyTooLarge` (413) |
 | chunk extensions, summed over one message | 16 KiB (the header budget) | `ChunkExtensionsTooLarge` (400) |
-| interim 1xx heads before a response (client) | 16 KiB (the header budget) | `HeadersTooLarge` |
+| interim 1xx responses before a final one (client) | 16, and 16 KiB of heads together | `TooManyInterim` / `HeadersTooLarge` |
 
-These are the budgets of LexerSketch Studio's localhost server. Change them with [`Limits`](./docs/API.md#limits). The blocking server adds time budgets in [`ServerConfig`](./docs/API.md#blockingserverconfig): 10 s per read, 30 s per request, 10 s per write, at most 1 s of lingering close.
+These are the budgets of LexerSketch Studio's localhost server. Change them with [`Limits`](./docs/API.md#limits). The blocking server adds time budgets in [`ServerConfig`](./docs/API.md#blockingserverconfig): 10 s per read, 30 s per request, 10 s per write, 60 s to write a whole response, at most 1 s of lingering close.
 
 <br>
 
@@ -174,6 +177,8 @@ These are the budgets of LexerSketch Studio's localhost server. Change them with
 ```bash
 cargo run --example localhost   # serve, fetch, shut down
 cargo run --example sans_io     # the core with no socket
+cargo run --example early_hints # 103 Early Hints, server to client, in memory
+cargo run --example trailers    # trailer fields both ways, in memory
 cargo run --example serve -- 127.0.0.1:8080
 cargo run --example get -- http://127.0.0.1:8080/
 ```
@@ -183,7 +188,6 @@ cargo run --example get -- http://127.0.0.1:8080/
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- Interim responses other than `100 Continue` from the server (for example `103 Early Hints`), sending `Expect: 100-continue` from the client, trailers exposed and sent, a cached `Date`, and total deadlines in the blocking server and client: v0.4.0. The server already answers `Expect: 100-continue`; the blocking adapter's timeouts apply to each connect, read, and write.
 - Client pipelining, the allocation-free Tier-3 writer and stateless parsers, spans for zero-copy copy-out, and a standalone chunked decoder: v0.5.0. The server already serves pipelined requests in order. See the [roadmap](./dev/ROADMAP.md) and the planned items in [`docs/API.md`](./docs/API.md).
 - An async runtime or adapter: never; drive the sans-IO core from any loop.
 - Content codings (gzip and others): a body is delivered as sent, and a `Transfer-Encoding` other than `chunked` is refused with 501.
@@ -193,16 +197,16 @@ cargo run --example get -- http://127.0.0.1:8080/
 
 ## Performance
 
-Criterion medians for 0.3.0 on Windows x86_64 (Rust stable, release profile), from `cargo bench`, measured back to back with a 0.2.0 build on the same machine (the largest consistent difference from 0.2.0 is about +2%, on the head and pipelined benchmarks; the rest are within run-to-run noise):
+Criterion medians for 0.4.0 in WSL Ubuntu on a Windows x86_64 machine (Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.3.0 build so machine load falls on both (0.4 costs about 2 to 3% on the head benchmark for its new per-request facts; the rest are within run-to-run noise; the machine had other load, so absolute numbers are on the slow side):
 
 | Benchmark | Median |
 |---|---:|
-| 12-field browser GET, parsed and answered | ~298 ns |
-| 100,000 pipelined GETs in 16 KiB reads | ~8.9 ms (about 11.2 M requests/s) |
-| 1 MiB body, `Content-Length`, 16 KiB reads | ~13.5 µs |
-| 1 MiB body, chunked in 4 KiB chunks | ~16.9 µs |
-| response with five fields and a 1 KiB body, serialized | ~78 ns |
-| client parsing a 1 KiB response | ~101 ns |
+| 12-field browser GET, parsed and answered | ~316 ns |
+| 100,000 pipelined GETs in 16 KiB reads | ~10.1 ms (about 9.9 M requests/s) |
+| 1 MiB body, `Content-Length`, 16 KiB reads | ~14.5 µs |
+| 1 MiB body, chunked in 4 KiB chunks | ~19.8 µs |
+| response with five fields and a 1 KiB body, serialized | ~92 ns |
+| client parsing a 1 KiB response | ~110 ns |
 
 These are library-only numbers: no sockets are involved. Body events borrow the input buffer, so the 1 MiB cases measure one copy into the buffer plus framing.
 

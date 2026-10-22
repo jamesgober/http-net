@@ -105,6 +105,7 @@ extern crate alloc;
 mod body;
 mod buffer;
 mod client;
+mod date;
 mod error;
 mod head;
 mod limits;
@@ -120,15 +121,17 @@ mod syntax;
 pub mod blocking;
 
 pub use client::{ClientConn, ClientEvent};
+pub use date::{DateCache, HttpDate};
 pub use error::HttpError;
 pub use head::{
-    BodyFraming, HeaderValues, Headers, RequestHead, ResponseHead, TargetForm, Version,
+    BodyFraming, HeaderValues, Headers, ListElements, RequestHead, ResponseHead, TargetForm,
+    Version,
 };
 pub use limits::Limits;
 pub use message::{Request, Response};
 pub use method::{Method, MethodSet};
-pub use server::{ServerConn, ServerEvent};
-pub use status::{StatusClass, reason_phrase, status_class};
+pub use server::{Progress, ServerConn, ServerEvent};
+pub use status::{StatusClass, reason_phrase, status_allows_body, status_class};
 
 /// The crate version, as published (`CARGO_PKG_VERSION`).
 ///

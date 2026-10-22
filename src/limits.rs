@@ -23,7 +23,10 @@ const BODY_WINDOW: usize = 16 * 1024;
 /// |---|---|
 /// | request line / status line / chunk-size line | 8 KiB |
 /// | header section (all field lines) | 16 KiB |
-/// | header fields (and, separately, trailer fields) | 100 |
+/// | one field line (headers and trailers) | 8 KiB |
+/// | header fields | 100 |
+/// | trailer section, trailer fields | the header budgets |
+/// | interim (1xx) responses per request (client) | 16 |
 /// | body | 1 MiB |
 ///
 /// # Examples
@@ -41,6 +44,12 @@ pub struct Limits {
     start_line: usize,
     header_bytes: usize,
     headers: usize,
+    field_line: usize,
+    /// `None`: the same as the header budget.
+    trailer_bytes: Option<usize>,
+    /// `None`: the same as the header count.
+    trailer_fields: Option<usize>,
+    interim: u16,
     body: u64,
 }
 
@@ -64,6 +73,10 @@ impl Limits {
             start_line: 8 * 1024,
             header_bytes: 16 * 1024,
             headers: 100,
+            field_line: 8 * 1024,
+            trailer_bytes: None,
+            trailer_fields: None,
+            interim: 16,
             body: 1024 * 1024,
         }
     }
@@ -111,6 +124,77 @@ impl Limits {
     #[must_use]
     pub const fn with_max_headers(mut self, count: usize) -> Self {
         self.headers = clamp(count, 0, 65_536);
+        self
+    }
+
+    /// Sets the longest accepted single field line (name, colon, value, and
+    /// CRLF), in headers and trailers alike. Clamped to `4..=16 MiB`. A line
+    /// over it is [`HttpError::FieldLineTooLong`](crate::HttpError::FieldLineTooLong)
+    /// (431), checked before the rest of the line is buffered. The whole
+    /// section is still bounded by
+    /// [`max_header_bytes`](Self::max_header_bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::Limits::new().with_max_field_line(1024);
+    /// assert_eq!(l.max_field_line(), 1024);
+    /// ```
+    #[must_use]
+    pub const fn with_max_field_line(mut self, bytes: usize) -> Self {
+        self.field_line = clamp(bytes, 4, HARD_CAP);
+        self
+    }
+
+    /// Sets the largest accepted trailer section, in bytes (every trailer
+    /// field line plus the blank line that ends it). Clamped to
+    /// `2..=16 MiB`. Until it is set it follows
+    /// [`max_header_bytes`](Self::max_header_bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::Limits::new().with_max_trailer_bytes(512);
+    /// assert_eq!(l.max_trailer_bytes(), 512);
+    /// assert_eq!(http_net::Limits::new().max_trailer_bytes(), 16 * 1024);
+    /// ```
+    #[must_use]
+    pub const fn with_max_trailer_bytes(mut self, bytes: usize) -> Self {
+        self.trailer_bytes = Some(clamp(bytes, 2, HARD_CAP));
+        self
+    }
+
+    /// Sets the most trailer fields accepted in one message. Clamped to
+    /// `0..=65536`. Until it is set it follows
+    /// [`max_headers`](Self::max_headers).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::Limits::new().with_max_trailer_fields(4);
+    /// assert_eq!(l.max_trailer_fields(), 4);
+    /// ```
+    #[must_use]
+    pub const fn with_max_trailer_fields(mut self, count: usize) -> Self {
+        self.trailer_fields = Some(clamp(count, 0, 65_536));
+        self
+    }
+
+    /// Sets the most interim (1xx) responses a client accepts before the
+    /// final response to one request; one more is
+    /// [`HttpError::TooManyInterim`](crate::HttpError::TooManyInterim). The
+    /// interim heads together also count against
+    /// [`max_header_bytes`](Self::max_header_bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::Limits::new().with_max_interim(2);
+    /// assert_eq!(l.max_interim(), 2);
+    /// ```
+    #[must_use]
+    pub const fn with_max_interim(mut self, count: u16) -> Self {
+        self.interim = count;
         self
     }
 
@@ -164,6 +248,61 @@ impl Limits {
         self.headers
     }
 
+    /// The longest accepted single field line, CRLF included.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Limits::new().max_field_line(), 8192);
+    /// ```
+    #[must_use]
+    pub const fn max_field_line(&self) -> usize {
+        self.field_line
+    }
+
+    /// The largest accepted trailer section, in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::Limits::new().with_max_header_bytes(4096);
+    /// assert_eq!(l.max_trailer_bytes(), 4096);
+    /// ```
+    #[must_use]
+    pub const fn max_trailer_bytes(&self) -> usize {
+        match self.trailer_bytes {
+            Some(n) => n,
+            None => self.header_bytes,
+        }
+    }
+
+    /// The most trailer fields accepted in one message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Limits::new().max_trailer_fields(), 100);
+    /// ```
+    #[must_use]
+    pub const fn max_trailer_fields(&self) -> usize {
+        match self.trailer_fields {
+            Some(n) => n,
+            None => self.headers,
+        }
+    }
+
+    /// The most interim responses a client accepts per request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Limits::new().max_interim(), 16);
+    /// ```
+    #[must_use]
+    pub const fn max_interim(&self) -> u16 {
+        self.interim
+    }
+
     /// The largest accepted body, in bytes.
     ///
     /// # Examples
@@ -176,15 +315,17 @@ impl Limits {
         self.body
     }
 
-    /// The input buffer's hard capacity, `2 * (max_start_line +
-    /// max_header_bytes) + 16 KiB` (64 KiB with the defaults), so a driver
-    /// can plan memory per connection.
+    /// The input buffer's hard capacity, `head + max(head,
+    /// max_trailer_bytes) + 16 KiB` where `head = max_start_line +
+    /// max_header_bytes` (64 KiB with the defaults), so a driver can plan
+    /// memory per connection.
     ///
     /// The current message's head stays pinned while its body streams, and
     /// the decoder may need one whole chunk-size line or trailer section on
-    /// top of it, so twice the head budget plus the body window always fits
-    /// whatever the parser is waiting to complete. A connection's memory is
-    /// this buffer plus `max_headers` field records of 16 bytes each.
+    /// top of it, so this always fits whatever the parser is waiting to
+    /// complete. A connection's memory is this buffer plus `max_headers`
+    /// field records of 16 bytes each (and as many for trailers when they
+    /// are reported).
     ///
     /// # Examples
     ///
@@ -197,7 +338,10 @@ impl Limits {
     /// ```
     #[must_use]
     pub const fn buffer_capacity(&self) -> usize {
-        2 * (self.start_line + self.header_bytes) + BODY_WINDOW
+        let head = self.start_line + self.header_bytes;
+        let trailers = self.max_trailer_bytes();
+        let tail = if trailers > head { trailers } else { head };
+        head + tail + BODY_WINDOW
     }
 }
 
@@ -225,5 +369,18 @@ mod tests {
         assert_eq!(l.max_header_bytes(), 2);
         assert_eq!(l.max_headers(), 65_536);
         assert!(l.buffer_capacity() <= u32::MAX as usize);
+        let l = l.with_max_trailer_bytes(usize::MAX).with_max_field_line(0);
+        assert!(l.buffer_capacity() <= u32::MAX as usize);
+        assert_eq!(l.max_field_line(), 4);
+    }
+
+    #[test]
+    fn test_buffer_capacity_covers_a_larger_trailer_section() {
+        let base = Limits::new();
+        assert_eq!(base.buffer_capacity(), 64 * 1024);
+        let big = base.with_max_trailer_bytes(100 * 1024);
+        assert_eq!(big.buffer_capacity(), 24 * 1024 + 100 * 1024 + 16 * 1024);
+        let small = base.with_max_trailer_bytes(10);
+        assert_eq!(small.buffer_capacity(), 64 * 1024);
     }
 }

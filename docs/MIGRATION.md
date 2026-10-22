@@ -5,6 +5,112 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.3 to 0.4
+
+Update the dependency:
+
+```toml
+[dependencies]
+http-net = "0.4"
+```
+
+Most code builds unchanged. `ServerEvent` and `ClientEvent` gained
+variants, but both are `#[non_exhaustive]`, so every `match` on them
+already has a wildcard arm; the new variants appear only when you opt in.
+
+### One field line is at most 8 KiB by default
+
+**What changed.** `Limits` has a per-line budget, `max_field_line`, 8 KiB by
+default. A longer field line (in headers or trailers) is refused with the
+new `HttpError::FieldLineTooLong`, answered 431. In 0.3 one line could use
+the whole 16 KiB header section.
+
+**Why.** A single huge line is how a header section budget gets spent in
+one go; 8 KiB matches common proxy limits (open decision OD-21).
+
+**What to do.** If you accept very long cookies or tokens, raise it:
+
+```rust
+let limits = http_net::Limits::new().with_max_field_line(16 * 1024);
+assert_eq!(limits.max_field_line(), 16 * 1024);
+```
+
+### `send_continue` reports `InterimNotAllowed`
+
+**What changed.** `ServerConn::send_continue` returns the new
+`HttpError::InterimNotAllowed` (was `InvalidState`) for an HTTP/1.0
+request, after a body byte was read or a response started, and when called
+twice. With no request waiting for its body it is still `InvalidState`.
+
+**What to do.** Match on `InterimNotAllowed` if you matched on the old
+error; both mean "skip the interim response".
+
+### The client counts interim responses
+
+**What changed.** A client stops after `Limits::max_interim` (16 by default)
+interim responses to one request, with the new `HttpError::TooManyInterim`;
+0.3 stopped only at the header byte budget (`HeadersTooLarge`).
+
+**What to do.** Nothing for real servers; raise `max_interim` if a server
+legitimately sends more `102 Processing` responses.
+
+### More reserved outgoing fields
+
+**What changed.** `Response::header` and `Request::header` refuse
+`trailer`, `keep-alive`, and `proxy-connection`, and `Response::header`
+refuses `te`, with `ReservedHeader`.
+
+**Why.** They are hop-by-hop fields that belong to the connection (RFC 9110
+section 7.6.1); `te` is a request field (section 10.1.4). A caller-set
+`keep-alive: timeout=5` could contradict what the connection does.
+
+**What to do.** Remove them from your builders; requests may still send
+`te: trailers`.
+
+### Blocking server: 417 and a response deadline
+
+**What changed.** `blocking::Server` answers a request whose `Expect`
+holds anything but `100-continue` with `417 Expectation Failed` and closes,
+without calling the handler (RFC 9110 section 10.1.1 allows it); 0.3
+ignored such expectations. Writing one response may now take at most
+`ServerConfig::response_deadline` (60 s by default) in total; a client
+that reads slower than that is cut off.
+
+**What to do.** Raise or disable the deadline with
+`with_response_deadline` for very large downloads to slow clients.
+
+### Lists split around quoted strings
+
+**What changed.** A comma inside a quoted string no longer splits a list
+element, in the fields the crate reads (`Connection`, `Transfer-Encoding`,
+`Expect`, `Upgrade`) and in the new `header_list`.
+
+**What to do.** Nothing: no message 0.3 accepted reads differently.
+
+### Added in 0.4
+
+These change no existing behaviour:
+
+- Trailers both ways: `set_report_trailers` and `ServerEvent::Trailers` /
+  `ClientEvent::Trailers`; `end_body_with_trailers` on both connections;
+  `HttpError::TrailerNotAllowed`.
+- Interim responses both ways: `ServerConn::send_informational`,
+  `ClientConn::set_report_informational`, `ClientEvent::Informational`,
+  `ResponseHead::is_informational`.
+- The client side of `Expect: 100-continue`: `Request::expect_continue`,
+  `ClientConn::is_waiting_for_continue`, `ClientEvent::Continue`.
+- `ServerConn::set_keep_alive`, `keep_alive`, `requests_served`,
+  `progress`; `ClientConn::progress`, `is_reusable`; the `Progress` enum.
+- `HttpDate`, `DateCache`, `ServerConn::respond_with_date`.
+- `header_list` on both views and `ListElements`;
+  `RequestHead::upgrade_protocols`, `has_unknown_expectation`.
+- `status_allows_body`.
+- `Limits` trailer budgets (`max_trailer_bytes`, `max_trailer_fields`) and
+  `max_interim`.
+- Blocking: `serve`, `post`, `now_date`, `Client::request`,
+  `Client::with_deadline`, `ServerConfig::with_max_requests_per_connection`,
+  `Connection::with_response_deadline`, `Connection::send_informational`.
+
 ## 0.2 to 0.3
 
 Update the dependency:

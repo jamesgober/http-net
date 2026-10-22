@@ -1,14 +1,22 @@
 //! `Request` and `Response` built from arbitrary methods, targets,
-//! statuses, field names, values, and bodies. Oracle: the builder either
-//! reports an error, or its output parses back on the other side to the
-//! same method, target, status, fields, and body. A builder must never
-//! write bytes the crate's own parser refuses.
+//! statuses, field names, values, bodies, trailers, and interim responses.
+//! Oracle: the builder (or the trailer writer, or `send_informational`)
+//! either reports an error and writes nothing, or its output parses back on
+//! the other side to the same method, target, status, fields, body,
+//! trailers, and interim responses. A builder must never write bytes the
+//! crate's own parser refuses.
 
 #![no_main]
 
 use arbitrary::Arbitrary;
 use http_net::{ClientConn, ClientEvent, Limits, Request, Response, ServerConn, ServerEvent};
 use libfuzzer_sys::fuzz_target;
+
+type Fields = Vec<(String, Vec<u8>)>;
+
+fn pairs(fields: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+    fields.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect()
+}
 
 #[derive(Arbitrary, Debug)]
 enum Mode {
@@ -25,6 +33,10 @@ struct Input {
     fields: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
     mode: Mode,
+    /// Sent after a chunked body.
+    trailers: Fields,
+    /// Interim responses sent before the response.
+    interims: Vec<(u16, Fields)>,
 }
 
 /// Fields the connection writes itself rather than the caller.
@@ -40,6 +52,9 @@ fn roomy() -> Limits {
     Limits::new()
         .with_max_start_line(1 << 20)
         .with_max_header_bytes(1 << 20)
+        .with_max_field_line(1 << 20)
+        .with_max_trailer_fields(1 << 10)
+        .with_max_interim(u16::MAX)
         .with_max_body(1 << 20)
 }
 
@@ -65,14 +80,23 @@ fn check_request(input: &Input, fields: &[(String, Vec<u8>)]) {
     if client.send_request(&request, &mut wire).is_err() {
         return;
     }
+    let mut sent_trailers: Fields = Vec::new();
     if !matches!(input.mode, Mode::Full) {
         client
             .send_body(&input.body, &mut wire)
             .expect("declared length");
-        client.end_body(&mut wire).expect("end of body");
+        let before = wire.len();
+        match client.end_body_with_trailers(&pairs(&input.trailers), &mut wire) {
+            Ok(()) => sent_trailers = input.trailers.clone(),
+            Err(_) => {
+                assert_eq!(wire.len(), before, "a refused trailer section wrote bytes");
+                client.end_body(&mut wire).expect("end of body");
+            }
+        }
     }
 
     let mut server = ServerConn::with_limits(roomy());
+    server.set_report_trailers(true);
     assert_eq!(
         server.feed(&wire),
         wire.len(),
@@ -95,14 +119,19 @@ fn check_request(input: &Input, fields: &[(String, Vec<u8>)]) {
     want.extend(fields.iter().cloned());
     assert_eq!(got, want, "request fields changed on the way");
     let mut body = Vec::new();
+    let mut got_trailers: Fields = Vec::new();
     loop {
         match server.poll() {
             Ok(ServerEvent::Body(b)) => body.extend_from_slice(b),
+            Ok(ServerEvent::Trailers(t)) => {
+                got_trailers = t.map(|(n, v)| (n.to_string(), v.to_vec())).collect();
+            }
             Ok(ServerEvent::RequestEnd) => break,
             other => panic!("a built request body did not parse: {other:?}"),
         }
     }
     assert_eq!(body, input.body);
+    assert_eq!(got_trailers, sent_trailers, "request trailers changed on the way");
 }
 
 fn check_response(input: &Input, fields: &[(String, Vec<u8>)]) {
@@ -119,20 +148,47 @@ fn check_response(input: &Input, fields: &[(String, Vec<u8>)]) {
     let _ = server.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     while !matches!(server.poll(), Ok(ServerEvent::RequestEnd)) {}
     let mut wire = Vec::new();
+    let mut sent_interims: Vec<(u16, Fields)> = Vec::new();
+    for (status, fields) in input.interims.iter().take(4) {
+        let mut interim = Response::new(*status);
+        for (n, v) in fields.iter().take(4) {
+            interim = interim.header(n, v);
+        }
+        let before = wire.len();
+        match server.send_informational(&interim, &mut wire) {
+            Ok(()) => sent_interims.push((*status, fields.iter().take(4).cloned().collect())),
+            Err(_) => assert_eq!(wire.len(), before, "a refused interim response wrote bytes"),
+        }
+    }
     if server.respond(&response, &mut wire).is_err() {
+        // Interim responses already written belong to a response that was
+        // never sent; nothing more to check.
         return;
     }
+    let mut sent_trailers: Fields = Vec::new();
     if !matches!(input.mode, Mode::Full) {
         server
             .send_body(&input.body, &mut wire)
             .expect("declared length");
-        server.end_body(&mut wire).expect("end of body");
+        let before = wire.len();
+        match server.end_body_with_trailers(&pairs(&input.trailers), &mut wire) {
+            Ok(()) if matches!(input.mode, Mode::Chunked) => {
+                sent_trailers = input.trailers.clone();
+            }
+            Ok(()) => assert!(input.trailers.is_empty(), "trailers on a length body accepted"),
+            Err(_) => {
+                assert_eq!(wire.len(), before, "a refused trailer section wrote bytes");
+                server.end_body(&mut wire).expect("end of body");
+            }
+        }
     }
     // 204 and 304 carry no body (a non-empty full body is refused above,
     // a streamed one is dropped).
     let bodiless = input.status == 204 || input.status == 304;
 
     let mut client = ClientConn::with_limits(roomy());
+    client.set_report_informational(true);
+    client.set_report_trailers(true);
     client
         .send_request(&Request::get("/").header("host", "a"), &mut Vec::new())
         .expect("send");
@@ -141,19 +197,32 @@ fn check_response(input: &Input, fields: &[(String, Vec<u8>)]) {
         wire.len(),
         "response larger than the buffer"
     );
-    let (status, got) = match client.poll() {
-        Ok(ClientEvent::Response(head)) => (head.status(), caller_fields(head.headers())),
-        other => panic!(
-            "the client refused a built response ({other:?}): {:?}",
-            String::from_utf8_lossy(&wire)
-        ),
+    let mut got_interims: Vec<(u16, Fields)> = Vec::new();
+    let (status, got) = loop {
+        match client.poll() {
+            Ok(ClientEvent::Informational(head)) => {
+                got_interims.push((head.status(), caller_fields(head.headers())));
+            }
+            Ok(ClientEvent::Response(head)) => {
+                break (head.status(), caller_fields(head.headers()));
+            }
+            other => panic!(
+                "the client refused a built response ({other:?}): {:?}",
+                String::from_utf8_lossy(&wire)
+            ),
+        }
     };
+    assert_eq!(got_interims, sent_interims, "interim responses changed on the way");
     assert_eq!(status, input.status);
     assert_eq!(got, fields, "response fields changed on the way");
     let mut body = Vec::new();
+    let mut got_trailers: Fields = Vec::new();
     loop {
         match client.poll() {
             Ok(ClientEvent::Body(b)) => body.extend_from_slice(b),
+            Ok(ClientEvent::Trailers(t)) => {
+                got_trailers = t.map(|(n, v)| (n.to_string(), v.to_vec())).collect();
+            }
             Ok(ClientEvent::ResponseEnd) => break,
             other => panic!("a built response body did not parse: {other:?}"),
         }
@@ -162,6 +231,7 @@ fn check_response(input: &Input, fields: &[(String, Vec<u8>)]) {
         assert!(body.is_empty(), "a 204 or 304 carried a body");
     } else {
         assert_eq!(body, input.body);
+        assert_eq!(got_trailers, sent_trailers, "response trailers changed on the way");
     }
 }
 

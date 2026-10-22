@@ -696,3 +696,298 @@ fn test_upgraded_socket_does_not_inherit_the_request_deadline() {
     stream.read_exact(&mut echo).unwrap();
     assert_eq!(&echo, b"ping");
 }
+
+/// Checks the shape of an IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn is_imf_fixdate(v: &[u8]) -> bool {
+    const DAYS: [&[u8]; 7] = [b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat", b"Sun"];
+    const MONTHS: [&[u8]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    let digits = |r: std::ops::Range<usize>| v[r].iter().all(u8::is_ascii_digit);
+    v.len() == 29
+        && DAYS.contains(&&v[0..3])
+        && &v[3..5] == b", "
+        && digits(5..7)
+        && v[7] == b' '
+        && MONTHS.contains(&&v[8..11])
+        && v[11] == b' '
+        && digits(12..16)
+        && v[16] == b' '
+        && digits(17..19)
+        && v[19] == b':'
+        && digits(20..22)
+        && v[22] == b':'
+        && digits(23..25)
+        && &v[25..] == b" GMT"
+}
+
+/// FR-36: every response, the error answers included, carries a `date` in
+/// IMF-fixdate form (RFC 9110 section 5.6.7), from the per-thread cache.
+#[test]
+fn test_every_response_date_is_an_imf_fixdate() {
+    let running = start(Server::bind("127.0.0.1:0").unwrap(), echo);
+    let resp = blocking::get(&format!("http://{}/", running.addr)).unwrap();
+    let date = resp.header("date").expect("date");
+    assert!(is_imf_fixdate(date), "{}", String::from_utf8_lossy(date));
+
+    // A refused request: the answer comes from `Response::from_error`.
+    let mut stream = connect(running.addr);
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.starts_with("HTTP/1.1 400 "), "{text}");
+    let date = text
+        .lines()
+        .find_map(|l| l.strip_prefix("date: "))
+        .expect("date on the error answer");
+    assert!(is_imf_fixdate(date.as_bytes()), "{date}");
+    assert!(is_imf_fixdate(blocking::now_date().as_bytes()));
+}
+
+/// T-26, E-196, FR-57: a client that reads a large streamed response one
+/// byte every 100 ms holds the connection only until the response deadline,
+/// not for as long as the response would take (or the 10 s write timeout
+/// per write). A streamed body is used because it fills the socket buffers
+/// on every platform (Windows takes a very large single write into the
+/// kernel at once).
+#[test]
+fn test_connection_response_deadline_slow_reader_times_out() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop_reading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop_reading = Arc::clone(&stop_reading);
+        thread::spawn(move || {
+            let mut s = connect(addr);
+            s.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            let mut byte = [0u8; 1];
+            while !stop_reading.load(Ordering::SeqCst) {
+                if s.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    let (stream, _) = listener.accept().unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut conn = Connection::new(stream, Limits::new())
+        .with_response_deadline(Some(Duration::from_millis(500)));
+    assert!(conn.next_request().unwrap().is_some());
+    let started = Instant::now();
+    conn.respond(&Response::new(200).chunked()).unwrap();
+    let chunk = vec![b'x'; 1 << 20];
+    let mut outcome = Ok(());
+    for _ in 0..1024 {
+        outcome = conn.send_body(&chunk);
+        if outcome.is_err() {
+            break;
+        }
+    }
+    let waited = started.elapsed();
+    stop_reading.store(true, Ordering::SeqCst);
+    drop(conn);
+    reader.join().unwrap();
+    assert!(
+        matches!(&outcome, Err(blocking::Error::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+        "{outcome:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(400) && waited < Duration::from_secs(3),
+        "the response was cut after {waited:?}"
+    );
+}
+
+/// T-26, A-241: the server applies its response deadline. A slow reader of
+/// a large response does not hold the connection thread (and so shutdown)
+/// for the 10 s write timeout. The read timeout is short so an idle
+/// keep-alive read after a response the kernel accepted in full ends soon.
+#[test]
+fn test_server_response_deadline_slow_reader_is_cut_off() {
+    let server = Server::bind("127.0.0.1:0").unwrap().with_config(
+        ServerConfig::new()
+            .with_read_timeout(Some(Duration::from_secs(1)))
+            .with_write_timeout(Some(Duration::from_secs(10)))
+            .with_response_deadline(Some(Duration::from_millis(500))),
+    );
+    // Larger than any loopback send and receive buffer, so the writes block.
+    let running = start(server, |_, _| Response::new(200).body(vec![b'x'; 64 << 20]));
+    let mut stream = connect(running.addr);
+    stream
+        .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let stop_reading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop_reading = Arc::clone(&stop_reading);
+        thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            while !stop_reading.load(Ordering::SeqCst) {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    // Shutdown waits for every connection thread: it returns only once the
+    // deadline has cut the slow response off.
+    let started = Instant::now();
+    drop(running);
+    let waited = started.elapsed();
+    stop_reading.store(true, Ordering::SeqCst);
+    reader.join().unwrap();
+    assert!(
+        waited < Duration::from_secs(5),
+        "the connection was held for {waited:?}"
+    );
+}
+
+/// FR-49, A-241: with a cap of three requests per connection, the third
+/// response carries `connection: close` and the connection ends after it.
+#[test]
+fn test_max_requests_per_connection_third_response_closes() {
+    let server = Server::bind("127.0.0.1:0")
+        .unwrap()
+        .with_config(ServerConfig::new().with_max_requests_per_connection(Some(3)));
+    let running = start(server, echo);
+    let mut stream = connect(running.addr);
+    let one = b"GET /n HTTP/1.1\r\nHost: x\r\n\r\n";
+    stream.write_all(&one.repeat(4)).unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    let text = String::from_utf8_lossy(&reply);
+    assert_eq!(text.matches("HTTP/1.1 200 OK").count(), 3, "{text}");
+    assert_eq!(text.matches("connection: close").count(), 1, "{text}");
+    let third = text.rfind("HTTP/1.1 200 OK").unwrap();
+    assert!(text[third..].contains("connection: close"), "{text}");
+}
+
+/// FR-26, FR-57: an expectation other than `100-continue` is answered 417
+/// before the body is read, without a `100 Continue`, and the connection
+/// closes (RFC 9110 section 10.1.1).
+#[test]
+fn test_unknown_expectation_gets_417_without_reading_the_body() {
+    let running = start(Server::bind("127.0.0.1:0").unwrap(), echo);
+    let mut stream = connect(running.addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // The body is never sent: a server waiting for it would time out.
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: x\r\nExpect: x-unknown\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    let text = String::from_utf8_lossy(&reply);
+    assert!(
+        text.starts_with("HTTP/1.1 417 Expectation Failed\r\n"),
+        "{text}"
+    );
+    assert!(!text.contains("100 Continue"), "{text}");
+    assert!(text.contains("connection: close"), "{text}");
+}
+
+/// FR-34, A-247: `Connection::send_informational` writes a `103` before
+/// the final response.
+#[test]
+fn test_connection_send_informational_writes_103_first() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut s = connect(addr);
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut reply = Vec::new();
+        s.read_to_end(&mut reply).unwrap();
+        reply
+    });
+    let (stream, _) = listener.accept().unwrap();
+    let mut conn = Connection::new(stream, Limits::new());
+    assert!(conn.next_request().unwrap().is_some());
+    conn.send_informational(&Response::new(103).header("link", "</a.css>; rel=preload"))
+        .unwrap();
+    conn.respond(&Response::text(200, "page")).unwrap();
+    conn.close();
+    let reply = client.join().unwrap();
+    let text = String::from_utf8_lossy(&reply);
+    assert!(
+        text.starts_with(
+            "HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\n"
+        ),
+        "{text}"
+    );
+    assert!(text.ends_with("\r\n\r\npage"), "{text}");
+}
+
+/// FR-58, A-252: `Client::request` sends any method and body; the URL gives
+/// the target and `host`.
+#[test]
+fn test_client_request_post_with_a_body_reaches_the_handler() {
+    let running = start(Server::bind("127.0.0.1:0").unwrap(), echo);
+    let request = Request::post("/")
+        .header("content-type", "application/octet-stream")
+        .body(&b"payload"[..]);
+    let resp = blocking::Client::new()
+        .request(&format!("http://{}/echo", running.addr), request)
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.body(), b"payload");
+
+    let resp = blocking::Client::new()
+        .request(
+            &format!("http://{}/x?y", running.addr),
+            Request::delete("/"),
+        )
+        .unwrap();
+    assert_eq!(resp.text(), Some("DELETE /x"));
+}
+
+/// A-255: the Tier-1 `post`.
+#[test]
+fn test_post_sends_the_body_and_content_type() {
+    let running = start(Server::bind("127.0.0.1:0").unwrap(), |req, body| {
+        let ct = req.header_str("content-type").unwrap_or("");
+        Response::text(200, &format!("{ct} {}", body.len()))
+    });
+    let resp = blocking::post(
+        &format!("http://{}/notes", running.addr),
+        "text/plain",
+        b"hello",
+    )
+    .unwrap();
+    assert_eq!(resp.text(), Some("text/plain 5"));
+}
+
+/// FR-58, A-253: the total deadline stops a client waiting on a server that
+/// accepts and never answers, well before the per-operation timeout.
+#[test]
+fn test_client_deadline_silent_server_times_out() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let holder = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        thread::sleep(Duration::from_secs(3));
+        drop(stream);
+    });
+    let started = Instant::now();
+    let err = blocking::Client::new()
+        .with_timeout(Duration::from_secs(10))
+        .with_deadline(Some(Duration::from_millis(500)))
+        .get(&format!("http://{addr}/"))
+        .unwrap_err();
+    let waited = started.elapsed();
+    assert!(
+        matches!(&err, blocking::Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+        "{err}"
+    );
+    assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+    holder.join().unwrap();
+}

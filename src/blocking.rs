@@ -10,6 +10,7 @@
 //! Only plain `http://` is spoken; there is no TLS in this crate.
 
 use std::{
+    cell::Cell,
     fmt, io,
     io::{Read, Write},
     net::{
@@ -26,8 +27,10 @@ use std::{
 };
 
 use crate::{
-    ClientConn, ClientEvent, HttpError, Limits, Method, Request, RequestHead, Response, ServerConn,
-    ServerEvent, redact::FieldValue,
+    ClientConn, ClientEvent, DateCache, HttpDate, HttpError, Limits, Method, Progress, Request,
+    RequestHead, Response, ServerConn, ServerEvent,
+    message::OutBody,
+    redact::{FieldValue, serialized_fields},
 };
 
 /// Bytes a closing connection reads and discards so the peer's unread data
@@ -102,7 +105,9 @@ impl From<HttpError> for Error {
 /// | concurrent connections | 64 (the 65th is answered `503` and closed) |
 /// | read timeout (also the idle keep-alive timeout) | 10 s |
 /// | request timeout (first byte of a request to the end of its body) | 30 s |
-/// | write timeout | 10 s |
+/// | write timeout (each write) | 10 s |
+/// | response deadline (writing one whole response) | 60 s |
+/// | requests per connection | no cap |
 ///
 /// # Examples
 ///
@@ -123,6 +128,8 @@ pub struct ServerConfig {
     read_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
+    response_deadline: Option<Duration>,
+    max_requests: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -147,6 +154,8 @@ impl ServerConfig {
             read_timeout: Some(Duration::from_secs(10)),
             request_timeout: Some(Duration::from_secs(30)),
             write_timeout: Some(Duration::from_secs(10)),
+            response_deadline: Some(Duration::from_secs(60)),
+            max_requests: None,
         }
     }
 
@@ -231,6 +240,45 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the response deadline: the most time writing one response may
+    /// take, from its first byte to its last (a streamed body included).
+    /// The write timeout bounds each write; it cannot stop a client that
+    /// reads one byte just inside it and so holds a thread for as long as a
+    /// large response takes. This deadline can: when it passes, the
+    /// connection is closed. `None` disables it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// let c = http_net::blocking::ServerConfig::new().with_response_deadline(Some(Duration::from_secs(5)));
+    /// assert_eq!(c.response_deadline(), Some(Duration::from_secs(5)));
+    /// ```
+    #[must_use]
+    pub const fn with_response_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.response_deadline = deadline;
+        self
+    }
+
+    /// Sets the most requests served on one connection: the response that
+    /// reaches the cap carries `connection: close` and the connection ends
+    /// after it. `Some(0)` is raised to 1; `None` (the default) sets no cap.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let c = http_net::blocking::ServerConfig::new().with_max_requests_per_connection(Some(100));
+    /// assert_eq!(c.max_requests_per_connection(), Some(100));
+    /// ```
+    #[must_use]
+    pub const fn with_max_requests_per_connection(mut self, max: Option<u64>) -> Self {
+        self.max_requests = match max {
+            Some(0) => Some(1),
+            other => other,
+        };
+        self
+    }
+
     /// The message limits.
     ///
     /// # Examples
@@ -292,6 +340,31 @@ impl ServerConfig {
     #[must_use]
     pub const fn write_timeout(&self) -> Option<Duration> {
         self.write_timeout
+    }
+
+    /// The response deadline.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// assert_eq!(http_net::blocking::ServerConfig::new().response_deadline(), Some(Duration::from_secs(60)));
+    /// ```
+    #[must_use]
+    pub const fn response_deadline(&self) -> Option<Duration> {
+        self.response_deadline
+    }
+
+    /// The cap on requests per connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::blocking::ServerConfig::new().max_requests_per_connection(), None);
+    /// ```
+    #[must_use]
+    pub const fn max_requests_per_connection(&self) -> Option<u64> {
+        self.max_requests
     }
 }
 
@@ -552,9 +625,14 @@ impl Server {
     ///
     /// The handler gets each request's head and its complete body (bounded
     /// by [`Limits::max_body`]) and returns the response. Requests that fail
-    /// to parse are answered with their [`HttpError::status`] and the
-    /// connection is closed; the handler never sees them. Every response
-    /// gets a `date` header unless the handler set one.
+    /// to parse are answered with [`Response::from_error`] and the
+    /// connection is closed; the handler never sees them. A request with
+    /// `Expect: 100-continue` gets `100 Continue` before its body is read;
+    /// one with any other expectation is answered `417 Expectation Failed`
+    /// without reading its body (RFC 9110 section 10.1.1), and the
+    /// connection is closed. Every response gets a `date` field (from
+    /// [`now_date`]) unless the handler set one. The time limits and the
+    /// request cap of [`ServerConfig`] apply to every connection.
     ///
     /// # Errors
     ///
@@ -654,8 +732,10 @@ fn serve_stream(
     if !configured {
         return;
     }
-    let mut conn =
-        Connection::new(stream, config.limits).with_request_timeout(config.request_timeout);
+    let mut conn = Connection::new(stream, config.limits)
+        .with_request_timeout(config.request_timeout)
+        .with_response_deadline(config.response_deadline);
+    conn.refuse_unknown_expectations = true;
     while !stop.load(Ordering::SeqCst) {
         // The handler runs inside the first match; errors (which borrow
         // nothing) are handled in the second, where `conn` is free again.
@@ -703,6 +783,13 @@ fn serve_stream(
         } else {
             response
         };
+        if config
+            .max_requests
+            .is_some_and(|max| conn.conn.requests_served().saturating_add(1) >= max)
+        {
+            // This response reaches the cap: it carries `connection: close`.
+            conn.conn.set_keep_alive(false);
+        }
         match conn.respond(&response) {
             Ok(()) if streamed && is_head => {
                 if conn.end_body().is_err() {
@@ -761,6 +848,13 @@ fn drain_and_close(mut stream: TcpStream) {
             Ok(n) => drained += n,
         }
     }
+}
+
+fn response_timed_out() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the response was not written within the response deadline",
+    ))
 }
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -855,6 +949,17 @@ pub struct Connection {
     /// Whether the socket's read timeout is currently shortened to the
     /// deadline.
     shortened: bool,
+    /// The socket's own write timeout, restored after a response deadline
+    /// shortened it.
+    write_timeout: Option<Duration>,
+    response_deadline: Option<Duration>,
+    /// When the response being written must be complete.
+    write_deadline: Option<Instant>,
+    write_shortened: bool,
+    /// `Server` answers expectations other than `100-continue` with 417
+    /// before the body is read; a bare `Connection` leaves them to the
+    /// caller.
+    refuse_unknown_expectations: bool,
 }
 
 impl Connection {
@@ -869,6 +974,7 @@ impl Connection {
     #[must_use]
     pub fn new(stream: TcpStream, limits: Limits) -> Self {
         let read_timeout = stream.read_timeout().ok().flatten();
+        let write_timeout = stream.write_timeout().ok().flatten();
         Self {
             stream,
             conn: ServerConn::with_limits(limits),
@@ -878,7 +984,35 @@ impl Connection {
             request_timeout: None,
             deadline: None,
             shortened: false,
+            write_timeout,
+            response_deadline: None,
+            write_deadline: None,
+            write_shortened: false,
+            refuse_unknown_expectations: false,
         }
+    }
+
+    /// Sets a deadline for writing each response, from its first byte to
+    /// its last, a streamed body included (see
+    /// [`ServerConfig::with_response_deadline`]). When it passes, the write
+    /// fails with an [`Error::Io`] of kind `TimedOut`; close the connection
+    /// then (the response cannot be finished). `None` (the default for a
+    /// bare `Connection`) leaves only the socket's own write timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// # fn demo(stream: std::net::TcpStream) {
+    /// let conn = http_net::blocking::Connection::new(stream, http_net::Limits::new())
+    ///     .with_response_deadline(Some(Duration::from_secs(60)));
+    /// # let _ = conn;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_response_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.response_deadline = deadline;
+        self
     }
 
     /// Sets a deadline for each request: from the moment its first byte is
@@ -927,7 +1061,7 @@ impl Connection {
             .extend_from_slice(BODY.len().to_string().as_bytes());
         self.out
             .extend_from_slice(b"\r\nconnection: close\r\ndate: ");
-        self.out.extend_from_slice(&http_date(SystemTime::now()));
+        self.out.extend_from_slice(now_date().as_bytes());
         self.out.extend_from_slice(b"\r\n\r\n");
         self.out.extend_from_slice(BODY);
         self.flush_out()
@@ -985,7 +1119,9 @@ impl Connection {
     /// ended with `connection: close`, or the connection was upgraded).
     ///
     /// A request that carries `Expect: 100-continue` is answered with
-    /// `100 Continue` before its body is read.
+    /// `100 Continue` before its body is read. Other expectations are left
+    /// to the caller (see [`RequestHead::has_unknown_expectation`]);
+    /// [`Server`] answers them with 417.
     ///
     /// # Errors
     ///
@@ -1008,7 +1144,18 @@ impl Connection {
                     // request, so the expectation is answered here (RFC 9110
                     // section 10.1.1). A body over the limit was already
                     // refused from its Content-Length.
-                    if head.expects_continue() {
+                    let unknown = head.has_unknown_expectation();
+                    let expects_continue = head.expects_continue();
+                    if self.refuse_unknown_expectations && unknown {
+                        // An expectation this server cannot meet: 417, the
+                        // body left unread, so the connection closes after.
+                        let refusal =
+                            Response::text(417, "expectation not supported; send without Expect")
+                                .close();
+                        self.respond(&refusal)?;
+                        return Ok(None);
+                    }
+                    if expects_continue {
                         self.out.clear();
                         self.conn.send_continue(&mut self.out)?;
                         self.flush_out()?;
@@ -1047,9 +1194,32 @@ impl Connection {
     /// See [`Connection`].
     pub fn respond(&mut self, response: &Response) -> Result<(), Error> {
         self.out.clear();
-        let date = http_date(SystemTime::now());
         self.conn
-            .respond_dated(response, Some(&date), &mut self.out)?;
+            .respond_with_date(response, &now_date(), &mut self.out)?;
+        self.write_deadline = self.response_deadline.map(|d| Instant::now() + d);
+        self.flush_out()
+    }
+
+    /// Writes an interim response (for example `103 Early Hints`) before
+    /// the final one, through [`ServerConn::send_informational`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ServerConn::send_informational`], plus [`Error::Io`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn demo(conn: &mut http_net::blocking::Connection) -> Result<(), http_net::blocking::Error> {
+    /// use http_net::Response;
+    ///
+    /// conn.send_informational(&Response::new(103).header("link", "</app.css>; rel=preload; as=style"))?;
+    /// conn.respond(&Response::text(200, "page"))?;
+    /// # Ok(()) }
+    /// ```
+    pub fn send_informational(&mut self, response: &Response) -> Result<(), Error> {
+        self.out.clear();
+        self.conn.send_informational(response, &mut self.out)?;
         self.flush_out()
     }
 
@@ -1089,8 +1259,41 @@ impl Connection {
         self.flush_out()
     }
 
+    /// Writes `out`. While a response deadline runs, each write waits at
+    /// most the time left (and never longer than the socket's own write
+    /// timeout); the deadline ends with the response.
     fn flush_out(&mut self) -> Result<(), Error> {
-        self.stream.write_all(&self.out)?;
+        let mut written = 0;
+        while written < self.out.len() {
+            if let Some(deadline) = self.write_deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(response_timed_out());
+                }
+                let wait = self.write_timeout.map_or(left, |t| t.min(left));
+                self.stream.set_write_timeout(Some(wait))?;
+                self.write_shortened = true;
+            }
+            match self.stream.write(&self.out[written..]) {
+                Ok(0) => return Err(Error::Io(io::ErrorKind::WriteZero.into())),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if is_timeout(&e)
+                        && self.write_deadline.is_some_and(|d| Instant::now() >= d) =>
+                {
+                    return Err(response_timed_out());
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        if self.conn.progress() != Progress::WritingBody {
+            self.write_deadline = None;
+            if self.write_shortened {
+                self.stream.set_write_timeout(self.write_timeout)?;
+                self.write_shortened = false;
+            }
+        }
         if self.out.capacity() > OUT_RETAIN {
             self.out = Vec::new();
         }
@@ -1291,12 +1494,68 @@ pub fn get(url: &str) -> Result<ClientResponse, Error> {
     Client::new().get(url)
 }
 
+/// Sends `body` to `url` with `POST` and `content-type: content_type`,
+/// using the default [`Client`].
+///
+/// # Errors
+///
+/// As [`get`], plus [`Error::Http`] for a content type that is not a valid
+/// field value.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{blocking, Response};
+///
+/// let server = blocking::Server::bind("127.0.0.1:0")?;
+/// let addr = server.local_addr();
+/// let stop = server.shutdown_handle();
+/// let t = std::thread::spawn(move || server.serve(|_, body| Response::text(200, &body.len().to_string())));
+///
+/// let resp = blocking::post(&format!("http://{addr}/notes"), "text/plain", b"hello")?;
+/// assert_eq!(resp.text(), Some("5"));
+///
+/// stop.shutdown();
+/// t.join().unwrap()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn post(url: &str, content_type: &str, body: &[u8]) -> Result<ClientResponse, Error> {
+    let request = Request::post("/")
+        .header("content-type", content_type)
+        .body(body.to_vec());
+    Client::new().request(url, request)
+}
+
+/// Binds `addr` and serves `handler` with the default [`ServerConfig`]
+/// until the process ends: the shortest way to run a server. Use
+/// [`Server`] for a shutdown handle, settings, or an upgrade hook.
+///
+/// # Errors
+///
+/// The bind error, or a persistent accept failure (see [`Server::serve`]).
+///
+/// # Examples
+///
+/// ```no_run
+/// use http_net::{blocking, Response};
+///
+/// blocking::serve("127.0.0.1:8080", |req, _body| Response::text(200, req.path()))?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn serve<H>(addr: impl ToSocketAddrs, handler: H) -> io::Result<()>
+where
+    H: Fn(&RequestHead<'_>, &[u8]) -> Response + Send + Sync + 'static,
+{
+    Server::bind(addr)?.serve(handler)
+}
+
 /// A blocking HTTP/1.1 client: one connection per request.
 ///
 /// | Setting | Default |
 /// |---|---|
 /// | limits | [`Limits::new`] with a 16 MiB body |
 /// | connect, read, and write timeout | 30 s each |
+/// | total deadline for one exchange (connect, write, read) | none |
 ///
 /// # Examples
 ///
@@ -1315,6 +1574,7 @@ pub fn get(url: &str) -> Result<ClientResponse, Error> {
 pub struct Client {
     limits: Limits,
     timeout: Duration,
+    deadline: Option<Duration>,
 }
 
 impl Default for Client {
@@ -1336,6 +1596,7 @@ impl Client {
         Self {
             limits: Limits::new().with_max_body(16 * 1024 * 1024),
             timeout: Duration::from_secs(30),
+            deadline: None,
         }
     }
 
@@ -1369,6 +1630,24 @@ impl Client {
         self
     }
 
+    /// Sets a total deadline for one exchange: connecting, writing the
+    /// request, and reading the whole response. The per-operation timeout
+    /// of [`with_timeout`](Self::with_timeout) cannot stop a server that
+    /// sends one byte just inside it; this deadline can. `None` (the
+    /// default) disables it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// let _ = http_net::blocking::Client::new().with_deadline(Some(Duration::from_secs(10)));
+    /// ```
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     /// Fetches `url` with `GET`.
     ///
     /// # Errors
@@ -1379,38 +1658,208 @@ impl Client {
     ///
     /// See [`Client`].
     pub fn get(&self, url: &str) -> Result<ClientResponse, Error> {
+        self.request(url, Request::get("/"))
+    }
+
+    /// Sends `request` to the `http://` URL `url` and reads the response.
+    /// The URL gives the authority (written as `host`) and the target, which
+    /// replaces the target `request` was built with; the method, fields,
+    /// and body come from `request`. The request is sent with
+    /// `connection: close` on a connection of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`]; [`Error::Http`] with the builder's first error;
+    /// [`HttpError::InvalidHost`] when `request` already has a `host` (the
+    /// URL supplies it); [`HttpError::InvalidState`] for a streamed body
+    /// (`chunked` or `content_length`: this client sends full bodies) or an
+    /// upgrade request (it cannot hand the connection over; use
+    /// [`ClientConn`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{blocking::{self, Client}, Request, Response};
+    ///
+    /// let server = blocking::Server::bind("127.0.0.1:0")?;
+    /// let addr = server.local_addr();
+    /// let stop = server.shutdown_handle();
+    /// let t = std::thread::spawn(move || {
+    ///     server.serve(|req, body| Response::text(200, &format!("{} {} {}", req.method_str(), req.path(), body.len())))
+    /// });
+    ///
+    /// let put = Request::put("/").header("content-type", "application/json").body(&b"{}"[..]);
+    /// let resp = Client::new().request(&format!("http://{addr}/items/7"), put)?;
+    /// assert_eq!(resp.text(), Some("PUT /items/7 2"));
+    ///
+    /// stop.shutdown();
+    /// t.join().unwrap()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn request(&self, url: &str, request: Request) -> Result<ClientResponse, Error> {
         let url = Url::parse(url)?;
-        let request = Request::get(url.target)
-            .header("host", url.authority)
-            .close();
-        let mut stream = self.connect(&url)?;
+        let request = retarget(&request, url.target, url.authority)?;
+        let deadline = self.deadline.map(|d| Instant::now() + d);
+        let addrs = (url.host, url.port).to_socket_addrs()?;
+        let mut stream = connect_any(addrs, self.timeout, deadline)?;
         let mut conn = ClientConn::with_limits(self.limits);
         let mut out = Vec::new();
         conn.send_request(&request, &mut out)?;
-        stream.write_all(&out)?;
-        read_response(&mut stream, &mut conn)
-    }
-
-    fn connect(&self, url: &Url<'_>) -> Result<TcpStream, Error> {
-        let mut last = None;
-        for addr in (url.host, url.port).to_socket_addrs()? {
-            match TcpStream::connect_timeout(&addr, self.timeout) {
-                Ok(stream) => {
-                    stream.set_read_timeout(Some(self.timeout))?;
-                    stream.set_write_timeout(Some(self.timeout))?;
-                    stream.set_nodelay(true)?;
-                    return Ok(stream);
-                }
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(Error::Io(last.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "the host resolved to no address")
-        })))
+        let mut io = Timed {
+            stream: &mut stream,
+            timeout: self.timeout,
+            deadline,
+        };
+        io.write_all(&out)?;
+        read_response(&mut io, &mut conn)
     }
 }
 
-fn read_response(stream: &mut TcpStream, conn: &mut ClientConn) -> Result<ClientResponse, Error> {
+/// Rebuilds `request` for a URL: the URL's target, `host` from its
+/// authority first, then the request's own fields, body, and flags, and
+/// always `connection: close` (one connection per exchange).
+fn retarget(request: &Request, target: &str, authority: &str) -> Result<Request, Error> {
+    if let Some(e) = request.error() {
+        return Err(Error::Http(e));
+    }
+    if request.has_host {
+        return Err(Error::Http(HttpError::InvalidHost));
+    }
+    if request.upgrade {
+        return Err(Error::Http(HttpError::InvalidState(
+            "the blocking client cannot hand over an upgraded connection; use ClientConn",
+        )));
+    }
+    let mut rebuilt = Request::new(request.method(), target).header("host", authority);
+    for (name, value) in serialized_fields(request.fields()) {
+        let name = core::str::from_utf8(name).unwrap_or("");
+        if request.expect_continue
+            && name.eq_ignore_ascii_case("expect")
+            && value.eq_ignore_ascii_case(b"100-continue")
+        {
+            // Added again below by its builder method.
+            continue;
+        }
+        rebuilt = rebuilt.header(name, value);
+    }
+    if request.expect_continue {
+        rebuilt = rebuilt.expect_continue();
+    }
+    rebuilt = match &request.body {
+        OutBody::Full(body) => rebuilt.body(body.clone()),
+        OutBody::Length(_) | OutBody::Chunked => {
+            return Err(Error::Http(HttpError::InvalidState(
+                "the blocking client sends full bodies only; use ClientConn to stream",
+            )));
+        }
+    };
+    let rebuilt = rebuilt.close();
+    match rebuilt.error() {
+        Some(e) => Err(Error::Http(e)),
+        None => Ok(rebuilt),
+    }
+}
+
+/// Connects to the first address that accepts, each attempt bounded by
+/// `timeout` and by what is left before `deadline`.
+fn connect_any(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> Result<TcpStream, Error> {
+    let mut last = None;
+    for addr in addrs {
+        let wait = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(exchange_timed_out());
+                }
+                left.min(timeout)
+            }
+            None => timeout,
+        };
+        match TcpStream::connect_timeout(&addr, wait) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(Error::Io(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "the host resolved to no address")
+    })))
+}
+
+fn exchange_timed_out() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the exchange did not finish within the client deadline",
+    ))
+}
+
+/// A client socket whose reads and writes stop at a total deadline: each
+/// operation waits at most the time left, and never longer than the
+/// per-operation timeout.
+struct Timed<'a> {
+    stream: &'a mut TcpStream,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Timed<'_> {
+    /// Sets the socket timeouts for the next operation.
+    fn arm(&mut self) -> Result<(), Error> {
+        if let Some(d) = self.deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(exchange_timed_out());
+            }
+            let wait = left.min(self.timeout);
+            self.stream.set_read_timeout(Some(wait))?;
+            self.stream.set_write_timeout(Some(wait))?;
+        }
+        Ok(())
+    }
+
+    /// Maps a timeout that ran into the deadline to the deadline's error.
+    fn check(&self, e: io::Error) -> Error {
+        if is_timeout(&e) && self.deadline.is_some_and(|d| Instant::now() >= d) {
+            exchange_timed_out()
+        } else {
+            Error::Io(e)
+        }
+    }
+
+    fn write_all(&mut self, mut data: &[u8]) -> Result<(), Error> {
+        while !data.is_empty() {
+            self.arm()?;
+            match self.stream.write(data) {
+                Ok(0) => return Err(Error::Io(io::ErrorKind::WriteZero.into())),
+                Ok(n) => data = &data[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.check(e)),
+            }
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        loop {
+            self.arm()?;
+            match self.stream.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.check(e)),
+                Ok(n) => return Ok(n),
+            }
+        }
+    }
+}
+
+fn read_response(stream: &mut Timed<'_>, conn: &mut ClientConn) -> Result<ClientResponse, Error> {
     let mut response = ClientResponse {
         status: 0,
         headers: Vec::new(),
@@ -1434,12 +1883,7 @@ fn read_response(stream: &mut TcpStream, conn: &mut ClientConn) -> Result<Client
                         "input buffer full while the parser needs input",
                     )));
                 }
-                let n = loop {
-                    match stream.read(spare) {
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        other => break other?,
-                    }
-                };
+                let n = stream.read(spare)?;
                 if n == 0 {
                     conn.feed_eof();
                 } else {
@@ -1527,51 +1971,35 @@ impl<'a> Url<'a> {
     }
 }
 
-/// Formats `time` as an IMF-fixdate (RFC 9110 section 5.6.7), for example
-/// `Sun, 06 Nov 1994 08:49:37 GMT`.
-fn http_date(time: SystemTime) -> [u8; 29] {
-    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    const WEEKDAYS: [&[u8; 3]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
-    const MONTHS: [&[u8; 3]; 12] = [
-        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
-        b"Dec",
-    ];
-    let mut out = *b"Thu, 01 Jan 1970 00:00:00 GMT";
-    out[..3].copy_from_slice(WEEKDAYS[(days % 7) as usize]);
-    two_digits(&mut out[5..7], day);
-    out[8..11].copy_from_slice(MONTHS[(month - 1) as usize]);
-    let y = year.min(9999);
-    two_digits(&mut out[12..14], y / 100);
-    two_digits(&mut out[14..16], y % 100);
-    two_digits(&mut out[17..19], rem / 3600);
-    two_digits(&mut out[20..22], rem % 3600 / 60);
-    two_digits(&mut out[23..25], rem % 60);
-    out
+thread_local! {
+    /// One date cache per thread: each connection thread formats `date` at
+    /// most once per second, and nothing is shared between threads.
+    static DATE: Cell<DateCache> = const { Cell::new(DateCache::new()) };
 }
 
-fn two_digits(dst: &mut [u8], v: u64) {
-    if let [tens, ones] = dst {
-        *tens = b'0' + (v / 10 % 10) as u8;
-        *ones = b'0' + (v % 10) as u8;
-    }
-}
-
-/// Days since 1970-01-01 to (year, month 1..=12, day 1..=31), after Howard
-/// Hinnant's `civil_from_days`, restricted to dates on or after the epoch.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    (year, month, day)
+/// The current time as a `Date` value, from a per-thread
+/// [`DateCache`]: the system clock is read on every call, the value is
+/// reformatted only when the second changes. [`Connection::respond`] and
+/// [`Server`] write it on every response that did not set its own `date`.
+///
+/// # Examples
+///
+/// ```
+/// let date = http_net::blocking::now_date();
+/// assert_eq!(date.as_bytes().len(), 29);
+/// assert!(date.as_str().ends_with(" GMT"));
+/// ```
+#[must_use]
+pub fn now_date() -> HttpDate {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    DATE.with(|cell| {
+        let mut cache = cell.get();
+        let date = *cache.update(secs);
+        cell.set(cache);
+        date
+    })
 }
 
 #[cfg(test)]
@@ -1579,21 +2007,115 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_http_date_known_values() {
-        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
-        assert_eq!(&http_date(at(0)), b"Thu, 01 Jan 1970 00:00:00 GMT");
-        assert_eq!(
-            &http_date(at(784_111_777)),
-            b"Sun, 06 Nov 1994 08:49:37 GMT"
+    fn test_now_date_is_the_current_second() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let shown = now_date();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        assert!(
+            shown == HttpDate::from_unix_seconds(before)
+                || shown == HttpDate::from_unix_seconds(after),
+            "{shown}"
         );
-        assert_eq!(
-            &http_date(at(951_782_400)),
-            b"Tue, 29 Feb 2000 00:00:00 GMT"
+        // The same second twice comes from the cache and is equal.
+        assert_eq!(now_date().as_bytes().len(), 29);
+    }
+
+    /// E-198: a name that resolves to several addresses is tried in order;
+    /// an address that refuses the connection does not end the attempt.
+    #[test]
+    fn test_connect_any_unreachable_first_address_tries_the_next() {
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = closed.local_addr().unwrap();
+        drop(closed);
+        let open = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = open.local_addr().unwrap();
+        let stream = connect_any([refused, good], Duration::from_secs(5), None).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+
+        let err = connect_any([refused], Duration::from_secs(5), None).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        let err = connect_any(Vec::<SocketAddr>::new(), Duration::from_secs(5), None).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+            "{err}"
         );
-        assert_eq!(
-            &http_date(at(1_791_072_000)),
-            b"Sun, 04 Oct 2026 00:00:00 GMT"
+    }
+
+    #[test]
+    fn test_connect_any_past_the_deadline_times_out() {
+        let open = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = open.local_addr().unwrap();
+        let err = connect_any([good], Duration::from_secs(5), Some(Instant::now())).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut),
+            "{err}"
         );
+    }
+
+    #[test]
+    fn test_client_request_with_host_is_refused() {
+        let req = Request::get("/").header("host", "a");
+        let err = Client::new()
+            .request("http://127.0.0.1:1/", req)
+            .unwrap_err();
+        assert!(matches!(err, Error::Http(HttpError::InvalidHost)), "{err}");
+    }
+
+    #[test]
+    fn test_client_request_streamed_body_is_refused() {
+        for req in [
+            Request::post("/").chunked(),
+            Request::put("/").content_length(3),
+        ] {
+            let err = Client::new()
+                .request("http://127.0.0.1:1/", req)
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Http(HttpError::InvalidState(_))),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retarget_keeps_method_fields_body_and_flags() {
+        let original = Request::new("PATCH", "/ignored")
+            .header("x-a", "1")
+            .header("content-type", "text/plain")
+            .body(&b"xyz"[..]);
+        let r = retarget(&original, "/real?q", "example.com:8080").unwrap();
+        assert_eq!(r.method(), "PATCH");
+        assert_eq!(r.target(), "/real?q");
+        assert_eq!(r.header_value("host"), Some(&b"example.com:8080"[..]));
+        assert_eq!(r.header_value("x-a"), Some(&b"1"[..]));
+        assert_eq!(r.body_bytes(), Some(&b"xyz"[..]));
+        let mut out = Vec::new();
+        ClientConn::new().send_request(&r, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("PATCH /real?q HTTP/1.1\r\nhost: example.com:8080\r\nx-a: 1\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("connection: close\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nxyz"), "{text}");
+
+        // The blocking client reads one response to its end, so it cannot
+        // hand over an upgraded connection.
+        let up = Request::get("/").upgrade("websocket");
+        assert!(matches!(
+            retarget(&up, "/", "a"),
+            Err(Error::Http(HttpError::InvalidState(_)))
+        ));
+        // A builder error surfaces first.
+        let bad = Request::get("/").header("bad name", "x");
+        assert!(matches!(
+            retarget(&bad, "/", "a"),
+            Err(Error::Http(HttpError::InvalidHeaderName))
+        ));
     }
 
     #[test]
