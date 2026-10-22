@@ -50,8 +50,12 @@ pub struct Limits {
     /// `None`: the same as the header count.
     trailer_fields: Option<usize>,
     interim: u16,
+    pipeline_depth: u8,
     body: u64,
 }
+
+/// The most requests a client may have outstanding at once.
+pub(crate) const MAX_PIPELINE_DEPTH: u8 = 32;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -77,6 +81,7 @@ impl Limits {
             trailer_bytes: None,
             trailer_fields: None,
             interim: 16,
+            pipeline_depth: 1,
             body: 1024 * 1024,
         }
     }
@@ -301,6 +306,44 @@ impl Limits {
     #[must_use]
     pub const fn max_interim(&self) -> u16 {
         self.interim
+    }
+
+    /// Sets how many requests a client may have outstanding at once
+    /// (pipelining, RFC 9112 section 9.3.2). Clamped to `1..=32`; 1 (the
+    /// default) means one request at a time. Only idempotent requests with
+    /// full bodies are pipelined; see
+    /// [`ClientConn::can_send`](crate::ClientConn::can_send).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::Limits::new().with_pipeline_depth(8);
+    /// assert_eq!(l.pipeline_depth(), 8);
+    /// assert_eq!(http_net::Limits::new().with_pipeline_depth(0).pipeline_depth(), 1);
+    /// assert_eq!(http_net::Limits::new().with_pipeline_depth(200).pipeline_depth(), 32);
+    /// ```
+    #[must_use]
+    pub const fn with_pipeline_depth(mut self, depth: u8) -> Self {
+        self.pipeline_depth = if depth == 0 {
+            1
+        } else if depth > MAX_PIPELINE_DEPTH {
+            MAX_PIPELINE_DEPTH
+        } else {
+            depth
+        };
+        self
+    }
+
+    /// How many requests a client may have outstanding at once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Limits::new().pipeline_depth(), 1);
+    /// ```
+    #[must_use]
+    pub const fn pipeline_depth(&self) -> u8 {
+        self.pipeline_depth
     }
 
     /// The largest accepted body, in bytes.

@@ -549,3 +549,79 @@ fn test_client_reported_interim_and_trailers_steady_state_allocates_nothing() {
         "responses with hints and trailers allocated {m:?}"
     );
 }
+
+/// FR-42: the pipelining queue is a fixed array, so eight requests in
+/// flight at a time allocate nothing after warm-up.
+#[test]
+fn test_client_pipelined_steady_state_allocates_nothing() {
+    let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(8));
+    let request = Request::get("/api/items").header("host", "api.example.com");
+    let mut out = Vec::with_capacity(8 * 64);
+    let wire = RESPONSE_JSON.repeat(8);
+    let mut round = |conn: &mut ClientConn, out: &mut Vec<u8>| {
+        out.clear();
+        for _ in 0..8 {
+            conn.send_request(&request, out).expect("send");
+        }
+        let mut fed = 0;
+        let mut ended = 0;
+        loop {
+            match conn.poll() {
+                Ok(ClientEvent::NeedInput) => fed += conn.feed(&wire[fed..]),
+                Ok(ClientEvent::ResponseEnd) => ended += 1,
+                Ok(ClientEvent::Idle) => break,
+                Ok(_) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert_eq!(ended, 8);
+    };
+    for _ in 0..16 {
+        round(&mut conn, &mut out);
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..1250 {
+            round(&mut conn, &mut out);
+        }
+    });
+    assert_eq!(
+        m.allocations, 0,
+        "10,000 pipelined responses allocated {m:?}"
+    );
+}
+
+/// FR-59: wiping consumed input costs a memset, never an allocation.
+#[test]
+fn test_server_wipe_steady_state_allocates_nothing() {
+    let mut conn = ServerConn::new();
+    conn.set_wipe(true);
+    let response = Response::new(204);
+    let mut out = Vec::with_capacity(4096);
+    for _ in 0..64 {
+        serve_one(&mut conn, BROWSER_GET, &response, &mut out);
+    }
+    let ((), m) = measure(|| {
+        for _ in 0..10_000 {
+            serve_one(&mut conn, BROWSER_GET, &response, &mut out);
+        }
+    });
+    assert_eq!(m.allocations, 0, "10,000 wiped requests allocated {m:?}");
+}
+
+/// FR-48: a connection reset for a new peer keeps its allocations.
+#[test]
+fn test_server_reset_reuse_allocates_nothing() {
+    let mut conn = ServerConn::new();
+    let response = Response::new(204);
+    let mut out = Vec::with_capacity(4096);
+    serve_one(&mut conn, BROWSER_GET, &response, &mut out);
+    conn.reset();
+    serve_one(&mut conn, BROWSER_GET, &response, &mut out);
+    let ((), m) = measure(|| {
+        for _ in 0..1000 {
+            conn.reset();
+            serve_one(&mut conn, BROWSER_GET, &response, &mut out);
+        }
+    });
+    assert_eq!(m.allocations, 0, "1,000 reset connections allocated {m:?}");
+}

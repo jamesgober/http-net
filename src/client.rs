@@ -9,7 +9,7 @@ use crate::{
     head::{
         Asked, HeadKind, HeadScanner, Headers, ResponseHead, ResponseInfo, Scan, interpret_response,
     },
-    limits::Limits,
+    limits::{Limits, MAX_PIPELINE_DEPTH},
     message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
     method::Method,
     server::Progress,
@@ -161,7 +161,66 @@ pub struct ClientConn {
     body_refused: bool,
     /// The request body was declared chunked (trailers allowed).
     req_chunked: bool,
+    /// The request being answered is idempotent (it may share the
+    /// connection with pipelined requests).
+    idempotent: bool,
+    /// Requests sent after the one being answered, in order: a fixed ring,
+    /// so pipelining allocates nothing after construction.
+    queue: [Queued; MAX_PIPELINE_DEPTH as usize],
+    queue_start: usize,
+    queued: usize,
 }
+
+/// A pipelined request waiting for its response: what framing its response
+/// needs and whether it asked to close.
+#[derive(Clone, Copy, Debug)]
+struct Queued {
+    asked: Asked,
+    close: bool,
+}
+
+/// Writes the request line, fields, framing, and (for a full body) the body;
+/// returns how the rest of the body, if any, is to be written.
+fn write_request(request: &Request, out: &mut Vec<u8>) -> Result<ReqWrite, HttpError> {
+    let method = request.method_kind;
+    let expects_body = matches!(method, Method::Post | Method::Put | Method::Patch);
+    let (mut encoder, declared) = match &request.body {
+        OutBody::Full(b) if b.is_empty() && !expects_body => (Encoder::Discard, None),
+        OutBody::Full(b) => (
+            Encoder::Length {
+                remaining: b.len() as u64,
+            },
+            Some(b.len() as u64),
+        ),
+        OutBody::Length(n) => (Encoder::Length { remaining: *n }, Some(*n)),
+        OutBody::Chunked => (Encoder::Chunked, None),
+    };
+    out.extend_from_slice(request.method().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(request.target().as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    out.extend_from_slice(request.fields());
+    push_framing(out, encoder, declared);
+    if request.close {
+        out.extend_from_slice(b"connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    match &request.body {
+        OutBody::Full(b) => {
+            encoder.write(b, out)?;
+            Ok(ReqWrite::Sent)
+        }
+        _ => Ok(ReqWrite::Streaming(encoder)),
+    }
+}
+
+const NO_QUEUED: Queued = Queued {
+    asked: Asked {
+        head: false,
+        connect: false,
+    },
+    close: false,
+};
 
 impl Default for ClientConn {
     fn default() -> Self {
@@ -204,8 +263,31 @@ impl ClientConn {
     /// ```
     #[must_use]
     pub fn with_limits(limits: Limits) -> Self {
+        Self::from_buffer(Buffer::new(limits.buffer_capacity()), limits)
+    }
+
+    /// A connection enforcing `limits` that reads into `storage` (its
+    /// capacity is used up to [`Limits::buffer_capacity`], its contents are
+    /// ignored), for drivers that pool buffers. Give it back with
+    /// [`into_buffer`](Self::into_buffer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let conn = http_net::ClientConn::with_buffer(Vec::with_capacity(4096), http_net::Limits::new());
+    /// assert!(conn.into_buffer().capacity() >= 4096);
+    /// ```
+    #[must_use]
+    pub fn with_buffer(storage: Vec<u8>, limits: Limits) -> Self {
+        Self::from_buffer(
+            Buffer::with_storage(storage, limits.buffer_capacity()),
+            limits,
+        )
+    }
+
+    fn from_buffer(buf: Buffer, limits: Limits) -> Self {
         Self {
-            buf: Buffer::new(limits.buffer_capacity()),
+            buf,
             limits,
             scanner: HeadScanner::new(),
             trailers: HeadScanner::new(),
@@ -226,6 +308,10 @@ impl ClientConn {
             waiting_continue: false,
             body_refused: false,
             req_chunked: false,
+            idempotent: true,
+            queue: [NO_QUEUED; MAX_PIPELINE_DEPTH as usize],
+            queue_start: 0,
+            queued: 0,
         }
     }
 
@@ -349,7 +435,7 @@ impl ClientConn {
                     "the connection is closed or upgraded",
                 ));
             }
-            _ => return Err(HttpError::InvalidState("a request is already outstanding")),
+            _ => return self.send_pipelined(request, out),
         }
         if !self.buf.unread().is_empty() {
             return Err(HttpError::UnexpectedData);
@@ -366,42 +452,14 @@ impl ClientConn {
             ));
         }
         let method = request.method_kind;
-        let expects_body = matches!(method, Method::Post | Method::Put | Method::Patch);
-        let (encoder, declared) = match &request.body {
-            OutBody::Full(b) if b.is_empty() && !expects_body => (Encoder::Discard, None),
-            OutBody::Full(b) => (
-                Encoder::Length {
-                    remaining: b.len() as u64,
-                },
-                Some(b.len() as u64),
-            ),
-            OutBody::Length(n) => (Encoder::Length { remaining: *n }, Some(*n)),
-            OutBody::Chunked => (Encoder::Chunked, None),
-        };
-        out.extend_from_slice(request.method().as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(request.target().as_bytes());
-        out.extend_from_slice(b" HTTP/1.1\r\n");
-        out.extend_from_slice(request.fields());
-        push_framing(out, encoder, declared);
-        if request.close {
-            out.extend_from_slice(b"connection: close\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
-        let mut encoder = encoder;
-        match &request.body {
-            OutBody::Full(b) => {
-                encoder.write(b, out)?;
-                self.req = ReqWrite::Sent;
-            }
-            _ => self.req = ReqWrite::Streaming(encoder),
-        }
+        self.req = write_request(request, out)?;
         self.asked = Asked {
             head: method == Method::Head,
             connect: method == Method::Connect,
         };
         self.upgrade_asked = request.upgrade;
         self.keep_alive = !request.close;
+        self.idempotent = method.is_idempotent();
         self.req_chunked = matches!(request.body, OutBody::Chunked);
         self.waiting_continue = request.expect_continue;
         self.body_refused = false;
@@ -412,6 +470,217 @@ impl ClientConn {
         self.interim_count = 0;
         self.state = State::Head;
         Ok(())
+    }
+
+    /// Sends `request` behind the ones already outstanding (pipelining).
+    fn send_pipelined(&mut self, request: &Request, out: &mut Vec<u8>) -> Result<(), HttpError> {
+        if !self.can_send() {
+            return Err(HttpError::InvalidState(
+                if self.limits.pipeline_depth() <= 1 {
+                    "a request is already outstanding (raise Limits::with_pipeline_depth to pipeline)"
+                } else {
+                    "pipelining needs room in the pipeline depth, idempotent requests, \
+                 every earlier body sent, and no close, upgrade, CONNECT, or expectation"
+                },
+            ));
+        }
+        if !request.has_host {
+            return Err(HttpError::MissingHost);
+        }
+        let method = request.method_kind;
+        if !method.is_idempotent()
+            || request.upgrade
+            || request.expect_continue
+            || !matches!(request.body, OutBody::Full(_))
+        {
+            return Err(HttpError::InvalidState(
+                "only idempotent requests with a full body and no upgrade or expectation \
+                 can be pipelined",
+            ));
+        }
+        let req = write_request(request, out)?;
+        debug_assert_eq!(req, ReqWrite::Sent);
+        let slot = (self.queue_start + self.queued) % self.queue.len();
+        self.queue[slot] = Queued {
+            asked: Asked {
+                head: method == Method::Head,
+                connect: false,
+            },
+            close: request.close,
+        };
+        self.queued += 1;
+        Ok(())
+    }
+
+    /// Starts on the response to the oldest queued request.
+    fn next_queued(&mut self) {
+        let next = self.queue[self.queue_start];
+        self.queue_start = (self.queue_start + 1) % self.queue.len();
+        self.queued -= 1;
+        self.asked = next.asked;
+        self.keep_alive = !next.close;
+        self.upgrade_asked = false;
+        self.idempotent = true;
+        self.req_chunked = false;
+        self.waiting_continue = false;
+        self.body_refused = false;
+        self.buf.unpin();
+        self.buf.pin_at_pos();
+        self.scanner.reset();
+        self.interim_bytes = 0;
+        self.interim_count = 0;
+        self.state = State::Head;
+    }
+
+    /// Whether any outstanding request asked to close the connection.
+    fn closing(&self) -> bool {
+        !self.keep_alive
+            || (0..self.queued).any(|i| self.queue[(self.queue_start + i) % self.queue.len()].close)
+    }
+
+    /// The number of requests sent whose response has not completed:
+    /// 0 when idle, up to [`Limits::pipeline_depth`] when pipelining. After
+    /// the connection closed it is the number of requests that never got
+    /// a response (send them again on a new connection if they are safe to
+    /// repeat).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Limits, Request};
+    ///
+    /// let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+    /// let get = |p: &str| Request::get(p).header("host", "a");
+    /// let mut out = Vec::new();
+    /// conn.send_request(&get("/1"), &mut out)?;
+    /// conn.send_request(&get("/2"), &mut out)?;
+    /// assert_eq!(conn.outstanding(), 2);
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        match self.state {
+            State::Idle => 0,
+            State::Head | State::Interim | State::Body => 1 + self.queued,
+            State::Complete | State::Closed | State::Upgraded => self.queued,
+        }
+    }
+
+    /// Whether [`send_request`](Self::send_request) would accept another
+    /// request now. With no request outstanding: the connection is open
+    /// and nothing unsolicited is buffered. With requests outstanding
+    /// (pipelining): fewer than [`Limits::pipeline_depth`] are outstanding,
+    /// all of them are idempotent with their bodies fully sent, and none
+    /// asked to close, upgrade, `CONNECT`, or expect `100 Continue`. The new
+    /// request must also be idempotent with a full body (RFC 9112 section
+    /// 9.3.2: a client should not pipeline non-idempotent requests).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Limits, Request};
+    ///
+    /// let mut conn = ClientConn::new(); // depth 1: no pipelining
+    /// assert!(conn.can_send());
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// assert!(!conn.can_send());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn can_send(&self) -> bool {
+        match self.state {
+            State::Idle => self.buf.unread().is_empty() && !self.buf.is_eof(),
+            State::Closed | State::Upgraded => false,
+            State::Head | State::Interim | State::Body | State::Complete => {
+                self.outstanding() < usize::from(self.limits.pipeline_depth())
+                    && self.idempotent
+                    && self.req == ReqWrite::Sent
+                    && !self.closing()
+                    && !self.upgrade_asked
+                    && !self.asked.connect
+                    && !self.waiting_continue
+                    && !self.body_refused
+                    && !self.buf.is_eof()
+            }
+        }
+    }
+
+    /// Returns the connection to its initial state for a new socket,
+    /// keeping the buffer and field-index allocations and the limits and
+    /// reporting settings. Requests still outstanding are forgotten.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Progress, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// conn.reset();
+    /// assert_eq!(conn.progress(), Progress::Idle);
+    /// assert!(conn.can_send());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn reset(&mut self) {
+        self.buf.reset();
+        self.scanner.reset();
+        self.trailers.reset();
+        self.decoder = Decoder::new();
+        self.info = ResponseInfo::EMPTY;
+        self.asked = NO_QUEUED.asked;
+        self.upgrade_asked = false;
+        self.state = State::Idle;
+        self.req = ReqWrite::Sent;
+        self.keep_alive = true;
+        self.interim_bytes = 0;
+        self.interim_count = 0;
+        self.waiting_continue = false;
+        self.body_refused = false;
+        self.req_chunked = false;
+        self.idempotent = true;
+        self.queue_start = 0;
+        self.queued = 0;
+    }
+
+    /// Gives the input buffer's storage back, for a pool.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::ClientConn::new().into_buffer().capacity(), 0);
+    /// ```
+    #[must_use]
+    pub fn into_buffer(mut self) -> Vec<u8> {
+        self.buf.take_storage()
+    }
+
+    /// Frees the input buffer and the field indexes while no request is
+    /// outstanding and nothing is buffered. Returns whether memory was
+    /// released.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = conn.feed(b"HTTP/1.1 204 No Content\r\n\r\n");
+    /// while !matches!(conn.poll()?, ClientEvent::Idle) {}
+    /// assert!(conn.shrink_idle());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn shrink_idle(&mut self) -> bool {
+        if self.state != State::Idle {
+            return false;
+        }
+        self.buf.unpin();
+        let freed = self.buf.shrink();
+        if freed {
+            self.scanner.fields = Vec::new();
+            self.trailers.fields = Vec::new();
+        }
+        freed
     }
 
     /// Writes body bytes of a streamed request.
@@ -560,9 +829,15 @@ impl ClientConn {
                 }
                 State::Body => return self.poll_body(),
                 State::Complete => {
-                    if self.reusable() {
+                    if self.reusable() && self.queued > 0 {
+                        // Pipelined: the next response is for the oldest
+                        // queued request, and may already be buffered.
+                        self.next_queued();
+                    } else if self.reusable() {
                         self.state = State::Idle;
                     } else {
+                        // Queued requests, if any, will get no response;
+                        // `outstanding()` says how many.
                         self.state = State::Closed;
                         return Ok(ClientEvent::Closed);
                     }

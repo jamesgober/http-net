@@ -162,6 +162,15 @@ without the space after the code (client, from 0.3).
 | D-19 | 2026-10-21 | The default per-field-line budget is 8 KiB from 0.4 (OD-21). Reserved outgoing fields grow by `trailer`, `keep-alive`, `proxy-connection` (both sides) and `te` (responses only). Both are listed as behaviour changes in the CHANGELOG and MIGRATION. | Proxy limits commonly sit near 8 KiB per line; the hop-by-hop fields belong to the connection (RFC 9110 section 7.6.1), and `te` is a request field (section 10.1.4). |
 | D-20 | 2026-10-21 | `Progress` is one enum shared by both connections (defined with `ServerConn`, re-exported at the root). Server `Closed` covers "will close after the last response"; client `AwaitingResponse` means "sent, no response byte yet". | One type for drivers that run both sides (proxy-net); the phases are the same questions. |
 
+### 0.5 decisions
+
+| Id | Date | Decision | Reason |
+|---|---|---|---|
+| D-21 (core) | 2026-10-21 | Client pipelining queues only idempotent requests with full bodies, behind a current request that is idempotent with its body sent, and never behind a close, upgrade, `CONNECT`, or expectation. The queue is a fixed array of 32 entries in the connection (about 4 bytes each). | RFC 9112 section 9.3.2; a streamed body behind other requests would tie their responses to it; a fixed array keeps the no-allocation claim. |
+| D-22 (core) | 2026-10-21 | When the server closes mid-pipeline, the connection reports `Closed` and `outstanding()` keeps counting the unanswered requests rather than failing them one by one. | The caller decides whether to retry (they are idempotent by D-21); one number is enough to do it. |
+| D-23 (core) | 2026-10-21 | `reset()` keeps the limits and the trailer-reporting and wipe settings, and resets per-connection state including `set_keep_alive` (allowed again) and `requests_served`. | Settings describe how the driver uses the object; keep-alive control and the count describe one peer. |
+| D-24 (core) | 2026-10-21 | Wiping is done by the buffer: the finished request's region at each exchange, the vacated tail on every compaction, everything on reset, release, and drop; each `fill(0)` is followed by `core::hint::black_box` so it is not removed. Only `ServerConn` has `set_wipe` (the spec's A-46); the client's buffer supports it internally for later. | Compaction leaves stale copies past the new end that a per-request wipe alone would miss (the wipe test checks it with a control run). |
+
 ## 8. Defence ideas (one per version)
 
 | Version | Hypothesis | Method | Expected cost | Outcome |

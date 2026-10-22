@@ -616,11 +616,23 @@ let big_trailers = Limits::new().with_max_trailer_bytes(100 * 1024);
 assert_eq!(big_trailers.buffer_capacity(), 24 * 1024 + 100 * 1024 + 16 * 1024);
 ```
 
-### Planned budgets
+### `Limits::with_pipeline_depth`
 
-| Setter / getter | Behaviour | Default | Ships |
-|---|---|---|---|
-| `with_pipeline_depth(u8)` / `pipeline_depth()` | client: most outstanding requests | 1 (max 32) | 0.5 |
+```rust,ignore
+pub const fn with_pipeline_depth(self, depth: u8) -> Limits
+pub const fn pipeline_depth(&self) -> u8
+```
+
+How many requests a client may have outstanding at once (pipelining, RFC
+9112 section 9.3.2), clamped to `1..=32`. The default, 1, means one request
+at a time. See [`ClientConn::can_send`](#pipelining) for what may be
+pipelined. **Ships:** 0.5.
+
+```rust
+let l = http_net::Limits::new().with_pipeline_depth(8);
+assert_eq!(l.pipeline_depth(), 8);
+assert_eq!(http_net::Limits::new().with_pipeline_depth(0).pipeline_depth(), 1);
+```
 
 ## `ServerConn`
 
@@ -1014,14 +1026,58 @@ assert!(conn.is_upgraded());
 assert_eq!(conn.remaining_input(), b"\x81\x00");
 ```
 
+### Reuse, pooling, and wiping
+
+```rust,ignore
+pub fn reset(&mut self)
+pub fn with_buffer(storage: Vec<u8>, limits: Limits) -> ServerConn
+pub fn into_buffer(self) -> Vec<u8>
+pub fn shrink_idle(&mut self) -> bool
+pub fn set_wipe(&mut self, wipe: bool)
+```
+
+- `reset()` returns the connection to its initial state for a new socket,
+  keeping the buffer and field-index allocations and the limits, trailer
+  reporting, and wipe settings. Everything per connection starts over:
+  buffered input, the request in progress, keep-alive (allowed again), the
+  request count.
+- `with_buffer(storage, limits)` adopts pooled storage (its capacity used up
+  to `Limits::buffer_capacity`, its contents ignored); `into_buffer()` gives
+  it back.
+- `shrink_idle()` frees the buffer and field indexes while the connection is
+  idle with nothing buffered, so idle keep-alive connections cost only their
+  struct; it returns whether memory was released, and the next input
+  allocates again.
+- `set_wipe(true)` zeroes the bytes of every finished request (head, body,
+  framing) before the buffer is reused, zeroes the stale copies compaction
+  leaves behind, and zeroes the whole buffer on `reset`, `into_buffer`, and
+  drop, so credentials do not linger between requests (threat T-36). It
+  costs a `memset` of each request's bytes, about 30 to 60 ns per 2 KiB (an
+  estimate), and no allocation.
+
+**Ships:** 0.5.
+
+```rust
+use http_net::{Limits, Response, ServerConn, ServerEvent};
+
+let pooled = Vec::with_capacity(16 * 1024);
+let mut conn = ServerConn::with_buffer(pooled, Limits::new());
+conn.set_wipe(true);
+let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nCookie: sid=secret\r\n\r\n");
+while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
+conn.respond(&Response::new(204), &mut Vec::new())?;
+assert!(matches!(conn.poll()?, ServerEvent::NeedInput)); // the request's bytes are zeroed
+assert!(conn.shrink_idle());
+conn.reset(); // a new socket
+let back = conn.into_buffer(); // back to the pool, zeroed
+assert!(back.iter().all(|&b| b == 0));
+# Ok::<(), http_net::HttpError>(())
+```
+
 ### Planned `ServerConn` methods
 
 | Method | Behaviour | Errors | Ships |
 |---|---|---|---|
-| `reset(&mut self)` | back to the initial state for a new socket, keeping allocations | none | 0.5 |
-| `with_buffer(storage: Vec<u8>, limits) -> Self`, `into_buffer(self) -> Vec<u8>` | adopt and return caller storage for a buffer pool | none | 0.5 |
-| `shrink_idle(&mut self) -> bool` | frees the buffer and field index while idle with nothing buffered | none | 0.5 |
-| `set_wipe(&mut self, wipe: bool)` | zero consumed bytes of each finished request, and the whole buffer on `reset`, `into_buffer`, and drop | none | 0.5 |
 | `write_head<O: Output>(&mut self, head: &ResponseHeadRef<'_>, date, out: &mut O) -> Result<BodyPlan, HttpError>` | allocation-free head writer from borrowed fields | as `respond` | 0.5 |
 | `respond_into<O: Output>(&mut self, response, date, out: &mut O)` | `respond` over any `Output` | as `respond` | 0.5 |
 | `respond_head_only(&mut self, response, out) -> Result<BodyPlan, HttpError>` | writes only the head of a full-body response, so the driver can send head and body with one vectored write | as `respond` | 0.6 |
@@ -1904,13 +1960,62 @@ assert!(conn.is_reusable());
 # Ok::<(), http_net::HttpError>(())
 ```
 
+### Pipelining
+
+```rust,ignore
+pub fn outstanding(&self) -> usize
+pub fn can_send(&self) -> bool
+```
+
+With [`Limits::with_pipeline_depth`](#limitswith_pipeline_depth) above 1, a
+client may send more requests before the first response arrives; responses
+are matched to them in order, from a fixed array (no allocation after
+construction). Only idempotent requests with a full body are pipelined, and
+nothing goes behind a request that streams its body, asks to close,
+upgrades, uses `CONNECT`, or expects `100 Continue` (RFC 9112 section 9.3.2:
+a client should not pipeline non-idempotent requests). `can_send()` says
+whether `send_request` would accept another request now; `outstanding()`
+counts requests whose response has not completed. If the server closes the
+connection mid-pipeline, `outstanding()` reports how many requests got no
+response, to retry on a new connection. **Ships:** 0.5.
+
+```rust
+use http_net::{ClientConn, ClientEvent, Limits, Request};
+
+let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(3));
+let mut out = Vec::new();
+for path in ["/a", "/b", "/c"] {
+    conn.send_request(&Request::get(path).header("host", "x"), &mut out)?;
+}
+assert_eq!(conn.outstanding(), 3);
+assert!(!conn.can_send()); // the depth is full
+let _ = conn.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nbHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nc");
+let mut bodies = Vec::new();
+loop {
+    match conn.poll()? {
+        ClientEvent::Body(b) => bodies.extend_from_slice(b),
+        ClientEvent::Idle => break,
+        _ => {}
+    }
+}
+assert_eq!(bodies, b"abc");
+assert_eq!(conn.outstanding(), 0);
+# Ok::<(), http_net::HttpError>(())
+```
+
+### Reuse and pooling
+
+`reset()`, `with_buffer(storage, limits)`, `into_buffer()`, and
+`shrink_idle()` work as on `ServerConn`: back to the initial state keeping
+allocations (outstanding requests are forgotten), adopt and return pooled
+storage, and free the buffer while no request is outstanding. **Ships:**
+0.5.
+
 ### Planned `ClientConn` methods
 
 | Method | Behaviour | Ships |
 |---|---|---|
-| `outstanding(&self) -> usize`, `can_send(&self) -> bool` | pipelining state (depth from `Limits::pipeline_depth`, idempotent requests only) | 0.5 |
 | `set_leniency(&mut self, leniency: ClientLeniency)` | opt-in tolerance: `obs_fold_in_responses` replaces each fold's CR LF with SP SP in place (RFC 9112 section 5.2 user-agent rule); bare LF, bare CR, CL with TE, and whitespace before a colon are never tolerated | 0.5 |
-| `reset`, `with_buffer`, `into_buffer`, `shrink_idle` | as on `ServerConn` | 0.5 |
 
 ## `ClientEvent`
 

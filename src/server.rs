@@ -241,7 +241,35 @@ impl ServerConn {
     /// ```
     #[must_use]
     pub fn with_limits(limits: Limits) -> Self {
-        let mut buf = Buffer::new(limits.buffer_capacity());
+        Self::from_buffer(Buffer::new(limits.buffer_capacity()), limits)
+    }
+
+    /// A connection enforcing `limits` that reads into `storage`, for
+    /// drivers that pool buffers: its capacity is used up to
+    /// [`Limits::buffer_capacity`], its contents are ignored. Give it back
+    /// with [`into_buffer`](Self::into_buffer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Limits, ServerConn, ServerEvent};
+    ///
+    /// let pooled: Vec<u8> = Vec::with_capacity(8192);
+    /// let mut conn = ServerConn::with_buffer(pooled, Limits::new());
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// let back = conn.into_buffer();
+    /// assert!(back.capacity() >= 8192);
+    /// ```
+    #[must_use]
+    pub fn with_buffer(storage: Vec<u8>, limits: Limits) -> Self {
+        Self::from_buffer(
+            Buffer::with_storage(storage, limits.buffer_capacity()),
+            limits,
+        )
+    }
+
+    fn from_buffer(mut buf: Buffer, limits: Limits) -> Self {
         buf.pin_at_pos();
         Self {
             buf,
@@ -457,6 +485,7 @@ impl ServerConn {
     }
 
     fn next_exchange(&mut self) {
+        self.buf.wipe_consumed();
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
@@ -827,6 +856,108 @@ impl ServerConn {
     /// ```
     pub fn set_report_trailers(&mut self, report: bool) {
         self.report_trailers = report;
+    }
+
+    /// Returns the connection to its initial state for a new socket,
+    /// keeping the buffer and field-index allocations (and the limits,
+    /// [`set_report_trailers`](Self::set_report_trailers), and
+    /// [`set_wipe`](Self::set_wipe) settings). Everything per connection
+    /// starts over: buffered input, the request in progress, keep-alive
+    /// (allowed again), and the request count. With wiping on, the whole
+    /// buffer is zeroed first.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Progress, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET /next");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// conn.reset(); // the socket closed; reuse the object for the next one
+    /// assert_eq!(conn.progress(), Progress::Idle);
+    /// assert!(conn.remaining_input().is_empty());
+    /// ```
+    pub fn reset(&mut self) {
+        self.buf.reset();
+        self.buf.pin_at_pos();
+        self.scanner.reset();
+        self.trailers.reset();
+        self.decoder = Decoder::new();
+        self.info = RequestInfo::EMPTY;
+        self.state = ReqState::Head;
+        self.resp = RespState::Idle;
+        self.keep_alive = false;
+        self.allow_keep_alive = true;
+        self.continue_sent = false;
+        self.body_seen = false;
+        self.resp_chunked = false;
+        self.requests_served = 0;
+    }
+
+    /// Gives the input buffer's storage back (for a pool), wiped first when
+    /// [`set_wipe`](Self::set_wipe) is on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let conn = http_net::ServerConn::new();
+    /// assert_eq!(conn.into_buffer().capacity(), 0); // nothing was ever buffered
+    /// ```
+    #[must_use]
+    pub fn into_buffer(mut self) -> Vec<u8> {
+        self.buf.take_storage()
+    }
+
+    /// Frees the input buffer and the field indexes while the connection is
+    /// idle between requests with nothing buffered, so thousands of idle
+    /// keep-alive connections cost only their struct size. Returns whether
+    /// memory was released; the next input allocates again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// assert!(!conn.shrink_idle()); // a request is in progress
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::RequestEnd));
+    /// conn.respond(&Response::new(204), &mut Vec::new()).unwrap();
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::NeedInput));
+    /// assert!(conn.shrink_idle());
+    /// ```
+    pub fn shrink_idle(&mut self) -> bool {
+        if self.progress() != Progress::Idle || self.state != ReqState::Head {
+            return false;
+        }
+        self.buf.unpin();
+        let freed = self.buf.shrink();
+        self.buf.pin_at_pos();
+        if freed {
+            self.scanner.fields = Vec::new();
+            self.trailers.fields = Vec::new();
+        }
+        freed
+    }
+
+    /// When `true`, the bytes of every finished request (head, body, and
+    /// framing) are zeroed before the buffer is reused, stale copies left by
+    /// compaction are zeroed, and the whole buffer is zeroed on
+    /// [`reset`](Self::reset), [`into_buffer`](Self::into_buffer), and drop,
+    /// so credentials do not linger in memory between requests. Costs a
+    /// `memset` of each request's bytes (about 30 to 60 ns for 2 KiB, an
+    /// estimate). Off by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut conn = http_net::ServerConn::new();
+    /// conn.set_wipe(true);
+    /// ```
+    pub fn set_wipe(&mut self, wipe: bool) {
+        self.buf.set_wipe(wipe);
     }
 
     pub(crate) fn respond_dated(

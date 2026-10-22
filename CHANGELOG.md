@@ -11,6 +11,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Client pipelining: `Limits::with_pipeline_depth` / `pipeline_depth`
+  (1 to 32, default 1), `ClientConn::outstanding` and `ClientConn::can_send`.
+  Idempotent requests with full bodies are sent before earlier responses
+  arrive and matched to them in order from a fixed array.
+- Connection reuse and buffer pooling: `reset`, `with_buffer`,
+  `into_buffer`, and `shrink_idle` on both connections.
+- `ServerConn::set_wipe`: zero each finished request's bytes, the stale
+  copies compaction leaves, and the whole buffer on reset, release, and
+  drop (threat T-36).
+
 ---
 
 ## [0.4.0] - 2026-10-21
