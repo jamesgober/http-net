@@ -960,6 +960,14 @@ impl Request {
     pub(crate) fn fields(&self) -> &[u8] {
         &self.fields
     }
+
+    /// The values of the `upgrade` fields [`upgrade`](Self::upgrade) added
+    /// (`header` refuses the name, so these are the only ones).
+    pub(crate) fn upgrade_offers(&self) -> impl Iterator<Item = &[u8]> {
+        serialized_fields(&self.fields)
+            .filter(|(n, _)| n.eq_ignore_ascii_case(b"upgrade"))
+            .map(|(_, v)| v)
+    }
 }
 
 /// Shows method, target, fields, and body size; the values of credential

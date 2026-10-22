@@ -11,6 +11,21 @@
 
 ## [Unreleased]
 
+### Security
+
+- The client switches protocols on a `101` only when every protocol its
+  `Upgrade` field names is one the request offered (RFC 9110 section
+  7.8); otherwise `UnexpectedUpgrade` (threat T-21). Before, any non-empty
+  `Upgrade` was accepted, so a server answering a `websocket` upgrade with
+  another protocol took over the connection.
+
+### Added
+
+- `examples/soak.rs`: the soak test of the blocking server (mixed
+  workload, one status line per minute, resident memory on Linux).
+- An attack test for the accept loop's back-off on persistent accept
+  errors (threat T-41).
+
 ---
 
 ## [0.6.0] - 2026-10-22
