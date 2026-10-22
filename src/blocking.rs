@@ -12,7 +12,7 @@
 use std::{
     cell::Cell,
     fmt, io,
-    io::{Read, Write},
+    io::{IoSlice, Read, Write},
     net::{
         IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
     },
@@ -27,8 +27,8 @@ use std::{
 };
 
 use crate::{
-    ClientConn, ClientEvent, DateCache, HttpDate, HttpError, Limits, Method, Progress, Request,
-    RequestHead, Response, ServerConn, ServerEvent,
+    BodyPlan, ClientConn, ClientEvent, DateCache, HttpDate, HttpError, Limits, Method, Progress,
+    Request, RequestHead, Response, ServerConn, ServerEvent,
     message::OutBody,
     redact::{FieldValue, serialized_fields},
 };
@@ -43,6 +43,9 @@ const DRAIN_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const DRAIN_TOTAL: Duration = Duration::from_secs(1);
 /// Responses larger than this do not keep their output buffer afterwards.
 const OUT_RETAIN: usize = 64 * 1024;
+/// Full bodies larger than this are written after the head with one
+/// vectored write instead of being copied into the output buffer.
+const VECTORED_BODY: usize = 4 * 1024;
 
 /// What can go wrong in the blocking adapter.
 ///
@@ -1194,10 +1197,26 @@ impl Connection {
     /// See [`Connection`].
     pub fn respond(&mut self, response: &Response) -> Result<(), Error> {
         self.out.clear();
-        self.conn
-            .respond_with_date(response, &now_date(), &mut self.out)?;
+        let date = now_date();
+        // A large full body goes out after the head in one vectored write
+        // instead of being copied into the output buffer.
+        let tail = match response.body_bytes() {
+            Some(body) if body.len() > VECTORED_BODY => {
+                let plan = self.conn.respond_head_dated(
+                    response,
+                    Some(&date.as_bytes()[..]),
+                    &mut self.out,
+                )?;
+                if plan == BodyPlan::Raw { body } else { &[][..] }
+            }
+            _ => {
+                self.conn
+                    .respond_with_date(response, &date, &mut self.out)?;
+                &[][..]
+            }
+        };
         self.write_deadline = self.response_deadline.map(|d| Instant::now() + d);
-        self.flush_out()
+        self.flush_with(tail)
     }
 
     /// Writes an interim response (for example `103 Early Hints`) before
@@ -1263,8 +1282,17 @@ impl Connection {
     /// most the time left (and never longer than the socket's own write
     /// timeout); the deadline ends with the response.
     fn flush_out(&mut self) -> Result<(), Error> {
+        self.flush_with(&[])
+    }
+
+    /// Writes the serialized bytes in `out` and then `tail` (a full body
+    /// sent as it is, not copied into `out`), with vectored writes while
+    /// both remain.
+    fn flush_with(&mut self, tail: &[u8]) -> Result<(), Error> {
+        let head_len = self.out.len();
+        let total = head_len + tail.len();
         let mut written = 0;
-        while written < self.out.len() {
+        while written < total {
             if let Some(deadline) = self.write_deadline {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -1274,7 +1302,15 @@ impl Connection {
                 self.stream.set_write_timeout(Some(wait))?;
                 self.write_shortened = true;
             }
-            match self.stream.write(&self.out[written..]) {
+            let result = if written >= head_len {
+                self.stream.write(&tail[written - head_len..])
+            } else if tail.is_empty() {
+                self.stream.write(&self.out[written..])
+            } else {
+                let parts = [IoSlice::new(&self.out[written..]), IoSlice::new(tail)];
+                self.stream.write_vectored(&parts)
+            };
+            match result {
                 Ok(0) => return Err(Error::Io(io::ErrorKind::WriteZero.into())),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}

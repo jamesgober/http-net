@@ -54,6 +54,19 @@ macro_rules! registry {
             }
         }
 
+        /// The whole status line, `HTTP/1.1 <code> <phrase>` CRLF, for a
+        /// registered code, built at compile time so a response head starts
+        /// with one copy.
+        #[inline]
+        pub(crate) const fn status_line(status: u16) -> Option<&'static [u8]> {
+            match status {
+                $($code => Some(
+                    concat!("HTTP/1.1 ", stringify!($code), " ", $phrase, "\r\n").as_bytes()
+                ),)*
+                _ => None,
+            }
+        }
+
         #[cfg(test)]
         const REGISTERED: &[(u16, &str)] = &[$(($code, $phrase)),*];
     };
@@ -197,9 +210,38 @@ pub const fn status_allows_body(status: u16, request: crate::Method) -> bool {
         || (matches!(request, crate::Method::Connect) && status >= 200 && status < 300))
 }
 
+/// Writes `HTTP/1.1 <code> <phrase>` CRLF: one copy from the compile-time
+/// table for a registered code, the parts otherwise (an unregistered code
+/// still gets the space after it, RFC 9112 section 4).
+#[inline]
+pub(crate) fn write_status_line<O: crate::Output + ?Sized>(out: &mut O, status: u16) {
+    if let Some(line) = status_line(status) {
+        out.put(line);
+    } else {
+        out.put(b"HTTP/1.1 ");
+        crate::syntax::push_decimal(out, u64::from(status));
+        out.put(b" \r\n");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_status_line_table_matches_the_parts_for_every_code() {
+        use alloc::{format, vec::Vec};
+        for status in 100..=599u16 {
+            let mut out = Vec::new();
+            write_status_line(&mut out, status);
+            let expected = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
+            assert_eq!(out, expected.as_bytes(), "status {status}");
+            assert_eq!(
+                status_line(status).is_some(),
+                !reason_phrase(status).is_empty()
+            );
+        }
+    }
 
     #[test]
     fn test_status_allows_body_follows_rfc_9112_6_3() {
