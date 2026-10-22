@@ -22,8 +22,8 @@ pub mod reference;
 
 use arbitrary::Arbitrary;
 use http_net::{
-    BodyFraming, ClientConn, ClientEvent, HttpError, Limits, Request, Response, ServerConn,
-    ServerEvent, Version,
+    BodyFraming, ClientConn, ClientEvent, ClientLeniency, HttpError, Limits, Request, Response,
+    ServerConn, ServerEvent, Version,
 };
 
 /// Upper bound on driver steps, so a bug that loops is reported as a crash
@@ -71,6 +71,8 @@ pub struct Options {
     pub keep_alive_off: bool,
     /// Server: send a `103` before each answer.
     pub send_hints: bool,
+    /// Client: replace obsolete line folds in response heads.
+    pub lenient_folds: bool,
 }
 
 /// Fuzzer-chosen budgets; `None` fields keep the defaults.
@@ -218,7 +220,11 @@ pub fn drive_server_with(pieces: &[&[u8]], limits: Limits, opts: Options) -> Vec
                     None
                 };
                 version = r.version();
-                let _ = (r.has_unknown_expectation(), r.content_length(), r.target_form());
+                let _ = (
+                    r.has_unknown_expectation(),
+                    r.content_length(),
+                    r.target_form(),
+                );
                 assert!(
                     r.upgrade_protocols()
                         .all(|p| !p.eq_ignore_ascii_case(b"h2c") && !p.is_empty()),
@@ -240,7 +246,10 @@ pub fn drive_server_with(pieces: &[&[u8]], limits: Limits, opts: Options) -> Vec
             Ok(ServerEvent::Body(b)) => push_body(&mut events, b),
             Ok(ServerEvent::Trailers(t)) => {
                 assert!(opts.report_trailers, "trailers reported without asking");
-                assert!(t.clone().next().is_some(), "an empty trailer section was reported");
+                assert!(
+                    t.clone().next().is_some(),
+                    "an empty trailer section was reported"
+                );
                 events.push(Ev::Trailers(fields_of(t)));
             }
             Ok(ServerEvent::RequestEnd) => {
@@ -249,7 +258,9 @@ pub fn drive_server_with(pieces: &[&[u8]], limits: Limits, opts: Options) -> Vec
                 if opts.send_hints {
                     let sent = conn.send_informational(&Response::new(103), &mut out);
                     match version {
-                        Version::Http11 => assert!(sent.is_ok(), "103 to HTTP/1.1 refused: {sent:?}"),
+                        Version::Http11 => {
+                            assert!(sent.is_ok(), "103 to HTTP/1.1 refused: {sent:?}")
+                        }
                         _ => assert_eq!(sent, Err(HttpError::InterimNotAllowed)),
                     }
                 }
@@ -258,9 +269,16 @@ pub fn drive_server_with(pieces: &[&[u8]], limits: Limits, opts: Options) -> Vec
                 }
                 answer(&mut conn, protocol.as_deref(), &mut out);
                 answered += 1;
-                assert_eq!(conn.requests_served(), answered, "requests_served miscounted");
+                assert_eq!(
+                    conn.requests_served(),
+                    answered,
+                    "requests_served miscounted"
+                );
                 if opts.keep_alive_off {
-                    assert!(!conn.keep_alive(), "keep-alive still on after set_keep_alive(false)");
+                    assert!(
+                        !conn.keep_alive(),
+                        "keep-alive still on after set_keep_alive(false)"
+                    );
                 }
             }
             Ok(ServerEvent::NeedInput) => {
@@ -328,6 +346,7 @@ pub fn drive_client_with(
     let mut conn = ClientConn::with_limits(limits);
     conn.set_report_trailers(opts.report_trailers);
     conn.set_report_informational(opts.report_informational);
+    conn.set_leniency(ClientLeniency::new().with_obs_fold_in_responses(opts.lenient_folds));
     let mut out = Vec::new();
     if let Err(e) = conn.send_request(request, &mut out) {
         panic!("a valid request was refused: {e:?}");
@@ -337,7 +356,11 @@ pub fn drive_client_with(
     let mut pending: &[u8] = &[];
     let mut eof = false;
     for _ in 0..MAX_STEPS {
-        let _ = (conn.progress(), conn.is_reusable(), conn.is_waiting_for_continue());
+        let _ = (
+            conn.progress(),
+            conn.is_reusable(),
+            conn.is_waiting_for_continue(),
+        );
         match conn.poll() {
             Ok(ClientEvent::Informational(r)) => {
                 assert!(opts.report_informational, "interim reported without asking");
@@ -355,7 +378,10 @@ pub fn drive_client_with(
             }
             Ok(ClientEvent::Trailers(t)) => {
                 assert!(opts.report_trailers, "trailers reported without asking");
-                assert!(t.clone().next().is_some(), "an empty trailer section was reported");
+                assert!(
+                    t.clone().next().is_some(),
+                    "an empty trailer section was reported"
+                );
                 events.push(Ev::Trailers(fields_of(t)));
             }
             Ok(ClientEvent::Response(r)) => events.push(Ev::Status {

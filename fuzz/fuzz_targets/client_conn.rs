@@ -5,7 +5,8 @@
 //! and options (interim responses and trailers reported). Oracles as for
 //! `server_conn`: no panic, bounded buffer, only `Closed` after an error,
 //! interim responses and trailers reported only when asked for, and events
-//! identical to the whole-input run.
+//! identical to the whole-input run, and, for input with no obsolete
+//! fold, identical with fold leniency on.
 
 #![no_main]
 
@@ -48,4 +49,28 @@ fuzz_target!(|input: Input| {
     let pieces = split(&input.data, &input.cuts);
     let split_run = drive_client_with(&request, &pieces, limits, input.options);
     assert_eq!(whole, split_run, "events depend on how the input was split");
+    // Leniency changes only folded input: where no line end is followed by
+    // SP or HTAB, the lenient run must report exactly the strict events. (A
+    // strict run can stop on an earlier error before it reaches a fold, so
+    // its events alone do not say whether the input was folded.)
+    let folded = input
+        .data
+        .windows(3)
+        .any(|w| w[0] == b'\r' && w[1] == b'\n' && (w[2] == b' ' || w[2] == b'\t'));
+    if !folded {
+        let strict = Options {
+            lenient_folds: false,
+            ..input.options
+        };
+        let lenient = Options {
+            lenient_folds: true,
+            ..input.options
+        };
+        let strict_run = drive_client_with(&request, &[&input.data], limits, strict);
+        let lenient_run = drive_client_with(&request, &[&input.data], limits, lenient);
+        assert_eq!(
+            strict_run, lenient_run,
+            "leniency changed an unfolded response"
+        );
+    }
 });
