@@ -150,6 +150,37 @@ pub(crate) fn trim_ows(mut s: &[u8]) -> &[u8] {
     s
 }
 
+/// The length of the run of printable ASCII (`0x20` to `0x7e`) at the start
+/// of `s`, eight bytes at a time: where the first control byte, DEL, or
+/// byte of `0x80` and above sits, or `s.len()`.
+#[inline]
+pub(crate) fn printable_run(s: &[u8]) -> usize {
+    let mut chunks = s.chunks_exact(8);
+    let mut base = 0usize;
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        let w = u64::from_le_bytes(word);
+        // As in `check_field_value`; a marker can be false only above a true
+        // one, so the lowest is exact.
+        let low = w.wrapping_sub(0x2020_2020_2020_2020) & !w & 0x8080_8080_8080_8080;
+        let del = {
+            let x = w ^ 0x7f7f_7f7f_7f7f_7f7f;
+            x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+        };
+        let marks = low | del | (w & 0x8080_8080_8080_8080);
+        if marks != 0 {
+            return base + (marks.trailing_zeros() / 8) as usize;
+        }
+        base += 8;
+    }
+    let rest = chunks.remainder();
+    base + rest
+        .iter()
+        .position(|b| !(0x20..0x7f).contains(b))
+        .unwrap_or(rest.len())
+}
+
 /// Validates a field value (already trimmed of OWS).
 ///
 /// A CR is reported as [`HttpError::BareCr`] because that is the smuggling

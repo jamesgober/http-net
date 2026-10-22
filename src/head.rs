@@ -18,7 +18,7 @@ use crate::{
     redact::{FieldName, FieldValue},
     syntax::{
         ListSplit, check_field_value, find_byte, is_host_value, is_ows, is_reason, is_target_chars,
-        is_tchar, is_token, list_elements, parse_decimal, trim_ows,
+        is_tchar, is_token, list_elements, parse_decimal, printable_run, trim_ows,
     },
 };
 
@@ -199,6 +199,7 @@ pub(crate) enum HeadKind {
     Trailer,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Scan {
     Partial,
     /// The head is complete; the value is its length including the blank line.
@@ -348,6 +349,28 @@ impl LineScan {
                     (section, HttpError::HeadersTooLarge)
                 }
             };
+            // The common field line in one pass. Anything else, and a line
+            // whose search already began on earlier input, takes the general
+            // path below, which decides exactly as it always has.
+            if !in_start && self.scan <= self.line_start {
+                if let Some((field, next)) = fast_field(msg, self.line_start) {
+                    let line_len = next - self.line_start;
+                    if line_len <= budget {
+                        self.scan = next;
+                        self.line_start = next;
+                        self.field_bytes += line_len;
+                        if self.field_bytes + 2 > section_bytes {
+                            return Err(HttpError::HeadersTooLarge);
+                        }
+                        if self.count >= section_fields {
+                            return Err(HttpError::TooManyHeaders);
+                        }
+                        self.count += 1;
+                        sink.put(field)?;
+                        continue;
+                    }
+                }
+            }
             let Some(end) = find_line(msg, self.line_start, &mut self.scan, budget, too_long)?
             else {
                 return Ok(Scan::Partial);
@@ -428,6 +451,43 @@ fn parse_field(line: &[u8], base: usize) -> Result<Field, HttpError> {
         name: Span::new(base, base + colon),
         value: Span::new(value_start, value_start + value.len()),
     })
+}
+
+/// The common field line in one pass, the way it nearly always arrives: a
+/// token name, a colon, spaces, a value of printable ASCII, and CR LF, all
+/// in `msg` from `start`. Returns the field and the offset after its LF.
+///
+/// `None` for anything else (a tab, obs-text, a control byte, a bare CR or
+/// LF, a fold, a missing colon) and for a line not yet complete: the caller
+/// then takes the general path from the line's start, which accepts and
+/// refuses exactly as before. On every line this accepts, the general path
+/// gives the same field (`tests` below and the fuzz targets check it).
+#[inline(always)]
+fn fast_field(msg: &[u8], start: usize) -> Option<(Field, usize)> {
+    let line = msg.get(start..)?;
+    let colon = line.iter().position(|&b| !is_tchar(b))?;
+    if colon == 0 || line[colon] != b':' {
+        return None;
+    }
+    let mut value = colon + 1;
+    while line.get(value) == Some(&b' ') {
+        value += 1;
+    }
+    let cr = value + printable_run(&line[value..]);
+    if line.get(cr) != Some(&b'\r') || line.get(cr + 1) != Some(&b'\n') {
+        return None;
+    }
+    let mut value_end = cr;
+    while value_end > value && line[value_end - 1] == b' ' {
+        value_end -= 1;
+    }
+    Some((
+        Field {
+            name: Span::new(start, start + colon),
+            value: Span::new(start + value, start + value_end),
+        },
+        start + cr + 2,
+    ))
 }
 
 /// The HTTP version of a message.
@@ -1966,7 +2026,112 @@ impl fmt::Debug for ResponseHead<'_> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
+
+    /// Lines built from the bytes that decide field parsing, at random.
+    fn random_lines(count: usize) -> Vec<Vec<u8>> {
+        const BYTES: &[u8] = b"aZ09-!~:: \t\r\n\x00\x7f\x80\xff\"(,";
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Mostly the shape a field line has (a name, a colon, a value), with
+        // the deciding bytes mixed in now and then, so lines land on both
+        // sides of what the fast path accepts.
+        let mut pick = move |plain: &[u8]| {
+            if next() % 12 == 0 {
+                BYTES[(next() % BYTES.len() as u64) as usize]
+            } else {
+                plain[(next() % plain.len() as u64) as usize]
+            }
+        };
+        (0..count)
+            .map(|i| {
+                let mut line = Vec::new();
+                for _ in 0..(i % 9) {
+                    line.push(pick(b"abcXYZ019-_.!~"));
+                }
+                line.push(pick(b":"));
+                for _ in 0..(i % 23) {
+                    line.push(pick(b"  abc XYZ 019 ,;=/\"()[]{}"));
+                }
+                if i % 5 != 0 {
+                    line.extend_from_slice(b"\r\n");
+                }
+                line
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_fast_field_agrees_with_the_general_path() {
+        let mut fast = 0;
+        for line in random_lines(300_000).into_iter().chain([
+            b"Host: a\r\n".to_vec(),
+            b"X:\r\n".to_vec(),
+            b"X:   \r\n".to_vec(),
+            b"X:  a  b  \r\n".to_vec(),
+            b"X: a\tb\r\n".to_vec(),
+            b"X: a\r".to_vec(),
+            b"X: a\n".to_vec(),
+            b" X: a\r\n".to_vec(),
+            b"X : a\r\n".to_vec(),
+            b"X: \x80\r\n".to_vec(),
+            b"X: a\rb\r\n".to_vec(),
+        ]) {
+            let Some((field, next)) = fast_field(&line, 0) else {
+                continue;
+            };
+            fast += 1;
+            // The general path on the same line: the LF it finds, then the
+            // field it parses.
+            let lf = find_byte(b'\n', &line).expect("an accepted line has an LF");
+            assert_eq!(next, lf + 1, "{line:?}");
+            assert_eq!(line[lf - 1], b'\r', "{line:?}");
+            assert_eq!(parse_field(&line[..lf - 1], 0), Ok(field), "{line:?}");
+        }
+        assert!(fast > 1_000, "the fast path accepted only {fast} lines");
+    }
+
+    #[test]
+    fn test_scan_with_and_without_the_fast_path_agree_at_every_split() {
+        // Whole input takes the fast path; one byte at a time cannot (a
+        // line is never complete when its search starts), so it exercises
+        // the general path. Both must report the same fields and errors.
+        let heads: [&[u8]; 6] = [
+            b"GET / HTTP/1.1\r\nHost: a\r\nX:  b  \r\nY:\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: a\tb\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: a\rb\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX : b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\n X: b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: \x80\x81\r\n\r\n",
+        ];
+        let fields = |s: &HeadScanner| {
+            s.fields
+                .iter()
+                .map(|f| (f.name, f.value))
+                .collect::<Vec<_>>()
+        };
+        for head in heads {
+            let mut whole = HeadScanner::new();
+            let whole_result = whole.advance(head, &Limits::new(), HeadKind::Request, true);
+            let mut split = HeadScanner::new();
+            let mut split_result = Ok(Scan::Partial);
+            for end in 1..=head.len() {
+                split_result = split.advance(&head[..end], &Limits::new(), HeadKind::Request, true);
+                if !matches!(split_result, Ok(Scan::Partial)) {
+                    break;
+                }
+            }
+            assert_eq!(whole_result, split_result, "{head:?}");
+            assert_eq!(fields(&whole), fields(&split), "{head:?}");
+        }
+    }
 
     fn scan(msg: &[u8], kind: HeadKind) -> Result<(HeadScanner, usize), HttpError> {
         let mut s = HeadScanner::new();
