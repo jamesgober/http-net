@@ -581,9 +581,17 @@ const REJECT: &[(&str, &[u8], HttpError)] = &[
         HttpError::UnexpectedEof,
     ),
     (
-        // E-18, T-42: prior-knowledge HTTP/2 to an HTTP/1.1-only listener.
+        // E-18, T-42: prior-knowledge HTTP/2 to an HTTP/1.1-only listener,
+        // recognised before version parsing from 0.5 (505 either way).
         "HTTP/2 connection preface",
         b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        HttpError::Http2Preface,
+    ),
+    (
+        // The preface's first 18 bytes alone are an HTTP/1.1-shaped head
+        // with version 2.0; without the rest it is that, not the preface.
+        "HTTP/2.0 request line without the rest of the preface",
+        b"PRI * HTTP/2.0\r\n\r\n",
         HttpError::UnsupportedVersion,
     ),
 ];

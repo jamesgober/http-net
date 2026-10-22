@@ -1428,6 +1428,27 @@ impl<'a> RequestHead<'a> {
         list
     }
 
+    /// The options the request's `Connection` field lists, across every
+    /// `Connection` line, in order (`close`, `keep-alive`, `upgrade`, and the
+    /// names of fields that are hop-by-hop for this message). Compare them
+    /// ASCII case-insensitively. A proxy passes them to
+    /// [`is_hop_by_hop`](crate::is_hop_by_hop).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, X-Trace\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// let options: Vec<&[u8]> = req.connection_options().collect();
+    /// assert_eq!(options, [&b"keep-alive"[..], b"X-Trace"]);
+    /// ```
+    #[must_use]
+    pub fn connection_options(&self) -> ListElements<'a, 'static> {
+        list_values(self.head, self.fields, "connection")
+    }
+
     /// The elements of a comma-separated list field (`#rule`, RFC 9110
     /// section 5.6.1) across every line with this name, in order, trimmed
     /// of whitespace, empty elements skipped. A comma inside a quoted

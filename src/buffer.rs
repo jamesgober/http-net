@@ -137,6 +137,14 @@ impl Buffer {
         self.data.get(start..self.filled).unwrap_or(&[])
     }
 
+    /// Bytes from absolute `start` to the end of input, writable: the
+    /// client's obs-fold leniency rewrites folds in place.
+    #[inline]
+    pub(crate) fn tail_mut(&mut self, start: usize) -> &mut [u8] {
+        let filled = self.filled;
+        self.data.get_mut(start..filled).unwrap_or(&mut [])
+    }
+
     /// Bytes in the absolute range `start..end`.
     #[inline]
     pub(crate) fn range(&self, start: usize, end: usize) -> &[u8] {

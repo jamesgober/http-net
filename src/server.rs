@@ -13,6 +13,7 @@ use crate::{
     limits::Limits,
     message::{OutBody, Response, check_trailers, push_last_chunk_with_trailers},
     method::Method,
+    preface::is_h2_preface,
     status::reason_phrase,
     syntax::push_decimal,
 };
@@ -195,6 +196,9 @@ pub struct ServerConn {
     resp_chunked: bool,
     report_trailers: bool,
     requests_served: u64,
+    /// The connection has not yet shown whether it starts with the HTTP/2
+    /// preface (checked once, before the first request only).
+    preface_undecided: bool,
 }
 
 impl Default for ServerConn {
@@ -287,6 +291,7 @@ impl ServerConn {
             resp_chunked: false,
             report_trailers: false,
             requests_served: 0,
+            preface_undecided: true,
         }
     }
 
@@ -416,6 +421,19 @@ impl ServerConn {
 
     fn poll_head(&mut self) -> Result<ServerEvent<'_>, HttpError> {
         let start = self.buf.pin();
+        if self.preface_undecided {
+            // RFC 9113 section 3.4: prior-knowledge HTTP/2 starts the
+            // connection with a fixed preface. Decide before the head is
+            // scanned (its first 18 bytes are a complete HTTP/1.1-shaped
+            // head), and wait while the input could still be the preface, so
+            // the answer does not depend on how the bytes arrived.
+            match is_h2_preface(self.buf.from(start)) {
+                Some(true) => return Err(self.fail(HttpError::Http2Preface)),
+                Some(false) => self.preface_undecided = false,
+                None if self.buf.is_eof() => self.preface_undecided = false,
+                None => return Ok(ServerEvent::NeedInput),
+            }
+        }
         let msg = self.buf.from(start);
         let progress = self
             .scanner
@@ -893,6 +911,7 @@ impl ServerConn {
         self.body_seen = false;
         self.resp_chunked = false;
         self.requests_served = 0;
+        self.preface_undecided = true;
     }
 
     /// Gives the input buffer's storage back (for a pool), wiped first when

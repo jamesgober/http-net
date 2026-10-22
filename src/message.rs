@@ -14,7 +14,8 @@ use core::fmt;
 
 use crate::{
     error::HttpError,
-    head::{check_target, is_h2c},
+    forward::is_hop_by_hop,
+    head::{BodyFraming, RequestHead, check_target, is_h2c},
     method::Method,
     redact::{SerializedFields, serialized_fields},
     syntax::{check_field_value, is_protocol, is_token, trim_ows},
@@ -625,6 +626,77 @@ impl Request {
     #[must_use]
     pub fn options(target: &str) -> Self {
         Self::new("OPTIONS", target)
+    }
+
+    /// A request for an upstream server built from a received head, for a
+    /// proxy: the same method and target, every field except the hop-by-hop
+    /// ones (RFC 9110 section 7.6.1: `connection`, `keep-alive`,
+    /// `proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`,
+    /// and any name the head's `Connection` lists; see
+    /// [`is_hop_by_hop`](crate::is_hop_by_hop)) in their original order,
+    /// except `content-length`, which the connection derives again from
+    /// the body mode of the head's framing: a chunked body stays
+    /// chunked, a length stays that length (stream it with
+    /// [`ClientConn::send_body`](crate::ClientConn::send_body)). The
+    /// connection writes its own framing and connection fields.
+    ///
+    /// The target is copied as received: an absolute-form target (a request
+    /// to a proxy) stays absolute, which an origin server also accepts (RFC
+    /// 9112 section 3.2.2); rewrite it with [`Request::new`] if the upstream
+    /// wants origin form. `Host` is forwarded as a field. Add `via` and
+    /// forwarding fields with [`header`](Self::header); requests are
+    /// re-serialized, never passed through as raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Recorded and returned by
+    /// [`ClientConn::send_request`](crate::ClientConn::send_request):
+    /// [`HttpError::InvalidState`] for an upgrade request (the upgrade is
+    /// hop-by-hop; a proxy tunnels it instead), and the builder errors of
+    /// [`Request::new`] and [`Request::header`] (for example a missing or
+    /// second `host` surfaces at send).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Request, ServerConn, ServerEvent};
+    ///
+    /// let mut downstream = ServerConn::new();
+    /// let _ = downstream.feed(b"POST /api HTTP/1.1\r\nHost: app\r\nConnection: X-Hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\nAccept: */*\r\nContent-Length: 2\r\n\r\nhi");
+    /// let ServerEvent::Request(head) = downstream.poll()? else { unreachable!() };
+    /// let upstream_req = Request::forward_from(&head).header("via", "1.1 proxy");
+    ///
+    /// let mut upstream = ClientConn::new();
+    /// let mut out = Vec::new();
+    /// upstream.send_request(&upstream_req, &mut out)?;
+    /// assert_eq!(out, b"POST /api HTTP/1.1\r\nHost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn forward_from(head: &RequestHead<'_>) -> Self {
+        let mut request = Self::new(head.method_str(), head.target());
+        if head.is_upgrade() {
+            if request.error.is_none() {
+                request.error = Some(HttpError::InvalidState(
+                    "an upgrade request is hop-by-hop; tunnel it instead of forwarding it",
+                ));
+            }
+            return request;
+        }
+        for (name, value) in head.headers() {
+            // `content-length` is end-to-end, but the connection derives it
+            // from the body mode below, so it is not copied as a field.
+            if !is_hop_by_hop(name, head.connection_options())
+                && !name.eq_ignore_ascii_case("content-length")
+            {
+                request = request.header(name, value);
+            }
+        }
+        match head.framing() {
+            BodyFraming::Chunked => request.chunked(),
+            BodyFraming::Length(n) => request.content_length(n),
+            _ => request,
+        }
     }
 
     /// Adds a header field, validated as for [`Response::header`]. A second

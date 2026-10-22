@@ -250,6 +250,16 @@ fn test_server_reset_reuses_the_object_for_a_new_socket() {
 }
 
 #[test]
+fn test_server_reset_checks_the_http2_preface_again() {
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Request(_))));
+    conn.reset();
+    let _ = conn.feed(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    assert_eq!(conn.poll().unwrap_err(), HttpError::Http2Preface);
+}
+
+#[test]
 fn test_server_with_buffer_uses_up_to_the_capacity_and_gives_it_back() {
     let limits = Limits::new()
         .with_max_start_line(1024)

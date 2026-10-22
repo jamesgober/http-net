@@ -13,6 +13,7 @@ use crate::{
     message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
     method::Method,
     server::Progress,
+    syntax::find_byte,
 };
 
 /// The error for sending a body the server declined (a final status in
@@ -86,6 +87,151 @@ pub enum ClientEvent<'a> {
     Upgraded,
     /// The connection cannot carry another request: close the socket.
     Closed,
+}
+
+/// Opt-in tolerances for responses a strict client would refuse. All are
+/// off by default; requests are never parsed leniently.
+///
+/// - `obs_fold_in_responses`: replace each obsolete line fold in a response
+///   head (a field line continued on the next line, which begins with a
+///   space or tab) by overwriting the fold's CR and LF with spaces, as RFC
+///   9112 section 5.2 tells a user agent to do. The rewrite happens in
+///   place in the connection's buffer, so offsets do not move, views stay
+///   borrowed, and nothing is allocated. Whitespace before the first field
+///   is still refused.
+///
+/// Bare LF, bare CR, `Content-Length` with `Transfer-Encoding`, and
+/// whitespace before a colon are never tolerated: they are how messages
+/// get framed differently by different hops.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{ClientConn, ClientEvent, ClientLeniency, Request};
+///
+/// let mut conn = ClientConn::new();
+/// conn.set_leniency(ClientLeniency::new().with_obs_fold_in_responses(true));
+/// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+/// let _ = conn.feed(b"HTTP/1.1 200 OK\r\nX-Long: part one,\r\n part two\r\nContent-Length: 0\r\n\r\n");
+/// let ClientEvent::Response(resp) = conn.poll()? else { panic!() };
+/// assert_eq!(resp.header("x-long"), Some(&b"part one,   part two"[..]));
+/// # Ok::<(), http_net::HttpError>(())
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ClientLeniency {
+    /// Replace obs-folds in response fields with spaces instead of refusing
+    /// them with [`HttpError::ObsFold`].
+    pub obs_fold_in_responses: bool,
+}
+
+impl ClientLeniency {
+    /// Every tolerance off (the strict default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(!http_net::ClientLeniency::new().obs_fold_in_responses);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            obs_fold_in_responses: false,
+        }
+    }
+
+    /// Sets [`obs_fold_in_responses`](Self::obs_fold_in_responses).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::ClientLeniency::new().with_obs_fold_in_responses(true);
+    /// assert!(l.obs_fold_in_responses);
+    /// ```
+    #[must_use]
+    pub const fn with_obs_fold_in_responses(mut self, on: bool) -> Self {
+        self.obs_fold_in_responses = on;
+        self
+    }
+}
+
+/// The in-place obs-fold rewrite of one response head. It walks the head's
+/// line ends once, overall linear however the input is split, and tells the
+/// head scanner how much it may see: a line end whose next byte has not
+/// arrived is held back, because only that byte says whether the line is
+/// folded. The scanner therefore never completes a field line that is about
+/// to be continued.
+#[derive(Clone, Copy, Debug)]
+struct Unfold {
+    /// Where the search for the next LF resumes.
+    scan: usize,
+    /// Start of the line being examined.
+    line_start: usize,
+    /// The status line has ended (it is never folded).
+    past_status: bool,
+    /// The blank line that ends the head was seen.
+    done: bool,
+}
+
+impl Unfold {
+    const fn new() -> Self {
+        Self {
+            scan: 0,
+            line_start: 0,
+            past_status: false,
+            done: false,
+        }
+    }
+
+    /// Rewrites the folds found in `msg` (the head so far) and returns how
+    /// many of its bytes the head scanner may examine.
+    fn run(&mut self, msg: &mut [u8], eof: bool) -> usize {
+        if self.done {
+            return msg.len();
+        }
+        loop {
+            let Some(off) = msg.get(self.scan..).and_then(|rest| find_byte(b'\n', rest)) else {
+                self.scan = msg.len();
+                return msg.len();
+            };
+            let lf = self.scan + off;
+            if !self.past_status {
+                self.past_status = true;
+                self.line_start = lf + 1;
+                self.scan = lf + 1;
+                continue;
+            }
+            // line_start <= lf: it only ever moves to just past an LF.
+            let line = msg.get(self.line_start..lf).unwrap_or(&[]);
+            if line.is_empty() || line == b"\r" {
+                self.done = true;
+                return msg.len();
+            }
+            let crlf = lf > 0 && msg.get(lf - 1) == Some(&b'\r');
+            match msg.get(lf + 1) {
+                None if eof => {
+                    self.scan = msg.len();
+                    return msg.len();
+                }
+                None => {
+                    // Revisit this LF once its next byte arrives.
+                    self.scan = lf;
+                    return lf;
+                }
+                Some(&b) if crlf && (b == b' ' || b == b'\t') => {
+                    // RFC 9112 section 5.2: replace the fold with SP. The
+                    // line goes on, so its start stays where it was.
+                    msg[lf - 1] = b' ';
+                    msg[lf] = b' ';
+                    self.scan = lf + 1;
+                }
+                Some(_) => {
+                    self.line_start = lf + 1;
+                    self.scan = lf + 1;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +315,9 @@ pub struct ClientConn {
     queue: [Queued; MAX_PIPELINE_DEPTH as usize],
     queue_start: usize,
     queued: usize,
+    leniency: ClientLeniency,
+    /// Where the obs-fold rewrite stopped in the current response head.
+    unfold: Unfold,
 }
 
 /// A pipelined request waiting for its response: what framing its response
@@ -312,6 +461,8 @@ impl ClientConn {
             queue: [NO_QUEUED; MAX_PIPELINE_DEPTH as usize],
             queue_start: 0,
             queued: 0,
+            leniency: ClientLeniency::new(),
+            unfold: Unfold::new(),
         }
     }
 
@@ -466,6 +617,7 @@ impl ClientConn {
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
+        self.unfold = Unfold::new();
         self.interim_bytes = 0;
         self.interim_count = 0;
         self.state = State::Head;
@@ -851,9 +1003,21 @@ impl ClientConn {
     fn poll_head(&mut self) -> Result<ClientEvent<'_>, HttpError> {
         loop {
             let start = self.buf.pin();
+            let visible = if self.leniency.obs_fold_in_responses {
+                let eof = self.buf.is_eof();
+                self.unfold.run(self.buf.tail_mut(start), eof)
+            } else {
+                self.buf.from(start).len()
+            };
+            let msg = self.buf.from(start);
             let progress = self
                 .scanner
-                .advance(self.buf.from(start), &self.limits, HeadKind::Response, true)
+                .advance(
+                    msg.get(..visible).unwrap_or(msg),
+                    &self.limits,
+                    HeadKind::Response,
+                    true,
+                )
                 .map_err(|e| self.fail(e))?;
             let len = match progress {
                 Scan::Partial if self.buf.is_eof() => {
@@ -929,6 +1093,7 @@ impl ClientConn {
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
+        self.unfold = Unfold::new();
     }
 
     fn reusable(&self) -> bool {
@@ -1084,6 +1249,31 @@ impl ClientConn {
     /// ```
     pub fn set_report_trailers(&mut self, report: bool) {
         self.report_trailers = report;
+    }
+
+    /// Sets the opt-in tolerances for responses (see [`ClientLeniency`]);
+    /// the default is strict. Takes effect from the next response head.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientLeniency, HttpError, Request};
+    ///
+    /// let folded = b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\nContent-Length: 0\r\n\r\n";
+    /// let mut strict = ClientConn::new();
+    /// strict.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = strict.feed(folded);
+    /// assert_eq!(strict.poll().unwrap_err(), HttpError::ObsFold);
+    ///
+    /// let mut lenient = ClientConn::new();
+    /// lenient.set_leniency(ClientLeniency::new().with_obs_fold_in_responses(true));
+    /// lenient.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = lenient.feed(folded);
+    /// assert!(lenient.poll().is_ok());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn set_leniency(&mut self, leniency: ClientLeniency) {
+        self.leniency = leniency;
     }
 
     /// Whether a request built with

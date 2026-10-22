@@ -22,6 +22,20 @@
 - `ServerConn::set_wipe`: zero each finished request's bytes, the stale
   copies compaction leaves, and the whole buffer on reset, release, and
   drop (threat T-36).
+- `Request::forward_from`: a request for an upstream built from a received
+  head, with the hop-by-hop fields (RFC 9110 section 7.6.1) removed and the
+  framing mode kept; `is_hop_by_hop` and `RequestHead::connection_options`.
+- `is_h2_preface`, and the error `HttpError::Http2Preface` (505).
+- `ClientLeniency` and `ClientConn::set_leniency`: an opt-in tolerance for
+  obsolete line folding in response heads, replaced by spaces in place
+  (RFC 9112 section 5.2); every other refusal stays.
+- Example `proxy_forward`.
+
+### Changed
+
+- A connection that starts with the HTTP/2 connection preface is refused
+  with `Http2Preface` instead of `UnsupportedVersion` (both answer 505). The
+  check runs only before a connection's first request.
 
 ---
 

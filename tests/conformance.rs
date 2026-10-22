@@ -897,6 +897,49 @@ const ROWS: &[Row] = &[
             )
         },
     },
+    Row {
+        section: "RFC 9110 7.6.1 (0.5)",
+        statement: "a proxy MUST remove the hop-by-hop fields, including every field the Connection field lists, before forwarding",
+        check: || {
+            let mut conn = ServerConn::new();
+            let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: up\r\nConnection: X-A\r\nX-A: 1\r\nKeep-Alive: 5\r\nTE: trailers\r\nAccept: */*\r\n\r\n");
+            let Ok(ServerEvent::Request(head)) = conn.poll() else {
+                return Err("no request".into());
+            };
+            let mut out = Vec::new();
+            ClientConn::new()
+                .send_request(&Request::forward_from(&head), &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            ensure(
+                out == b"GET / HTTP/1.1\r\nHost: up\r\nAccept: */*\r\n\r\n",
+                "a hop-by-hop field was forwarded",
+            )
+        },
+    },
+    Row {
+        section: "RFC 9112 5.2 (0.5)",
+        statement: "a user agent that receives obs-fold in a response MUST replace each fold with one or more SP before interpreting the value (opt-in here; refused by default)",
+        check: || {
+            let folded = b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\nContent-Length: 0\r\n\r\n";
+            let mut conn = ClientConn::new();
+            conn.set_leniency(http_net::ClientLeniency::new().with_obs_fold_in_responses(true));
+            conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())
+                .map_err(|e| format!("{e:?}"))?;
+            let _ = conn.feed(folded);
+            match conn.poll() {
+                Ok(ClientEvent::Response(r)) => ensure(
+                    r.header("x") == Some(&b"a   b"[..]),
+                    "the fold was not replaced with SP",
+                ),
+                other => Err(format!("{other:?}")),
+            }
+        },
+    },
+    Row {
+        section: "RFC 9113 3.4 (0.5)",
+        statement: "a connection that starts with the HTTP/2 preface is prior-knowledge HTTP/2, not an HTTP/1.1 request",
+        check: || expect_error(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", HttpError::Http2Preface),
+    },
 ];
 
 #[test]

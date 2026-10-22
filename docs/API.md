@@ -75,13 +75,17 @@
   - [`Response::switching_protocols`](#responseswitching_protocols)
 - [`Request`](#request)
   - [`Request::upgrade`](#requestupgrade)
+  - [`Request::forward_from`](#requestforward_from)
   - [`Request::expect_continue`](#requestexpect_continue)
 - [`ClientConn`](#clientconn)
   - [`ClientConn::send_request`](#clientconnsend_request)
   - [Interim responses, `Expect`, trailers, and reuse](#interim-responses-expect-trailers-and-reuse)
+  - [`ClientConn::set_leniency` and `ClientLeniency`](#clientconnset_leniency-and-clientleniency)
   - [Planned `ClientConn` methods](#planned-clientconn-methods)
 - [`ClientEvent`](#clientevent)
 - [Tier 3: stateless parsers, chunked decoder, output](#tier-3-stateless-parsers-chunked-decoder-output)
+  - [`is_hop_by_hop`](#is_hop_by_hop)
+  - [`is_h2_preface`](#is_h2_preface)
 - [Blocking adapter](#blocking-adapter)
   - [`blocking::Server`](#blockingserver)
   - [`blocking::serve`](#blockingserve)
@@ -489,7 +493,7 @@ assert!(HttpError::InvalidTarget.is_peer_error() && HttpError::InvalidTarget.is_
 | `InvalidMethod` | peer / usage | method is not a token (parse, or `Request::new`) | 400 | answer 400 / fix the method | exists |
 | `InvalidTarget` | peer / usage | target bytes outside RFC 3986, bad `%XX`, a form the method does not allow, absolute form without `//authority`, with userinfo, or with an empty host; an authority with an empty host before a port or a bad `%XX` (0.3) | 400 | answer 400 / fix the target | exists; 0.3 |
 | `InvalidVersion` | peer | version not `HTTP/DIGIT.DIGIT` | 400 | answer 400 | exists |
-| `UnsupportedVersion` | peer | major version other than 1 (includes `HTTP/2.0`, so the HTTP/2 connection preface gets 505) | 505 | answer 505 | exists |
+| `UnsupportedVersion` | peer | major version other than 1 (includes an `HTTP/2.0` request line; the HTTP/2 connection preface at the start of a connection is `Http2Preface` from 0.5) | 505 | answer 505 | exists |
 | `InvalidStatus` | peer / usage | status not three digits in 100..=599 (parse); outside 100..=599, or a 1xx other than 101 (respond) | None | drop the connection / fix the status | exists |
 | `StartLineTooLong` | peer | request or status line (including skipped empty lines) over `max_start_line` | 414 | answer 414 | exists |
 | `HeadersTooLarge` | peer | header or trailer section over `max_header_bytes`; client: interim heads over the same budget | 431 | answer 431 | exists |
@@ -1241,7 +1245,7 @@ assert_eq!(accept, [&b"text/html"[..], b"x/y;q=\"0.5,1\""]);
 | `has_unknown_expectation()` | `bool` | Any other `Expect` element (any version), so the caller can answer 417 (the blocking server does). Never changes framing. | 0.4 |
 | `is_upgrade()` | `bool` | HTTP/1.1, `Connection: upgrade`, and an `Upgrade` offering at least one protocol other than `h2c`. | exists; 0.3 |
 | `upgrade_protocols()` | `ListElements<'a, 'static>` | The offered protocols as product tokens, across every `Upgrade` line, `h2c` omitted; empty unless `is_upgrade()`. | 0.4 |
-| `connection_options()` | `ListElements<'a, 'static>` | The `Connection` field's options. | 0.5 |
+| `connection_options()` | `ListElements<'a, 'static>` | The `Connection` field's options across every line, in order; compare ASCII case-insensitively; pass to [`is_hop_by_hop`](#is_hop_by_hop). | 0.5 |
 
 ```rust
 use http_net::{BodyFraming, ServerConn, ServerEvent};
@@ -1776,7 +1780,7 @@ says HTTP/1.1.
 | `method(&self) -> &str`, `target(&self) -> &str` | | exists |
 | `body_bytes`, `header_value` | as for `Response` | exists |
 | `expect_continue(self) -> Request` | adds `expect: 100-continue` and makes the connection wait for `100` before the body; needs a streamed body (`content_length` or `chunked`) | 0.4 |
-| `forward_from(head: &RequestHead<'_>) -> Request` | a request for an upstream with the hop-by-hop fields removed (RFC 9110 section 7.6.1) | 0.5 |
+| `forward_from(head: &RequestHead<'_>) -> Request` | a request for an upstream with the hop-by-hop fields removed (RFC 9110 section 7.6.1); see [below](#requestforward_from) | 0.5 |
 
 ```rust
 use http_net::Request;
@@ -1803,6 +1807,42 @@ assert_eq!(r.header_value("upgrade"), Some(&b"websocket"[..]));
 let h2c = Request::get("/").header("host", "a").upgrade("h2c");
 let mut conn = ClientConn::new();
 assert_eq!(conn.send_request(&h2c, &mut Vec::new()), Err(HttpError::UpgradeNotOffered));
+```
+
+### `Request::forward_from`
+
+```rust,ignore
+pub fn forward_from(head: &RequestHead<'_>) -> Request
+```
+
+A request for an upstream server, built from a received head (the proxy
+path: requests are re-serialized, never passed through as raw bytes). It
+keeps the method and the target as received, and every field except the
+hop-by-hop ones (RFC 9110 section 7.6.1: `connection`, `keep-alive`,
+`proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`, and
+any name the head's `Connection` lists) in their original order.
+`content-length` is not copied: the body mode follows the head's framing
+(chunked stays chunked, a length stays that length; stream the body with
+`ClientConn::send_body`) and the connection writes the framing field
+itself. An absolute-form target stays absolute (origin servers accept it,
+RFC 9112 section 3.2.2); rebuild with `Request::new` for origin form. Add
+`via` and forwarding fields with `header`. **Errors** (at `send_request`):
+`InvalidState` for an upgrade request (tunnel it instead); the builders'
+errors, such as `MissingHost` for an HTTP/1.0 head without `Host`.
+**Ships:** 0.5.
+
+```rust
+use http_net::{ClientConn, Request, ServerConn, ServerEvent};
+
+let mut downstream = ServerConn::new();
+let _ = downstream.feed(b"POST /api HTTP/1.1\r\nHost: app\r\nConnection: X-Hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\nAccept: */*\r\nContent-Length: 2\r\n\r\nhi");
+let ServerEvent::Request(head) = downstream.poll()? else { unreachable!() };
+let forwarded = Request::forward_from(&head).header("via", "1.1 proxy");
+let mut upstream = ClientConn::new();
+let mut out = Vec::new();
+upstream.send_request(&forwarded, &mut out)?;
+assert_eq!(out, b"POST /api HTTP/1.1\r\nHost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
+# Ok::<(), http_net::HttpError>(())
 ```
 
 ### `Request::expect_continue`
@@ -2011,11 +2051,56 @@ allocations (outstanding requests are forgotten), adopt and return pooled
 storage, and free the buffer while no request is outstanding. **Ships:**
 0.5.
 
+### `ClientConn::set_leniency` and `ClientLeniency`
+
+```rust,ignore
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ClientLeniency { pub obs_fold_in_responses: bool }
+impl ClientLeniency {
+    pub const fn new() -> ClientLeniency;
+    pub const fn with_obs_fold_in_responses(self, on: bool) -> ClientLeniency;
+}
+impl ClientConn { pub fn set_leniency(&mut self, leniency: ClientLeniency); }
+```
+
+Opt-in tolerances for responses; the default is strict, and requests are
+never parsed leniently. `obs_fold_in_responses` follows the RFC 9112 section
+5.2 user-agent rule: each obsolete line fold in a response head is replaced
+by overwriting its CR and LF with spaces, in place in the connection's
+buffer, so offsets do not move, views stay borrowed, and nothing is
+allocated. A line end is held back until its next byte arrives (only that
+byte says whether the line is folded), so the result does not depend on how
+the input is split. Whitespace before the first field, bare LF, bare CR,
+`Content-Length` with `Transfer-Encoding`, and whitespace before a colon are
+never tolerated (OD-7). A folded line counts as one field line against the
+budgets. **Ships:** 0.5.
+
+```rust
+use http_net::{ClientConn, ClientEvent, ClientLeniency, HttpError, Request};
+
+let folded = b"HTTP/1.1 200 OK\r\nX-Long: one,\r\n two\r\nContent-Length: 0\r\n\r\n";
+let mut strict = ClientConn::new();
+strict.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+let _ = strict.feed(folded);
+assert_eq!(strict.poll().unwrap_err(), HttpError::ObsFold);
+
+let mut lenient = ClientConn::new();
+lenient.set_leniency(ClientLeniency::new().with_obs_fold_in_responses(true));
+lenient.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+let _ = lenient.feed(folded);
+let ClientEvent::Response(resp) = lenient.poll()? else { unreachable!() };
+assert_eq!(resp.header("x-long"), Some(&b"one,   two"[..]));
+# Ok::<(), http_net::HttpError>(())
+```
+
 ### Planned `ClientConn` methods
 
 | Method | Behaviour | Ships |
 |---|---|---|
 | `set_leniency(&mut self, leniency: ClientLeniency)` | opt-in tolerance: `obs_fold_in_responses` replaces each fold's CR LF with SP SP in place (RFC 9112 section 5.2 user-agent rule); bare LF, bare CR, CL with TE, and whitespace before a colon are never tolerated | 0.5 |
+| `outstanding(&self) -> usize`, `can_send(&self) -> bool` | pipelining state (depth from `Limits::pipeline_depth`, idempotent requests only) | 0.5 |
+| `reset`, `with_buffer`, `into_buffer`, `shrink_idle` | as on `ServerConn` | 0.5 |
 
 ## `ClientEvent`
 
@@ -2065,7 +2150,7 @@ impl Output for Vec<u8>;
 pub struct ResponseHeadRef<'a> { pub status: u16, pub fields: &'a [(&'a str, &'a [u8])],
     pub body: OutgoingBody, pub close: bool, pub upgrade: Option<&'a str> }
 
-pub fn is_hop_by_hop(name: &str, connection_options: ListElements<'_>) -> bool;
+pub fn is_hop_by_hop(name: &str, connection_options: ListElements<'_, '_>) -> bool;
 pub fn is_h2_preface(input: &[u8]) -> Option<bool>;
 ```
 
@@ -2076,6 +2161,48 @@ pub fn is_h2_preface(input: &[u8]) -> Option<bool>;
 | `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` | where serialized bytes go (`Vec<u8>` or a caller type such as a zeroizing buffer), and a borrowed response description; `put` cannot fail (OD-2) | 0.5 |
 | `is_hop_by_hop` | `connection`, `keep-alive`, `proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`, and any name listed in `Connection` | 0.5 |
 | `is_h2_preface` | `Some(true)` for the 24-byte HTTP/2 preface, `Some(false)` when the input cannot be it, `None` when too short to tell | 0.5 |
+
+### `is_hop_by_hop`
+
+Whether a field name is hop-by-hop for a message: the fixed set
+(`connection`, `keep-alive`, `proxy-connection`, `te`, `transfer-encoding`,
+`upgrade`, `trailer`) or any name the message's `Connection` lists (RFC
+9110 section 7.6.1), ASCII case-insensitively. **Ships:** 0.5.
+
+```rust
+use http_net::{ServerConn, ServerEvent, is_hop_by_hop};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: X-Trace\r\nX-Trace: 1\r\n\r\n");
+let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+assert!(is_hop_by_hop("Keep-Alive", req.connection_options()));
+assert!(is_hop_by_hop("x-trace", req.connection_options()));
+assert!(!is_hop_by_hop("host", req.connection_options()));
+```
+
+### `is_h2_preface`
+
+Whether input starts with the 24-byte HTTP/2 connection preface (RFC 9113
+section 3.4): `Some(true)`, `Some(false)` as soon as a byte differs, or
+`None` while the input is a shorter matching prefix. `ServerConn` checks it
+before a connection's first request (never later) and refuses the preface
+with `Http2Preface` (505), waiting while the input could still be the
+preface so the answer does not depend on how the bytes arrived; a driver
+that accepts prior-knowledge HTTP/2 (behind a trusted proxy only) checks it
+first and routes the connection to an HTTP/2 engine. **Ships:** 0.5.
+
+```rust
+use http_net::{HttpError, ServerConn, is_h2_preface};
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+assert_eq!(is_h2_preface(PREFACE), Some(true));
+assert_eq!(is_h2_preface(&PREFACE[..10]), None);
+assert_eq!(is_h2_preface(b"GET / HTTP/1.1\r\n"), Some(false));
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(PREFACE);
+assert_eq!(conn.poll().unwrap_err(), HttpError::Http2Preface);
+```
 
 ---
 

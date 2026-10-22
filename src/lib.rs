@@ -107,10 +107,12 @@ mod buffer;
 mod client;
 mod date;
 mod error;
+mod forward;
 mod head;
 mod limits;
 mod message;
 mod method;
+mod preface;
 mod redact;
 mod server;
 pub mod status;
@@ -120,9 +122,10 @@ mod syntax;
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod blocking;
 
-pub use client::{ClientConn, ClientEvent};
+pub use client::{ClientConn, ClientEvent, ClientLeniency};
 pub use date::{DateCache, HttpDate};
 pub use error::HttpError;
+pub use forward::is_hop_by_hop;
 pub use head::{
     BodyFraming, HeaderValues, Headers, ListElements, RequestHead, ResponseHead, TargetForm,
     Version,
@@ -130,6 +133,7 @@ pub use head::{
 pub use limits::Limits;
 pub use message::{Request, Response};
 pub use method::{Method, MethodSet};
+pub use preface::is_h2_preface;
 pub use server::{Progress, ServerConn, ServerEvent};
 pub use status::{StatusClass, reason_phrase, status_allows_body, status_class};
 
@@ -164,6 +168,7 @@ mod tests {
         assert::<crate::ServerConn>();
         assert::<crate::ServerEvent<'_>>();
         assert::<crate::ClientConn>();
+        assert::<crate::ClientLeniency>();
         assert::<crate::ClientEvent<'_>>();
         assert::<crate::Response>();
         assert::<crate::Request>();
