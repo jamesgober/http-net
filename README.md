@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.5.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.6.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -38,7 +38,7 @@
 
 ## The model
 
-- A **[`ServerConn`](./docs/API.md#serverconn)** is the server side of one connection. Bytes go in with `feed` (or `read_buf` + `commit`); `poll` reports a **[`ServerEvent`](./docs/API.md#serverevent)**: a request head, body runs, the end of the request, or what it needs next. `respond` writes a **[`Response`](./docs/API.md#response)** into your output buffer.
+- A **[`ServerConn`](./docs/API.md#serverconn)** is the server side of one connection. Bytes go in with `feed` (or `read_buf` + `commit`); `poll` reports a **[`ServerEvent`](./docs/API.md#serverevent)**: a request head, body runs, the end of the request, or what it needs next. `respond` writes a **[`Response`](./docs/API.md#response)** into your output buffer; [`respond_head_only`](./docs/API.md#serverconnrespond_head_only) writes just the head, so a large body goes out with it in one vectored write, uncopied.
 - A **[`ClientConn`](./docs/API.md#clientconn)** is the mirror image: `send_request` writes a **[`Request`](./docs/API.md#request)**, `poll` reports the response as **[`ClientEvent`](./docs/API.md#clientevent)**s.
 - **[`RequestHead`](./docs/API.md#requesthead)** and **[`ResponseHead`](./docs/API.md#responsehead)** are zero-copy views of a parsed head.
 - **[`Limits`](./docs/API.md#limits)** bounds every buffer; **[`HttpError`](./docs/API.md#httperror)** says exactly what was refused and which status to answer with, and [`Response::from_error`](./docs/API.md#responsefrom_error) builds that answer.
@@ -74,14 +74,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.5"
+http-net = "0.6"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.5", default-features = false }
+http-net = { version = "0.6", default-features = false }
 ```
 
 <hr>
@@ -193,7 +193,7 @@ cargo run --example get -- http://127.0.0.1:8080/
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- `respond_head_only` (one vectored write for head and body) and the optimisation pass with published comparisons: v0.6.0. See the [roadmap](./dev/ROADMAP.md).
+- The hardening release (24-hour fuzz campaign, HTTP Garden differential runs, soak test): v0.7.0. See the [roadmap](./dev/ROADMAP.md).
 - An async runtime or adapter: never; drive the sans-IO core from any loop.
 - Content codings (gzip and others): a body is delivered as sent, and a `Transfer-Encoding` other than `chunked` is refused with 501.
 
@@ -202,17 +202,18 @@ cargo run --example get -- http://127.0.0.1:8080/
 
 ## Performance
 
-Criterion medians for 0.5.0 in WSL Ubuntu on a Windows x86_64 machine (Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.4.0 build so machine load falls on both. Every 0.5 difference from 0.4 is within run-to-run noise. The machine had other load, so absolute numbers are on the slow side:
+Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen 9 9950X3D, Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.5.0 build so machine load falls on both. Method, Windows numbers, and every decision behind them: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
-| Benchmark | Median |
-|---|---:|
-| 12-field browser GET, parsed and answered | ~350 ns |
-| 100,000 pipelined GETs in 16 KiB reads | ~11.1 ms (about 9 M requests/s) |
-| 1 MiB body, `Content-Length`, 16 KiB reads | ~15.6 µs |
-| 1 MiB body, chunked in 4 KiB chunks | ~20.5 µs |
-| response with five fields and a 1 KiB body, serialized | ~97 ns |
-| the same head written by `write_head` from borrowed fields | ~133 ns |
-| client parsing a 1 KiB response | ~116 ns |
+| Benchmark | 0.6.0 | vs 0.5.0 |
+|---|---:|---:|
+| 12-field browser GET, parsed and answered | ~234 ns | -23% |
+| 100,000 pipelined GETs in 16 KiB reads | ~8.8 ms (11.4 M requests/s) | -13% |
+| 1 MiB body, `Content-Length`, 16 KiB reads | ~13.5 µs | -3% |
+| 1 MiB body, chunked in 4 KiB chunks | ~17.0 µs | -3% |
+| response with five fields and a 1 KiB body, serialized | ~74 ns | -17% |
+| client parsing a 1 KiB response | ~100 ns | -11% |
+
+Against other libraries, on identical bytes ([`http-net-bench`](https://github.com/jamesgober/http-net-bench)): a full server exchange takes ~250 ns against hyper's ~1.4 µs (3.4 to 5.5x faster), 100,000 pipelined requests 7.3 ms against hyper's 23.6 ms, and a client exchange 95 ns against hyper's 1.24 µs. Parsing a head alone is level with httparse (~177 ns against ~172 ns with httparse's SIMD) while also validating the `Host` value, the target, every value byte, and the framing rules, with no `unsafe` code.
 
 These are library-only numbers: no sockets are involved. Body events borrow the input buffer, so the 1 MiB cases measure one copy into the buffer plus framing.
 

@@ -13,6 +13,51 @@
 
 ---
 
+## [0.6.0] - 2026-10-22
+
+Optimisation: one-pass parsing of the common field and chunk lines,
+compile-time status lines, `respond_head_only` with vectored writes, the
+comparison repository `http-net-bench`, and `docs/PERFORMANCE.md`. Nothing
+a 0.5 user can notice changes except speed (see `docs/MIGRATION.md`).
+
+### Added
+
+- `ServerConn::respond_head_only` (A-224): writes only the head of a
+  response and returns the `BodyPlan`, so a driver sends a full body after
+  the head with one vectored write instead of copying it into the output
+  buffer. The head plus the body are exactly what `respond` writes.
+- The blocking server sends full bodies over 4 KiB after the head with one
+  `write_vectored`, without copying them.
+- `docs/PERFORMANCE.md`: method, numbers, the comparison with httparse and
+  hyper, and the decisions behind the optimisations.
+- The comparison repository
+  [`http-net-bench`](https://github.com/jamesgober/http-net-bench)
+  (workloads H1 to H5 against httparse and hyper on identical bytes).
+- `scripts/bench_ab.sh`: interleaved A/B benchmarks of the working tree
+  against a tag, pinned to one core, for the 5% regression gate.
+- Tests: the linearity guard (`tests/linearity.rs`: a head fed one byte at
+  a time costs time linear in its size); `respond_head_only` equivalence
+  with `respond` over 2,048 generated cases (`tests/head_only.rs`) and over
+  real sockets; the fast paths against the general paths on 300,000
+  generated field lines and 200,000 chunk lines; `find_byte` at every
+  position among near-miss bytes; the status-line table against the parts
+  for every code.
+
+### Changed
+
+- Faster head parsing: the common field line (token name, colon, spaces,
+  printable value, CR LF) is parsed in one pass instead of three; every
+  other shape takes the general path, so what is accepted and refused does
+  not change. About 20% faster on the 12-field request head, 15% on
+  client response parsing, 12% on pipelined requests.
+- Faster chunked bodies: the common chunk line (hex digits, CR LF) is
+  parsed in one pass. About 9% faster on a 1 MiB chunked body, 36% on
+  `ChunkedDecoder` framing.
+- Faster responses: status lines come from a compile-time table built
+  from the status registry. About 10% faster on response serialization.
+
+---
+
 ## [0.5.0] - 2026-10-21
 
 Feature complete: client pipelining, connection reuse and buffer pooling,
@@ -392,7 +437,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/http-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/http-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/http-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/http-net/compare/v0.2.0...v0.3.0
