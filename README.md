@@ -202,16 +202,17 @@ cargo run --example get -- http://127.0.0.1:8080/
 
 ## Performance
 
-Criterion medians for 0.4.0 in WSL Ubuntu on a Windows x86_64 machine (Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.3.0 build so machine load falls on both (0.4 costs about 2 to 3% on the head benchmark for its new per-request facts; the rest are within run-to-run noise; the machine had other load, so absolute numbers are on the slow side):
+Criterion medians for 0.5.0 in WSL Ubuntu on a Windows x86_64 machine (Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.4.0 build so machine load falls on both. Every 0.5 difference from 0.4 is within run-to-run noise. The machine had other load, so absolute numbers are on the slow side:
 
 | Benchmark | Median |
 |---|---:|
-| 12-field browser GET, parsed and answered | ~316 ns |
-| 100,000 pipelined GETs in 16 KiB reads | ~10.1 ms (about 9.9 M requests/s) |
-| 1 MiB body, `Content-Length`, 16 KiB reads | ~14.5 µs |
-| 1 MiB body, chunked in 4 KiB chunks | ~19.8 µs |
-| response with five fields and a 1 KiB body, serialized | ~92 ns |
-| client parsing a 1 KiB response | ~110 ns |
+| 12-field browser GET, parsed and answered | ~350 ns |
+| 100,000 pipelined GETs in 16 KiB reads | ~11.1 ms (about 9 M requests/s) |
+| 1 MiB body, `Content-Length`, 16 KiB reads | ~15.6 µs |
+| 1 MiB body, chunked in 4 KiB chunks | ~20.5 µs |
+| response with five fields and a 1 KiB body, serialized | ~97 ns |
+| the same head written by `write_head` from borrowed fields | ~133 ns |
+| client parsing a 1 KiB response | ~116 ns |
 
 These are library-only numbers: no sockets are involved. Body events borrow the input buffer, so the 1 MiB cases measure one copy into the buffer plus framing.
 
