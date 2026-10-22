@@ -495,7 +495,7 @@ pub(crate) fn push_decimal<O: Output + ?Sized>(out: &mut O, n: u64) {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     use super::*;
 
