@@ -9,10 +9,11 @@ use crate::{
     head::{
         Asked, HeadKind, HeadScanner, Headers, ResponseHead, ResponseInfo, Scan, interpret_response,
     },
-    limits::Limits,
+    limits::{Limits, MAX_PIPELINE_DEPTH},
     message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
     method::Method,
     server::Progress,
+    syntax::find_byte,
 };
 
 /// The error for sending a body the server declined (a final status in
@@ -88,6 +89,151 @@ pub enum ClientEvent<'a> {
     Closed,
 }
 
+/// Opt-in tolerances for responses a strict client would refuse. All are
+/// off by default; requests are never parsed leniently.
+///
+/// - `obs_fold_in_responses`: replace each obsolete line fold in a response
+///   head (a field line continued on the next line, which begins with a
+///   space or tab) by overwriting the fold's CR and LF with spaces, as RFC
+///   9112 section 5.2 tells a user agent to do. The rewrite happens in
+///   place in the connection's buffer, so offsets do not move, views stay
+///   borrowed, and nothing is allocated. Whitespace before the first field
+///   is still refused.
+///
+/// Bare LF, bare CR, `Content-Length` with `Transfer-Encoding`, and
+/// whitespace before a colon are never tolerated: they are how messages
+/// get framed differently by different hops.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{ClientConn, ClientEvent, ClientLeniency, Request};
+///
+/// let mut conn = ClientConn::new();
+/// conn.set_leniency(ClientLeniency::new().with_obs_fold_in_responses(true));
+/// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+/// let _ = conn.feed(b"HTTP/1.1 200 OK\r\nX-Long: part one,\r\n part two\r\nContent-Length: 0\r\n\r\n");
+/// let ClientEvent::Response(resp) = conn.poll()? else { panic!() };
+/// assert_eq!(resp.header("x-long"), Some(&b"part one,   part two"[..]));
+/// # Ok::<(), http_net::HttpError>(())
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ClientLeniency {
+    /// Replace obs-folds in response fields with spaces instead of refusing
+    /// them with [`HttpError::ObsFold`].
+    pub obs_fold_in_responses: bool,
+}
+
+impl ClientLeniency {
+    /// Every tolerance off (the strict default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(!http_net::ClientLeniency::new().obs_fold_in_responses);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            obs_fold_in_responses: false,
+        }
+    }
+
+    /// Sets [`obs_fold_in_responses`](Self::obs_fold_in_responses).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let l = http_net::ClientLeniency::new().with_obs_fold_in_responses(true);
+    /// assert!(l.obs_fold_in_responses);
+    /// ```
+    #[must_use]
+    pub const fn with_obs_fold_in_responses(mut self, on: bool) -> Self {
+        self.obs_fold_in_responses = on;
+        self
+    }
+}
+
+/// The in-place obs-fold rewrite of one response head. It walks the head's
+/// line ends once, overall linear however the input is split, and tells the
+/// head scanner how much it may see: a line end whose next byte has not
+/// arrived is held back, because only that byte says whether the line is
+/// folded. The scanner therefore never completes a field line that is about
+/// to be continued.
+#[derive(Clone, Copy, Debug)]
+struct Unfold {
+    /// Where the search for the next LF resumes.
+    scan: usize,
+    /// Start of the line being examined.
+    line_start: usize,
+    /// The status line has ended (it is never folded).
+    past_status: bool,
+    /// The blank line that ends the head was seen.
+    done: bool,
+}
+
+impl Unfold {
+    const fn new() -> Self {
+        Self {
+            scan: 0,
+            line_start: 0,
+            past_status: false,
+            done: false,
+        }
+    }
+
+    /// Rewrites the folds found in `msg` (the head so far) and returns how
+    /// many of its bytes the head scanner may examine.
+    fn run(&mut self, msg: &mut [u8], eof: bool) -> usize {
+        if self.done {
+            return msg.len();
+        }
+        loop {
+            let Some(off) = msg.get(self.scan..).and_then(|rest| find_byte(b'\n', rest)) else {
+                self.scan = msg.len();
+                return msg.len();
+            };
+            let lf = self.scan + off;
+            if !self.past_status {
+                self.past_status = true;
+                self.line_start = lf + 1;
+                self.scan = lf + 1;
+                continue;
+            }
+            // line_start <= lf: it only ever moves to just past an LF.
+            let line = msg.get(self.line_start..lf).unwrap_or(&[]);
+            if line.is_empty() || line == b"\r" {
+                self.done = true;
+                return msg.len();
+            }
+            let crlf = lf > 0 && msg.get(lf - 1) == Some(&b'\r');
+            match msg.get(lf + 1) {
+                None if eof => {
+                    self.scan = msg.len();
+                    return msg.len();
+                }
+                None => {
+                    // Revisit this LF once its next byte arrives.
+                    self.scan = lf;
+                    return lf;
+                }
+                Some(&b) if crlf && (b == b' ' || b == b'\t') => {
+                    // RFC 9112 section 5.2: replace the fold with SP. The
+                    // line goes on, so its start stays where it was.
+                    msg[lf - 1] = b' ';
+                    msg[lf] = b' ';
+                    self.scan = lf + 1;
+                }
+                Some(_) => {
+                    self.line_start = lf + 1;
+                    self.scan = lf + 1;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Idle,
@@ -161,7 +307,69 @@ pub struct ClientConn {
     body_refused: bool,
     /// The request body was declared chunked (trailers allowed).
     req_chunked: bool,
+    /// The request being answered is idempotent (it may share the
+    /// connection with pipelined requests).
+    idempotent: bool,
+    /// Requests sent after the one being answered, in order: a fixed ring,
+    /// so pipelining allocates nothing after construction.
+    queue: [Queued; MAX_PIPELINE_DEPTH as usize],
+    queue_start: usize,
+    queued: usize,
+    leniency: ClientLeniency,
+    /// Where the obs-fold rewrite stopped in the current response head.
+    unfold: Unfold,
 }
+
+/// A pipelined request waiting for its response: what framing its response
+/// needs and whether it asked to close.
+#[derive(Clone, Copy, Debug)]
+struct Queued {
+    asked: Asked,
+    close: bool,
+}
+
+/// Writes the request line, fields, framing, and (for a full body) the body;
+/// returns how the rest of the body, if any, is to be written.
+fn write_request(request: &Request, out: &mut Vec<u8>) -> Result<ReqWrite, HttpError> {
+    let method = request.method_kind;
+    let expects_body = matches!(method, Method::Post | Method::Put | Method::Patch);
+    let (mut encoder, declared) = match &request.body {
+        OutBody::Full(b) if b.is_empty() && !expects_body => (Encoder::Discard, None),
+        OutBody::Full(b) => (
+            Encoder::Length {
+                remaining: b.len() as u64,
+            },
+            Some(b.len() as u64),
+        ),
+        OutBody::Length(n) => (Encoder::Length { remaining: *n }, Some(*n)),
+        OutBody::Chunked => (Encoder::Chunked, None),
+    };
+    out.extend_from_slice(request.method().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(request.target().as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    out.extend_from_slice(request.fields());
+    push_framing(out, encoder, declared);
+    if request.close {
+        out.extend_from_slice(b"connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    match &request.body {
+        OutBody::Full(b) => {
+            encoder.write(b, out)?;
+            Ok(ReqWrite::Sent)
+        }
+        _ => Ok(ReqWrite::Streaming(encoder)),
+    }
+}
+
+const NO_QUEUED: Queued = Queued {
+    asked: Asked {
+        head: false,
+        connect: false,
+    },
+    close: false,
+};
 
 impl Default for ClientConn {
     fn default() -> Self {
@@ -204,8 +412,31 @@ impl ClientConn {
     /// ```
     #[must_use]
     pub fn with_limits(limits: Limits) -> Self {
+        Self::from_buffer(Buffer::new(limits.buffer_capacity()), limits)
+    }
+
+    /// A connection enforcing `limits` that reads into `storage` (its
+    /// capacity is used up to [`Limits::buffer_capacity`], its contents are
+    /// ignored), for drivers that pool buffers. Give it back with
+    /// [`into_buffer`](Self::into_buffer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let conn = http_net::ClientConn::with_buffer(Vec::with_capacity(4096), http_net::Limits::new());
+    /// assert!(conn.into_buffer().capacity() >= 4096);
+    /// ```
+    #[must_use]
+    pub fn with_buffer(storage: Vec<u8>, limits: Limits) -> Self {
+        Self::from_buffer(
+            Buffer::with_storage(storage, limits.buffer_capacity()),
+            limits,
+        )
+    }
+
+    fn from_buffer(buf: Buffer, limits: Limits) -> Self {
         Self {
-            buf: Buffer::new(limits.buffer_capacity()),
+            buf,
             limits,
             scanner: HeadScanner::new(),
             trailers: HeadScanner::new(),
@@ -226,6 +457,12 @@ impl ClientConn {
             waiting_continue: false,
             body_refused: false,
             req_chunked: false,
+            idempotent: true,
+            queue: [NO_QUEUED; MAX_PIPELINE_DEPTH as usize],
+            queue_start: 0,
+            queued: 0,
+            leniency: ClientLeniency::new(),
+            unfold: Unfold::new(),
         }
     }
 
@@ -349,7 +586,7 @@ impl ClientConn {
                     "the connection is closed or upgraded",
                 ));
             }
-            _ => return Err(HttpError::InvalidState("a request is already outstanding")),
+            _ => return self.send_pipelined(request, out),
         }
         if !self.buf.unread().is_empty() {
             return Err(HttpError::UnexpectedData);
@@ -366,44 +603,78 @@ impl ClientConn {
             ));
         }
         let method = request.method_kind;
-        let expects_body = matches!(method, Method::Post | Method::Put | Method::Patch);
-        let (encoder, declared) = match &request.body {
-            OutBody::Full(b) if b.is_empty() && !expects_body => (Encoder::Discard, None),
-            OutBody::Full(b) => (
-                Encoder::Length {
-                    remaining: b.len() as u64,
-                },
-                Some(b.len() as u64),
-            ),
-            OutBody::Length(n) => (Encoder::Length { remaining: *n }, Some(*n)),
-            OutBody::Chunked => (Encoder::Chunked, None),
-        };
-        out.extend_from_slice(request.method().as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(request.target().as_bytes());
-        out.extend_from_slice(b" HTTP/1.1\r\n");
-        out.extend_from_slice(request.fields());
-        push_framing(out, encoder, declared);
-        if request.close {
-            out.extend_from_slice(b"connection: close\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
-        let mut encoder = encoder;
-        match &request.body {
-            OutBody::Full(b) => {
-                encoder.write(b, out)?;
-                self.req = ReqWrite::Sent;
-            }
-            _ => self.req = ReqWrite::Streaming(encoder),
-        }
+        self.req = write_request(request, out)?;
         self.asked = Asked {
             head: method == Method::Head,
             connect: method == Method::Connect,
         };
         self.upgrade_asked = request.upgrade;
         self.keep_alive = !request.close;
+        self.idempotent = method.is_idempotent();
         self.req_chunked = matches!(request.body, OutBody::Chunked);
         self.waiting_continue = request.expect_continue;
+        self.body_refused = false;
+        self.buf.unpin();
+        self.buf.pin_at_pos();
+        self.scanner.reset();
+        self.unfold = Unfold::new();
+        self.interim_bytes = 0;
+        self.interim_count = 0;
+        self.state = State::Head;
+        Ok(())
+    }
+
+    /// Sends `request` behind the ones already outstanding (pipelining).
+    fn send_pipelined(&mut self, request: &Request, out: &mut Vec<u8>) -> Result<(), HttpError> {
+        if !self.can_send() {
+            return Err(HttpError::InvalidState(
+                if self.limits.pipeline_depth() <= 1 {
+                    "a request is already outstanding (raise Limits::with_pipeline_depth to pipeline)"
+                } else {
+                    "pipelining needs room in the pipeline depth, idempotent requests, \
+                 every earlier body sent, and no close, upgrade, CONNECT, or expectation"
+                },
+            ));
+        }
+        if !request.has_host {
+            return Err(HttpError::MissingHost);
+        }
+        let method = request.method_kind;
+        if !method.is_idempotent()
+            || request.upgrade
+            || request.expect_continue
+            || !matches!(request.body, OutBody::Full(_))
+        {
+            return Err(HttpError::InvalidState(
+                "only idempotent requests with a full body and no upgrade or expectation \
+                 can be pipelined",
+            ));
+        }
+        let req = write_request(request, out)?;
+        debug_assert_eq!(req, ReqWrite::Sent);
+        let slot = (self.queue_start + self.queued) % self.queue.len();
+        self.queue[slot] = Queued {
+            asked: Asked {
+                head: method == Method::Head,
+                connect: false,
+            },
+            close: request.close,
+        };
+        self.queued += 1;
+        Ok(())
+    }
+
+    /// Starts on the response to the oldest queued request.
+    fn next_queued(&mut self) {
+        let next = self.queue[self.queue_start];
+        self.queue_start = (self.queue_start + 1) % self.queue.len();
+        self.queued -= 1;
+        self.asked = next.asked;
+        self.keep_alive = !next.close;
+        self.upgrade_asked = false;
+        self.idempotent = true;
+        self.req_chunked = false;
+        self.waiting_continue = false;
         self.body_refused = false;
         self.buf.unpin();
         self.buf.pin_at_pos();
@@ -411,7 +682,157 @@ impl ClientConn {
         self.interim_bytes = 0;
         self.interim_count = 0;
         self.state = State::Head;
-        Ok(())
+    }
+
+    /// Whether any outstanding request asked to close the connection.
+    fn closing(&self) -> bool {
+        !self.keep_alive
+            || (0..self.queued).any(|i| self.queue[(self.queue_start + i) % self.queue.len()].close)
+    }
+
+    /// The number of requests sent whose response has not completed:
+    /// 0 when idle, up to [`Limits::pipeline_depth`] when pipelining. After
+    /// the connection closed it is the number of requests that never got
+    /// a response (send them again on a new connection if they are safe to
+    /// repeat).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Limits, Request};
+    ///
+    /// let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+    /// let get = |p: &str| Request::get(p).header("host", "a");
+    /// let mut out = Vec::new();
+    /// conn.send_request(&get("/1"), &mut out)?;
+    /// conn.send_request(&get("/2"), &mut out)?;
+    /// assert_eq!(conn.outstanding(), 2);
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        match self.state {
+            State::Idle => 0,
+            State::Head | State::Interim | State::Body => 1 + self.queued,
+            State::Complete | State::Closed | State::Upgraded => self.queued,
+        }
+    }
+
+    /// Whether [`send_request`](Self::send_request) would accept another
+    /// request now. With no request outstanding: the connection is open
+    /// and nothing unsolicited is buffered. With requests outstanding
+    /// (pipelining): fewer than [`Limits::pipeline_depth`] are outstanding,
+    /// all of them are idempotent with their bodies fully sent, and none
+    /// asked to close, upgrade, `CONNECT`, or expect `100 Continue`. The new
+    /// request must also be idempotent with a full body (RFC 9112 section
+    /// 9.3.2: a client should not pipeline non-idempotent requests).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Limits, Request};
+    ///
+    /// let mut conn = ClientConn::new(); // depth 1: no pipelining
+    /// assert!(conn.can_send());
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// assert!(!conn.can_send());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn can_send(&self) -> bool {
+        match self.state {
+            State::Idle => self.buf.unread().is_empty() && !self.buf.is_eof(),
+            State::Closed | State::Upgraded => false,
+            State::Head | State::Interim | State::Body | State::Complete => {
+                self.outstanding() < usize::from(self.limits.pipeline_depth())
+                    && self.idempotent
+                    && self.req == ReqWrite::Sent
+                    && !self.closing()
+                    && !self.upgrade_asked
+                    && !self.asked.connect
+                    && !self.waiting_continue
+                    && !self.body_refused
+                    && !self.buf.is_eof()
+            }
+        }
+    }
+
+    /// Returns the connection to its initial state for a new socket,
+    /// keeping the buffer and field-index allocations and the limits and
+    /// reporting settings. Requests still outstanding are forgotten.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Progress, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// conn.reset();
+    /// assert_eq!(conn.progress(), Progress::Idle);
+    /// assert!(conn.can_send());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn reset(&mut self) {
+        self.buf.reset();
+        self.scanner.reset();
+        self.trailers.reset();
+        self.decoder = Decoder::new();
+        self.info = ResponseInfo::EMPTY;
+        self.asked = NO_QUEUED.asked;
+        self.upgrade_asked = false;
+        self.state = State::Idle;
+        self.req = ReqWrite::Sent;
+        self.keep_alive = true;
+        self.interim_bytes = 0;
+        self.interim_count = 0;
+        self.waiting_continue = false;
+        self.body_refused = false;
+        self.req_chunked = false;
+        self.idempotent = true;
+        self.queue_start = 0;
+        self.queued = 0;
+    }
+
+    /// Gives the input buffer's storage back, for a pool.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::ClientConn::new().into_buffer().capacity(), 0);
+    /// ```
+    #[must_use]
+    pub fn into_buffer(mut self) -> Vec<u8> {
+        self.buf.take_storage()
+    }
+
+    /// Frees the input buffer and the field indexes while no request is
+    /// outstanding and nothing is buffered. Returns whether memory was
+    /// released.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientEvent, Request};
+    ///
+    /// let mut conn = ClientConn::new();
+    /// conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = conn.feed(b"HTTP/1.1 204 No Content\r\n\r\n");
+    /// while !matches!(conn.poll()?, ClientEvent::Idle) {}
+    /// assert!(conn.shrink_idle());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn shrink_idle(&mut self) -> bool {
+        if self.state != State::Idle {
+            return false;
+        }
+        self.buf.unpin();
+        let freed = self.buf.shrink();
+        if freed {
+            self.scanner.fields = Vec::new();
+            self.trailers.fields = Vec::new();
+        }
+        freed
     }
 
     /// Writes body bytes of a streamed request.
@@ -560,9 +981,15 @@ impl ClientConn {
                 }
                 State::Body => return self.poll_body(),
                 State::Complete => {
-                    if self.reusable() {
+                    if self.reusable() && self.queued > 0 {
+                        // Pipelined: the next response is for the oldest
+                        // queued request, and may already be buffered.
+                        self.next_queued();
+                    } else if self.reusable() {
                         self.state = State::Idle;
                     } else {
+                        // Queued requests, if any, will get no response;
+                        // `outstanding()` says how many.
                         self.state = State::Closed;
                         return Ok(ClientEvent::Closed);
                     }
@@ -576,9 +1003,21 @@ impl ClientConn {
     fn poll_head(&mut self) -> Result<ClientEvent<'_>, HttpError> {
         loop {
             let start = self.buf.pin();
+            let visible = if self.leniency.obs_fold_in_responses {
+                let eof = self.buf.is_eof();
+                self.unfold.run(self.buf.tail_mut(start), eof)
+            } else {
+                self.buf.from(start).len()
+            };
+            let msg = self.buf.from(start);
             let progress = self
                 .scanner
-                .advance(self.buf.from(start), &self.limits, HeadKind::Response, true)
+                .advance(
+                    msg.get(..visible).unwrap_or(msg),
+                    &self.limits,
+                    HeadKind::Response,
+                    true,
+                )
                 .map_err(|e| self.fail(e))?;
             let len = match progress {
                 Scan::Partial if self.buf.is_eof() => {
@@ -654,6 +1093,7 @@ impl ClientConn {
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
+        self.unfold = Unfold::new();
     }
 
     fn reusable(&self) -> bool {
@@ -809,6 +1249,31 @@ impl ClientConn {
     /// ```
     pub fn set_report_trailers(&mut self, report: bool) {
         self.report_trailers = report;
+    }
+
+    /// Sets the opt-in tolerances for responses (see [`ClientLeniency`]);
+    /// the default is strict. Takes effect from the next response head.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, ClientLeniency, HttpError, Request};
+    ///
+    /// let folded = b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\nContent-Length: 0\r\n\r\n";
+    /// let mut strict = ClientConn::new();
+    /// strict.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = strict.feed(folded);
+    /// assert_eq!(strict.poll().unwrap_err(), HttpError::ObsFold);
+    ///
+    /// let mut lenient = ClientConn::new();
+    /// lenient.set_leniency(ClientLeniency::new().with_obs_fold_in_responses(true));
+    /// lenient.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())?;
+    /// let _ = lenient.feed(folded);
+    /// assert!(lenient.poll().is_ok());
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    pub fn set_leniency(&mut self, leniency: ClientLeniency) {
+        self.leniency = leniency;
     }
 
     /// Whether a request built with

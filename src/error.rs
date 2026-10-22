@@ -46,6 +46,11 @@ pub enum HttpError {
     InvalidVersion,
     /// The version is well formed but not HTTP/1.0 or HTTP/1.1. Answer 505.
     UnsupportedVersion,
+    /// The connection starts with the HTTP/2 connection preface
+    /// (`PRI * HTTP/2.0`, RFC 9113 section 3.4): a client speaking HTTP/2
+    /// with prior knowledge. Route the connection to an HTTP/2 engine if
+    /// the listener allows prior knowledge; otherwise answer 505 and close.
+    Http2Preface,
     /// A status code outside `100..=599`, or not three digits.
     InvalidStatus,
     /// The request line (or status line) exceeds
@@ -183,7 +188,7 @@ impl HttpError {
             Self::StartLineTooLong => Some(414),
             Self::HeadersTooLarge | Self::TooManyHeaders | Self::FieldLineTooLong => Some(431),
             Self::BodyTooLarge => Some(413),
-            Self::UnsupportedVersion => Some(505),
+            Self::UnsupportedVersion | Self::Http2Preface => Some(505),
             Self::UnsupportedTransferEncoding => Some(501),
             Self::InvalidStartLine
             | Self::InvalidMethod
@@ -300,6 +305,10 @@ impl fmt::Display for HttpError {
             Self::InvalidTarget => "invalid request target",
             Self::InvalidVersion => "invalid HTTP version: expected HTTP/DIGIT.DIGIT",
             Self::UnsupportedVersion => "unsupported HTTP version: only HTTP/1.0 and HTTP/1.1",
+            Self::Http2Preface => {
+                "HTTP/2 connection preface on an HTTP/1.1 connection: route it to an HTTP/2 \
+                 engine or answer 505"
+            }
             Self::InvalidStatus => "invalid status code: expected three digits in 100..=599",
             Self::StartLineTooLong => "start line exceeds the configured limit",
             Self::HeadersTooLarge => "header section exceeds the configured byte limit",
@@ -376,6 +385,7 @@ mod tests {
         HttpError::InvalidTarget,
         HttpError::InvalidVersion,
         HttpError::UnsupportedVersion,
+        HttpError::Http2Preface,
         HttpError::InvalidStatus,
         HttpError::StartLineTooLong,
         HttpError::HeadersTooLarge,

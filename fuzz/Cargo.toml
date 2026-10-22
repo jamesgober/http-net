@@ -60,3 +60,17 @@ path  = "fuzz_targets/builders.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "stateless_parse"
+path  = "fuzz_targets/stateless_parse.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "chunked_decoder"
+path  = "fuzz_targets/chunked_decoder.rs"
+test  = false
+doc   = false
+bench = false

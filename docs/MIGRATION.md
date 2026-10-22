@@ -5,6 +5,43 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.4 to 0.5
+
+### The HTTP/2 preface has its own error
+
+**What changed.** A connection that starts with the HTTP/2 connection
+preface (`PRI * HTTP/2.0` CRLF CRLF `SM` CRLF CRLF, RFC 9113 section 3.4) is
+refused with the new `HttpError::Http2Preface` instead of
+`UnsupportedVersion`. Both map to status 505, so an answer built with
+`Response::from_error` is unchanged. The check runs only before a
+connection's first request; an `HTTP/2.0` request line later on a
+connection is still `UnsupportedVersion`. While the first bytes of a
+connection could still be the preface, the connection waits for more
+input instead of parsing them.
+
+**What to do.** Nothing, unless you matched `UnsupportedVersion` to detect
+prior-knowledge HTTP/2: match `Http2Preface` (or call `is_h2_preface`
+before feeding the connection) and route to an HTTP/2 engine.
+
+### Added in 0.5
+
+- Client pipelining: `Limits::with_pipeline_depth`, `ClientConn::outstanding`,
+  `ClientConn::can_send` (the default depth of 1 keeps 0.4 behaviour).
+- Reuse and pooling on both connections: `reset`, `with_buffer`,
+  `into_buffer`, `shrink_idle`; `ServerConn::set_wipe` (off by default).
+- Spans and copied heads: `Span`, `FieldSpan`, `RawHead`, `RequestHead::raw`,
+  `ResponseHead::raw`, `RequestHead::copy_into`, `RequestHead::to_owned`,
+  `OwnedRequestHead`, `HeadFacts`.
+- Stateless parsers: `parse_request_head`, `parse_response_head`, `Parsed`,
+  `ParsedRequest`, `ParsedResponse`, `Asked`.
+- The Tier-3 writer: `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan`,
+  `ServerConn::write_head`, `respond_into`, `send_body_into`,
+  `end_body_into`; `Response::clear`.
+- `ChunkedDecoder` and `ChunkStep`.
+- `Request::forward_from`, `is_hop_by_hop`, `RequestHead::connection_options`.
+- `is_h2_preface`.
+- `ClientLeniency`, `ClientConn::set_leniency` (strict by default).
+
 ## 0.3 to 0.4
 
 Update the dependency:

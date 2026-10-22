@@ -104,34 +104,47 @@ extern crate alloc;
 
 mod body;
 mod buffer;
+mod chunked;
 mod client;
 mod date;
 mod error;
+mod forward;
 mod head;
 mod limits;
 mod message;
 mod method;
+mod preface;
+mod raw;
 mod redact;
 mod server;
 pub mod status;
 mod syntax;
+mod write;
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod blocking;
 
-pub use client::{ClientConn, ClientEvent};
+pub use chunked::{ChunkStep, ChunkedDecoder};
+pub use client::{ClientConn, ClientEvent, ClientLeniency};
 pub use date::{DateCache, HttpDate};
 pub use error::HttpError;
+pub use forward::is_hop_by_hop;
 pub use head::{
-    BodyFraming, HeaderValues, Headers, ListElements, RequestHead, ResponseHead, TargetForm,
-    Version,
+    Asked, BodyFraming, FieldSpan, HeaderValues, Headers, ListElements, RequestHead, ResponseHead,
+    Span, TargetForm, Version,
 };
 pub use limits::Limits;
 pub use message::{Request, Response};
 pub use method::{Method, MethodSet};
+pub use preface::is_h2_preface;
+pub use raw::{
+    HeadFacts, OwnedRequestHead, Parsed, ParsedRequest, ParsedResponse, RawHead,
+    parse_request_head, parse_response_head,
+};
 pub use server::{Progress, ServerConn, ServerEvent};
 pub use status::{StatusClass, reason_phrase, status_allows_body, status_class};
+pub use write::{BodyPlan, OutgoingBody, Output, ResponseHeadRef};
 
 /// The crate version, as published (`CARGO_PKG_VERSION`).
 ///
@@ -164,6 +177,7 @@ mod tests {
         assert::<crate::ServerConn>();
         assert::<crate::ServerEvent<'_>>();
         assert::<crate::ClientConn>();
+        assert::<crate::ClientLeniency>();
         assert::<crate::ClientEvent<'_>>();
         assert::<crate::Response>();
         assert::<crate::Request>();

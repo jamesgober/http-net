@@ -22,16 +22,38 @@ use crate::{
     },
 };
 
-/// An offset range into a message head.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Span {
-    start: u32,
-    end: u32,
+/// A byte range of a message head: `start..end`, as offsets into
+/// [`RawHead::bytes`](crate::RawHead::bytes) (or into the input of a
+/// stateless parser).
+///
+/// Offsets are `u32` because every budget in [`Limits`] is capped at
+/// 16 MiB, so a head can never be longer. Spans stay valid when the head
+/// bytes are moved or copied, which is what makes a head cheap to copy into
+/// a passport ([`RequestHead::copy_into`]).
+///
+/// # Examples
+///
+/// ```
+/// use http_net::Span;
+///
+/// let head = b"GET / HTTP/1.1\r\n";
+/// let method = Span { start: 0, end: 3 };
+/// assert_eq!(method.get(head), b"GET");
+/// assert_eq!(method.len(), 3);
+/// // Out of range: an empty slice, never a panic.
+/// assert_eq!(Span { start: 10, end: 99 }.get(head), b"");
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Span {
+    /// The first byte.
+    pub start: u32,
+    /// One past the last byte.
+    pub end: u32,
 }
 
 impl Span {
     #[inline]
-    fn new(start: usize, end: usize) -> Self {
+    pub(crate) fn new(start: usize, end: usize) -> Self {
         // Offsets are bounded by the buffer capacity, which `Limits` keeps
         // far below `u32::MAX`.
         Self {
@@ -40,18 +62,134 @@ impl Span {
         }
     }
 
+    /// The bytes of `head` the span covers; empty when the span lies
+    /// outside `head` or is reversed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let span = http_net::Span { start: 4, end: 5 };
+    /// assert_eq!(span.get(b"GET / HTTP/1.1"), b"/");
+    /// ```
     #[inline]
-    pub(crate) fn get<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
-        buf.get(self.start as usize..self.end as usize)
+    #[must_use]
+    pub fn get<'b>(&self, head: &'b [u8]) -> &'b [u8] {
+        head.get(self.start as usize..self.end as usize)
             .unwrap_or(&[])
+    }
+
+    /// The span's length in bytes (0 for a reversed span).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(http_net::Span { start: 2, end: 7 }.len(), 5);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Whether the span covers no bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(http_net::Span::default().is_empty());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the span lies inside a head of `len` bytes, in order.
+    pub(crate) const fn fits(&self, len: usize) -> bool {
+        self.start <= self.end && (self.end as usize) <= len
     }
 }
 
-/// One field line: name and (OWS-trimmed) value.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Field {
-    name: Span,
-    value: Span,
+/// One field line of a head: the name's span and the value's span (the
+/// value without surrounding whitespace), as offsets into the head bytes.
+///
+/// # Examples
+///
+/// ```
+/// use http_net::{ServerConn, ServerEvent};
+///
+/// let mut conn = ServerConn::new();
+/// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost:  a \r\n\r\n");
+/// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+/// let raw = req.raw();
+/// let host = raw.fields()[0];
+/// assert_eq!(host.name.get(raw.bytes()), b"Host");
+/// assert_eq!(host.value.get(raw.bytes()), b"a");
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FieldSpan {
+    /// The field name, as received.
+    pub name: Span,
+    /// The field value, without leading or trailing whitespace.
+    pub value: Span,
+}
+
+/// The connections' own name for a field record.
+pub(crate) type Field = FieldSpan;
+
+/// Where scanned field records go: the connection's reusable vector, a
+/// caller's slice (the stateless parsers, which allocate nothing), or
+/// nowhere (trailers that are validated and discarded).
+pub(crate) trait FieldSink {
+    fn put(&mut self, field: Field) -> Result<(), HttpError>;
+}
+
+impl FieldSink for Vec<Field> {
+    #[inline]
+    fn put(&mut self, field: Field) -> Result<(), HttpError> {
+        self.push(field);
+        Ok(())
+    }
+}
+
+/// Validates fields without keeping them.
+pub(crate) struct Discard;
+
+impl FieldSink for Discard {
+    #[inline]
+    fn put(&mut self, _field: Field) -> Result<(), HttpError> {
+        Ok(())
+    }
+}
+
+/// Fills a caller's slice; a field that does not fit is `TooManyHeaders`.
+pub(crate) struct SliceSink<'s> {
+    slots: &'s mut [Field],
+    len: usize,
+}
+
+impl<'s> SliceSink<'s> {
+    pub(crate) fn new(slots: &'s mut [Field]) -> Self {
+        Self { slots, len: 0 }
+    }
+
+    /// The slice back, and how many records were written to its front.
+    pub(crate) fn into_parts(self) -> (&'s mut [Field], usize) {
+        (self.slots, self.len)
+    }
+}
+
+impl FieldSink for SliceSink<'_> {
+    #[inline]
+    fn put(&mut self, field: Field) -> Result<(), HttpError> {
+        let slot = self
+            .slots
+            .get_mut(self.len)
+            .ok_or(HttpError::TooManyHeaders)?;
+        *slot = field;
+        self.len += 1;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,18 +241,67 @@ pub(crate) fn find_line(
 }
 
 /// Resumable scanner over a head (start line plus field lines) or a trailer
-/// section (field lines only).
+/// section (field lines only), keeping its fields in a reusable vector.
 pub(crate) struct HeadScanner {
+    lines: LineScan,
+    pub(crate) fields: Vec<Field>,
+}
+
+impl HeadScanner {
+    pub(crate) const fn new() -> Self {
+        Self {
+            lines: LineScan::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Prepares for the next message; keeps the field vector's allocation.
+    pub(crate) fn reset(&mut self) {
+        self.lines = LineScan::new();
+        self.fields.clear();
+    }
+
+    /// Fields scanned in the current section, stored or not.
+    pub(crate) fn field_count(&self) -> usize {
+        self.lines.count
+    }
+
+    pub(crate) fn start_line(&self) -> Span {
+        self.lines.start_line()
+    }
+
+    /// Scans `msg` (the bytes from the message start to the end of input).
+    /// With `store` the fields are kept in [`fields`](Self::fields);
+    /// otherwise they are validated and counted only.
+    #[inline]
+    pub(crate) fn advance(
+        &mut self,
+        msg: &[u8],
+        limits: &Limits,
+        kind: HeadKind,
+        store: bool,
+    ) -> Result<Scan, HttpError> {
+        if store {
+            self.lines.advance(msg, limits, kind, &mut self.fields)
+        } else {
+            self.lines.advance(msg, limits, kind, &mut Discard)
+        }
+    }
+}
+
+/// The line-by-line state of a head scan: where the search stopped and
+/// what has been counted. Shared by the connections and the stateless
+/// parsers; the fields go to a [`FieldSink`].
+pub(crate) struct LineScan {
     scan: usize,
     line_start: usize,
     start_line: Option<Span>,
     skipped: usize,
     field_bytes: usize,
     count: usize,
-    pub(crate) fields: Vec<Field>,
 }
 
-impl HeadScanner {
+impl LineScan {
     pub(crate) const fn new() -> Self {
         Self {
             scan: 0,
@@ -123,32 +310,21 @@ impl HeadScanner {
             skipped: 0,
             field_bytes: 0,
             count: 0,
-            fields: Vec::new(),
         }
-    }
-
-    /// Prepares for the next message; keeps the field vector's allocation.
-    pub(crate) fn reset(&mut self) {
-        self.scan = 0;
-        self.line_start = 0;
-        self.start_line = None;
-        self.skipped = 0;
-        self.field_bytes = 0;
-        self.count = 0;
-        self.fields.clear();
     }
 
     pub(crate) fn start_line(&self) -> Span {
         self.start_line.unwrap_or_default()
     }
 
-    /// Scans `msg` (the bytes from the message start to the end of input).
-    pub(crate) fn advance(
+    /// Scans `msg` (the bytes from the message start to the end of input),
+    /// handing each validated field to `sink`.
+    pub(crate) fn advance<S: FieldSink>(
         &mut self,
         msg: &[u8],
         limits: &Limits,
         kind: HeadKind,
-        store: bool,
+        sink: &mut S,
     ) -> Result<Scan, HttpError> {
         let (section_bytes, section_fields) = if kind == HeadKind::Trailer {
             (limits.max_trailer_bytes(), limits.max_trailer_fields())
@@ -211,14 +387,16 @@ impl HeadScanner {
             }
             let field = parse_field(line, start)?;
             self.count += 1;
-            if store {
-                self.fields.push(field);
-            }
+            sink.put(field)?;
         }
     }
 }
 
 /// Validates one field line (`line` starts at offset `base` in the head).
+// Forced inline: the scanner is compiled once per field sink, and without
+// it this per-field call stays out of line (about 8% on the head
+// benchmark, 12% on client response parsing).
+#[inline(always)]
 fn parse_field(line: &[u8], base: usize) -> Result<Field, HttpError> {
     if line.first().is_some_and(|&b| is_ows(b)) {
         return Err(HttpError::ObsFold);
@@ -369,7 +547,7 @@ pub(crate) fn protocol_matches(chosen: &[u8], element: &[u8]) -> bool {
             .is_some_and(|i| element[..i].eq_ignore_ascii_case(chosen))
 }
 
-fn parse_version(v: &[u8]) -> Result<Version, HttpError> {
+pub(crate) fn parse_version(v: &[u8]) -> Result<Version, HttpError> {
     match v {
         [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
             if major.is_ascii_digit() && minor.is_ascii_digit() =>
@@ -492,12 +670,14 @@ fn transfer_framing(
     Ok(Some(BodyFraming::Chunked))
 }
 
-/// Everything learned from a request head.
-#[derive(Clone, Copy, Debug)]
+/// Everything learned from a request head. Spans are offsets into the head
+/// bytes, so the facts stay valid when the bytes are copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RequestInfo {
     pub(crate) method: Method,
-    method_span: Span,
-    target: Span,
+    pub(crate) start_line: Span,
+    pub(crate) method_span: Span,
+    pub(crate) target: Span,
     target_form: TargetForm,
     pub(crate) version: Version,
     pub(crate) framing: BodyFraming,
@@ -506,17 +686,18 @@ pub(crate) struct RequestInfo {
     pub(crate) upgrade: bool,
     pub(crate) expect_continue: bool,
     unknown_expectation: bool,
-    host: Option<Span>,
+    pub(crate) host: Option<Span>,
     /// The authority of an absolute-form target, which replaces `Host`.
-    authority: Option<Span>,
+    pub(crate) authority: Option<Span>,
     /// The path-and-query part of the target: the whole target except for
     /// the absolute form, where it is what follows the authority.
-    origin: Span,
+    pub(crate) origin: Span,
 }
 
 impl RequestInfo {
     pub(crate) const EMPTY: Self = Self {
         method: Method::Get,
+        start_line: Span { start: 0, end: 0 },
         method_span: Span { start: 0, end: 0 },
         target: Span { start: 0, end: 0 },
         target_form: TargetForm::Origin,
@@ -657,6 +838,7 @@ pub(crate) fn interpret_request(
     };
     Ok(RequestInfo {
         method,
+        start_line: start,
         method_span: Span::new(base, base + sp1),
         target: target_span,
         target_form,
@@ -668,11 +850,11 @@ pub(crate) fn interpret_request(
         // An offer of only `h2c` is no offer: the request is served as
         // HTTP/1.1 (RFC 9113 section 3.1).
         upgrade: version == Version::Http11 && facts.upgrade_token && facts.upgrade_offer,
-        // RFC 9110 section 10.1.1: ignored in HTTP/1.0, and meaningless
-        // without a body to wait for.
         // Reported for any version, so the caller can answer 417 (RFC 9110
         // section 10.1.1 MAY); it never changes framing.
         unknown_expectation: facts.expect_other,
+        // RFC 9110 section 10.1.1: ignored in HTTP/1.0, and meaningless
+        // without a body to wait for.
         expect_continue: version == Version::Http11
             && facts.expect_continue
             && framing != BodyFraming::None,
@@ -683,9 +865,10 @@ pub(crate) fn interpret_request(
 }
 
 /// Everything learned from a response head.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResponseInfo {
     pub(crate) status: u16,
+    pub(crate) start_line: Span,
     reason: Span,
     pub(crate) version: Version,
     pub(crate) framing: BodyFraming,
@@ -697,6 +880,7 @@ pub(crate) struct ResponseInfo {
 impl ResponseInfo {
     pub(crate) const EMPTY: Self = Self {
         status: 0,
+        start_line: Span { start: 0, end: 0 },
         reason: Span { start: 0, end: 0 },
         version: Version::Http11,
         framing: BodyFraming::None,
@@ -706,11 +890,25 @@ impl ResponseInfo {
     };
 }
 
-/// What the client asked for, which decides how the response is framed.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Asked {
-    pub(crate) head: bool,
-    pub(crate) connect: bool,
+/// What the request asked for, which decides how its response is framed
+/// (RFC 9112 section 6.3): a response to `HEAD` has no body whatever its
+/// fields say, and a 2xx to `CONNECT` turns the connection into a tunnel.
+/// The input to [`parse_response_head`](crate::parse_response_head).
+///
+/// # Examples
+///
+/// ```
+/// use http_net::Asked;
+///
+/// let after_head = Asked { head: true, ..Asked::default() };
+/// assert!(after_head.head && !after_head.connect);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Asked {
+    /// The request was `HEAD`.
+    pub head: bool,
+    /// The request was `CONNECT`.
+    pub connect: bool,
 }
 
 pub(crate) fn interpret_response(
@@ -772,6 +970,7 @@ pub(crate) fn interpret_response(
         };
     Ok(ResponseInfo {
         status,
+        start_line: start,
         reason: Span::new(base + reason_start, base + line.len()),
         version,
         framing,
@@ -1023,6 +1222,12 @@ pub struct RequestHead<'a> {
 impl<'a> RequestHead<'a> {
     pub(crate) const fn new(head: &'a [u8], fields: &'a [Field], info: &'a RequestInfo) -> Self {
         Self { head, fields, info }
+    }
+
+    /// The bytes the spans index (the head, possibly followed by more
+    /// input), the field records, and the interpreted facts.
+    pub(crate) const fn parts(&self) -> (&'a [u8], &'a [Field], &'a RequestInfo) {
+        (self.head, self.fields, self.info)
     }
 
     /// The method, classified.
@@ -1428,6 +1633,27 @@ impl<'a> RequestHead<'a> {
         list
     }
 
+    /// The options the request's `Connection` field lists, across every
+    /// `Connection` line, in order (`close`, `keep-alive`, `upgrade`, and the
+    /// names of fields that are hop-by-hop for this message). Compare them
+    /// ASCII case-insensitively. A proxy passes them to
+    /// [`is_hop_by_hop`](crate::is_hop_by_hop).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http_net::{ServerConn, ServerEvent};
+    /// # let mut conn = ServerConn::new();
+    /// # let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, X-Trace\r\n\r\n");
+    /// # let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// let options: Vec<&[u8]> = req.connection_options().collect();
+    /// assert_eq!(options, [&b"keep-alive"[..], b"X-Trace"]);
+    /// ```
+    #[must_use]
+    pub fn connection_options(&self) -> ListElements<'a, 'static> {
+        list_values(self.head, self.fields, "connection")
+    }
+
     /// The elements of a comma-separated list field (`#rule`, RFC 9110
     /// section 5.6.1) across every line with this name, in order, trimmed
     /// of whitespace, empty elements skipped. A comma inside a quoted
@@ -1497,6 +1723,11 @@ pub struct ResponseHead<'a> {
 impl<'a> ResponseHead<'a> {
     pub(crate) const fn new(head: &'a [u8], fields: &'a [Field], info: &'a ResponseInfo) -> Self {
         Self { head, fields, info }
+    }
+
+    /// As [`RequestHead::parts`], for a response.
+    pub(crate) const fn parts(&self) -> (&'a [u8], &'a [Field], &'a ResponseInfo) {
+        (self.head, self.fields, self.info)
     }
 
     /// The status code (`100..=599`).

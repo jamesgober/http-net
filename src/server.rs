@@ -11,10 +11,15 @@ use crate::{
         HeadKind, HeadScanner, Headers, RequestHead, RequestInfo, Scan, Version, interpret_request,
     },
     limits::Limits,
-    message::{OutBody, Response, check_trailers, push_last_chunk_with_trailers},
+    message::{
+        OutBody, Response, check_response_field, check_trailers, check_upgrade_protocol,
+        push_last_chunk_with_trailers, write_field,
+    },
     method::Method,
+    preface::is_h2_preface,
     status::reason_phrase,
     syntax::push_decimal,
+    write::{BodyPlan, OutgoingBody, Output, ResponseHeadRef},
 };
 
 /// What a [`ServerConn`] has for the caller after [`poll`](ServerConn::poll).
@@ -195,6 +200,9 @@ pub struct ServerConn {
     resp_chunked: bool,
     report_trailers: bool,
     requests_served: u64,
+    /// The connection has not yet shown whether it starts with the HTTP/2
+    /// preface (checked once, before the first request only).
+    preface_undecided: bool,
 }
 
 impl Default for ServerConn {
@@ -241,7 +249,35 @@ impl ServerConn {
     /// ```
     #[must_use]
     pub fn with_limits(limits: Limits) -> Self {
-        let mut buf = Buffer::new(limits.buffer_capacity());
+        Self::from_buffer(Buffer::new(limits.buffer_capacity()), limits)
+    }
+
+    /// A connection enforcing `limits` that reads into `storage`, for
+    /// drivers that pool buffers: its capacity is used up to
+    /// [`Limits::buffer_capacity`], its contents are ignored. Give it back
+    /// with [`into_buffer`](Self::into_buffer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Limits, ServerConn, ServerEvent};
+    ///
+    /// let pooled: Vec<u8> = Vec::with_capacity(8192);
+    /// let mut conn = ServerConn::with_buffer(pooled, Limits::new());
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// let back = conn.into_buffer();
+    /// assert!(back.capacity() >= 8192);
+    /// ```
+    #[must_use]
+    pub fn with_buffer(storage: Vec<u8>, limits: Limits) -> Self {
+        Self::from_buffer(
+            Buffer::with_storage(storage, limits.buffer_capacity()),
+            limits,
+        )
+    }
+
+    fn from_buffer(mut buf: Buffer, limits: Limits) -> Self {
         buf.pin_at_pos();
         Self {
             buf,
@@ -259,6 +295,7 @@ impl ServerConn {
             resp_chunked: false,
             report_trailers: false,
             requests_served: 0,
+            preface_undecided: true,
         }
     }
 
@@ -388,6 +425,19 @@ impl ServerConn {
 
     fn poll_head(&mut self) -> Result<ServerEvent<'_>, HttpError> {
         let start = self.buf.pin();
+        if self.preface_undecided {
+            // RFC 9113 section 3.4: prior-knowledge HTTP/2 starts the
+            // connection with a fixed preface. Decide before the head is
+            // scanned (its first 18 bytes are a complete HTTP/1.1-shaped
+            // head), and wait while the input could still be the preface, so
+            // the answer does not depend on how the bytes arrived.
+            match is_h2_preface(self.buf.from(start)) {
+                Some(true) => return Err(self.fail(HttpError::Http2Preface)),
+                Some(false) => self.preface_undecided = false,
+                None if self.buf.is_eof() => self.preface_undecided = false,
+                None => return Ok(ServerEvent::NeedInput),
+            }
+        }
         let msg = self.buf.from(start);
         let progress = self
             .scanner
@@ -457,6 +507,7 @@ impl ServerConn {
     }
 
     fn next_exchange(&mut self) {
+        self.buf.wipe_consumed();
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
@@ -829,15 +880,140 @@ impl ServerConn {
         self.report_trailers = report;
     }
 
-    pub(crate) fn respond_dated(
+    /// Returns the connection to its initial state for a new socket,
+    /// keeping the buffer and field-index allocations (and the limits,
+    /// [`set_report_trailers`](Self::set_report_trailers), and
+    /// [`set_wipe`](Self::set_wipe) settings). Everything per connection
+    /// starts over: buffered input, the request in progress, keep-alive
+    /// (allowed again), and the request count. With wiping on, the whole
+    /// buffer is zeroed first.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Progress, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET /next");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// conn.reset(); // the socket closed; reuse the object for the next one
+    /// assert_eq!(conn.progress(), Progress::Idle);
+    /// assert!(conn.remaining_input().is_empty());
+    /// ```
+    pub fn reset(&mut self) {
+        self.buf.reset();
+        self.buf.pin_at_pos();
+        self.scanner.reset();
+        self.trailers.reset();
+        self.decoder = Decoder::new();
+        self.info = RequestInfo::EMPTY;
+        self.state = ReqState::Head;
+        self.resp = RespState::Idle;
+        self.keep_alive = false;
+        self.allow_keep_alive = true;
+        self.continue_sent = false;
+        self.body_seen = false;
+        self.resp_chunked = false;
+        self.requests_served = 0;
+        self.preface_undecided = true;
+    }
+
+    /// Gives the input buffer's storage back (for a pool), wiped first when
+    /// [`set_wipe`](Self::set_wipe) is on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let conn = http_net::ServerConn::new();
+    /// assert_eq!(conn.into_buffer().capacity(), 0); // nothing was ever buffered
+    /// ```
+    #[must_use]
+    pub fn into_buffer(mut self) -> Vec<u8> {
+        self.buf.take_storage()
+    }
+
+    /// Frees the input buffer and the field indexes while the connection is
+    /// idle between requests with nothing buffered, so thousands of idle
+    /// keep-alive connections cost only their struct size. Returns whether
+    /// memory was released; the next input allocates again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{Response, ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+    /// assert!(!conn.shrink_idle()); // a request is in progress
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::RequestEnd));
+    /// conn.respond(&Response::new(204), &mut Vec::new()).unwrap();
+    /// assert!(matches!(conn.poll().unwrap(), ServerEvent::NeedInput));
+    /// assert!(conn.shrink_idle());
+    /// ```
+    pub fn shrink_idle(&mut self) -> bool {
+        if self.progress() != Progress::Idle || self.state != ReqState::Head {
+            return false;
+        }
+        self.buf.unpin();
+        let freed = self.buf.shrink();
+        self.buf.pin_at_pos();
+        if freed {
+            self.scanner.fields = Vec::new();
+            self.trailers.fields = Vec::new();
+        }
+        freed
+    }
+
+    /// When `true`, the bytes of every finished request (head, body, and
+    /// framing) are zeroed before the buffer is reused, stale copies left by
+    /// compaction are zeroed, and the whole buffer is zeroed on
+    /// [`reset`](Self::reset), [`into_buffer`](Self::into_buffer), and drop,
+    /// so credentials do not linger in memory between requests. Costs a
+    /// `memset` of each request's bytes (about 30 to 60 ns for 2 KiB, an
+    /// estimate). Off by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut conn = http_net::ServerConn::new();
+    /// conn.set_wipe(true);
+    /// ```
+    pub fn set_wipe(&mut self, wipe: bool) {
+        self.buf.set_wipe(wipe);
+    }
+
+    #[inline]
+    pub(crate) fn respond_dated<O: Output + ?Sized>(
         &mut self,
         response: &Response,
         date: Option<&[u8]>,
-        out: &mut Vec<u8>,
+        out: &mut O,
     ) -> Result<(), HttpError> {
-        if let Some(e) = response.error() {
-            return Err(e);
+        let plan = self.start_response(response, date, out)?;
+        if plan == BodyPlan::Raw {
+            if let OutBody::Full(body) = &response.body {
+                out.put(body);
+            }
         }
+        Ok(())
+    }
+
+    /// Validates and writes a response head, and moves the connection to
+    /// the state it implies: the one code path behind `respond`,
+    /// `respond_into`, and `write_head`. Nothing is written on error.
+    // Forced inline: called from several entry points, it otherwise stays
+    // out of line and `respond` measured about 7% slower than in 0.4.
+    #[inline(always)]
+    pub(crate) fn start_response<S: HeadSource + ?Sized, O: Output + ?Sized>(
+        &mut self,
+        spec: &S,
+        date: Option<&[u8]>,
+        out: &mut O,
+    ) -> Result<BodyPlan, HttpError> {
+        // Builder errors (a Response) or field errors (a borrowed head)
+        // come first, as when a Response is written.
+        let has_date = spec.check()?;
         let failed = self.state == ReqState::Failed;
         match self.state {
             ReqState::Body | ReqState::Complete | ReqState::Failed => {}
@@ -851,9 +1027,14 @@ impl ServerConn {
         if self.resp != RespState::Idle {
             return Err(HttpError::InvalidState("a response was already started"));
         }
-        let status = response.status();
+        let (status, body, upgrade) = (spec.status(), spec.body(), spec.upgrade());
         if !(100..=599).contains(&status) || ((100..200).contains(&status) && status != 101) {
             return Err(HttpError::InvalidStatus);
+        }
+        if upgrade.is_some() && status != 101 {
+            return Err(HttpError::InvalidState(
+                "an upgrade protocol needs status 101",
+            ));
         }
         let (method, version) = if failed {
             (Method::Get, Version::Http11)
@@ -862,16 +1043,13 @@ impl ServerConn {
         };
         let bodiless = (100..200).contains(&status) || status == 204 || status == 304;
         let tunnel = status == 101 || (method == Method::Connect && (200..300).contains(&status));
-        if bodiless || tunnel {
-            let empty = matches!(&response.body, OutBody::Full(b) if b.is_empty());
-            if !empty {
-                return Err(HttpError::BodyNotAllowed);
-            }
+        if (bodiless || tunnel) && !matches!(body, OutgoingBody::Empty | OutgoingBody::Full(0)) {
+            return Err(HttpError::BodyNotAllowed);
         }
         if tunnel {
             let complete_upgrade =
                 self.body_read() && (self.info.upgrade || method == Method::Connect);
-            if !complete_upgrade || (status == 101 && !response.upgrade) || failed {
+            if !complete_upgrade || (status == 101 && upgrade.is_none()) || failed {
                 return Err(HttpError::InvalidState(
                     "101 (or 2xx to CONNECT) must answer a complete upgrade request; \
                      build it with Response::switching_protocols",
@@ -879,77 +1057,116 @@ impl ServerConn {
             }
             // RFC 9110 section 7.8: never switch to a protocol the client
             // did not offer.
-            if status == 101
-                && !response
-                    .upgrade_protocol()
-                    .is_some_and(|p| self.view().offers(p))
-            {
+            if status == 101 && !upgrade.is_some_and(|p| self.view().offers(p)) {
                 return Err(HttpError::UpgradeNotOffered);
             }
         }
 
         let mut close = failed
-            || response.close
+            || spec.close()
             || !self.keep_alive
             || !self.allow_keep_alive
             || !self.body_read();
         let head_only = method == Method::Head || bodiless || tunnel;
-        self.resp_chunked = matches!(response.body, OutBody::Chunked);
-        let (mut encoder, declared) = match &response.body {
-            OutBody::Full(b) => (
-                Encoder::Length {
-                    remaining: b.len() as u64,
-                },
-                Some(b.len() as u64),
-            ),
-            OutBody::Length(n) => (Encoder::Length { remaining: *n }, Some(*n)),
-            OutBody::Chunked if version == Version::Http10 => {
+        self.resp_chunked = body == OutgoingBody::Chunked;
+        let (mut encoder, declared) = match body {
+            OutgoingBody::Empty => (Encoder::Length { remaining: 0 }, Some(0)),
+            OutgoingBody::Full(n) | OutgoingBody::Length(n) => {
+                (Encoder::Length { remaining: n }, Some(n))
+            }
+            OutgoingBody::Chunked if version == Version::Http10 => {
                 close = true;
                 (Encoder::CloseDelimited, None)
             }
-            OutBody::Chunked => (Encoder::Chunked, None),
+            OutgoingBody::Chunked => (Encoder::Chunked, None),
         };
 
-        out.extend_from_slice(b"HTTP/1.1 ");
+        out.put(b"HTTP/1.1 ");
         push_decimal(out, u64::from(status));
-        out.push(b' ');
-        out.extend_from_slice(reason_phrase(status).as_bytes());
-        out.extend_from_slice(b"\r\n");
+        out.put(b" ");
+        out.put(reason_phrase(status).as_bytes());
+        out.put(b"\r\n");
         if !(bodiless || tunnel) {
             push_framing(out, encoder, declared);
         }
         if tunnel {
             close = false;
         } else if close {
-            out.extend_from_slice(b"connection: close\r\n");
+            out.put(b"connection: close\r\n");
         } else if version == Version::Http10 {
-            out.extend_from_slice(b"connection: keep-alive\r\n");
+            out.put(b"connection: keep-alive\r\n");
         }
-        if let Some(date) = date.filter(|_| !response.has_date) {
-            out.extend_from_slice(b"date: ");
-            out.extend_from_slice(date);
-            out.extend_from_slice(b"\r\n");
+        if let Some(date) = date.filter(|_| !has_date) {
+            out.put(b"date: ");
+            out.put(date);
+            out.put(b"\r\n");
         }
-        out.extend_from_slice(response.fields());
-        out.extend_from_slice(b"\r\n");
+        spec.write_fields(out);
+        out.put(b"\r\n");
 
         if head_only {
             encoder = Encoder::Discard;
         }
         self.keep_alive = !close;
-        match &response.body {
-            OutBody::Full(b) => {
-                encoder.write(b, out)?;
+        let plan = match body {
+            OutgoingBody::Empty | OutgoingBody::Full(_) => {
                 self.resp = RespState::Sent;
                 self.requests_served += 1;
+                match body {
+                    OutgoingBody::Full(n) if n > 0 && !head_only => BodyPlan::Raw,
+                    _ => BodyPlan::None,
+                }
             }
-            _ => self.resp = RespState::Streaming(encoder),
-        }
+            OutgoingBody::Length(_) | OutgoingBody::Chunked => {
+                self.resp = RespState::Streaming(encoder);
+                BodyPlan::Stream
+            }
+        };
         if tunnel {
             self.state = ReqState::Upgraded;
         } else if failed {
             self.state = ReqState::Closed;
         }
+        Ok(plan)
+    }
+
+    /// Body bytes of a streamed response, into any output.
+    pub(crate) fn stream_body<O: Output + ?Sized>(
+        &mut self,
+        data: &[u8],
+        out: &mut O,
+    ) -> Result<(), HttpError> {
+        match &mut self.resp {
+            RespState::Streaming(encoder) => encoder.write(data, out),
+            _ => Err(HttpError::InvalidState("no streamed response in progress")),
+        }
+    }
+
+    /// The end of a streamed response, with optional trailers, into any
+    /// output.
+    pub(crate) fn finish_body<O: Output + ?Sized>(
+        &mut self,
+        trailers: &[(&str, &[u8])],
+        out: &mut O,
+    ) -> Result<(), HttpError> {
+        let RespState::Streaming(encoder) = &mut self.resp else {
+            return Err(HttpError::InvalidState("no streamed response in progress"));
+        };
+        if !trailers.is_empty() && !self.resp_chunked {
+            return Err(HttpError::TrailerNotAllowed);
+        }
+        match encoder {
+            Encoder::Chunked => push_last_chunk_with_trailers(out, trailers)?,
+            _ => {
+                check_trailers(trailers)?;
+                encoder.finish(out)?;
+            }
+        }
+        if *encoder == Encoder::CloseDelimited {
+            self.keep_alive = false;
+        }
+        self.resp = RespState::Sent;
+        self.requests_served += 1;
         Ok(())
     }
 
@@ -1030,10 +1247,7 @@ impl ServerConn {
     /// assert!(out.ends_with(b"7\r\nline 1\n\r\n0\r\n\r\n"));
     /// ```
     pub fn send_body(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), HttpError> {
-        match &mut self.resp {
-            RespState::Streaming(encoder) => encoder.write(data, out),
-            _ => Err(HttpError::InvalidState("no streamed response in progress")),
-        }
+        self.stream_body(data, out)
     }
 
     /// Ends a streamed response body (the last chunk for chunked encoding).
@@ -1106,25 +1320,109 @@ impl ServerConn {
         trailers: &[(&str, &[u8])],
         out: &mut Vec<u8>,
     ) -> Result<(), HttpError> {
-        let RespState::Streaming(encoder) = &mut self.resp else {
-            return Err(HttpError::InvalidState("no streamed response in progress"));
-        };
-        if !trailers.is_empty() && !self.resp_chunked {
-            return Err(HttpError::TrailerNotAllowed);
+        self.finish_body(trailers, out)
+    }
+}
+
+/// A response head to write: a [`Response`], whose fields its builder
+/// already serialized and checked, or a
+/// [`ResponseHeadRef`](crate::ResponseHeadRef), whose borrowed fields are
+/// checked here. `start_response` is generic over it, so each source gets
+/// its own compiled path with no runtime dispatch.
+pub(crate) trait HeadSource {
+    fn status(&self) -> u16;
+    fn body(&self) -> OutgoingBody;
+    fn close(&self) -> bool;
+    /// The protocol of a 101.
+    fn upgrade(&self) -> Option<&[u8]>;
+    /// Validates what the builder did not: returns whether a `date` field
+    /// is set.
+    fn check(&self) -> Result<bool, HttpError>;
+    fn write_fields<O: Output + ?Sized>(&self, out: &mut O);
+}
+
+impl HeadSource for Response {
+    #[inline]
+    fn status(&self) -> u16 {
+        Response::status(self)
+    }
+
+    #[inline]
+    fn body(&self) -> OutgoingBody {
+        match &self.body {
+            OutBody::Full(b) => OutgoingBody::Full(b.len() as u64),
+            OutBody::Length(n) => OutgoingBody::Length(*n),
+            OutBody::Chunked => OutgoingBody::Chunked,
         }
-        match encoder {
-            Encoder::Chunked => push_last_chunk_with_trailers(out, trailers)?,
-            _ => {
-                check_trailers(trailers)?;
-                encoder.finish(out)?;
-            }
+    }
+
+    #[inline]
+    fn close(&self) -> bool {
+        self.close
+    }
+
+    #[inline]
+    fn upgrade(&self) -> Option<&[u8]> {
+        self.upgrade_protocol()
+    }
+
+    #[inline]
+    fn check(&self) -> Result<bool, HttpError> {
+        match self.error() {
+            Some(e) => Err(e),
+            None => Ok(self.has_date),
         }
-        if *encoder == Encoder::CloseDelimited {
-            self.keep_alive = false;
+    }
+
+    #[inline]
+    fn write_fields<O: Output + ?Sized>(&self, out: &mut O) {
+        out.put(self.fields());
+    }
+}
+
+impl HeadSource for ResponseHeadRef<'_> {
+    #[inline]
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    #[inline]
+    fn body(&self) -> OutgoingBody {
+        self.body
+    }
+
+    #[inline]
+    fn close(&self) -> bool {
+        self.close
+    }
+
+    #[inline]
+    fn upgrade(&self) -> Option<&[u8]> {
+        self.upgrade.map(str::as_bytes)
+    }
+
+    fn check(&self) -> Result<bool, HttpError> {
+        if let Some(protocol) = self.upgrade {
+            check_upgrade_protocol(protocol.as_bytes())?;
         }
-        self.resp = RespState::Sent;
-        self.requests_served += 1;
-        Ok(())
+        let mut has_date = false;
+        for &(name, value) in self.fields {
+            has_date |= check_response_field(name, value)?;
+        }
+        Ok(has_date)
+    }
+
+    fn write_fields<O: Output + ?Sized>(&self, out: &mut O) {
+        if let Some(protocol) = self.upgrade {
+            // The same lines, in the same place, as
+            // Response::switching_protocols writes.
+            out.put(b"connection: upgrade\r\nupgrade: ");
+            out.put(protocol.as_bytes());
+            out.put(b"\r\n");
+        }
+        for &(name, value) in self.fields {
+            write_field(out, name, value);
+        }
     }
 }
 

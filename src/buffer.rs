@@ -22,6 +22,25 @@ pub(crate) struct Buffer {
     pin: Option<(usize, usize)>,
     cap: usize,
     eof: bool,
+    /// Zero bytes that are no longer needed: a finished message, the stale
+    /// copies compaction leaves behind, and everything on reset, release,
+    /// and drop.
+    wipe: bool,
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if self.wipe {
+            zero(&mut self.data);
+        }
+    }
+}
+
+/// Overwrites `bytes` with zeros in a way the optimizer keeps: the slice is
+/// passed to `black_box` afterwards, so the stores cannot be removed as dead.
+fn zero(bytes: &mut [u8]) {
+    bytes.fill(0);
+    let _ = core::hint::black_box(bytes);
 }
 
 impl Buffer {
@@ -33,6 +52,70 @@ impl Buffer {
             pin: None,
             cap,
             eof: false,
+            wipe: false,
+        }
+    }
+
+    /// A buffer that adopts `storage` (its contents are ignored); its
+    /// capacity is used up to `cap`.
+    pub(crate) fn with_storage(mut storage: Vec<u8>, cap: usize) -> Self {
+        storage.clear();
+        let usable = storage.capacity().min(cap);
+        storage.resize(usable, 0);
+        Self {
+            data: storage,
+            ..Self::new(cap)
+        }
+    }
+
+    /// Gives the storage back (wiped first when wiping is on), leaving this
+    /// buffer empty.
+    pub(crate) fn take_storage(&mut self) -> Vec<u8> {
+        if self.wipe {
+            zero(&mut self.data);
+        }
+        self.filled = 0;
+        self.pos = 0;
+        self.pin = None;
+        core::mem::take(&mut self.data)
+    }
+
+    /// Back to the initial state for a new peer, keeping the allocation
+    /// (wiped first when wiping is on).
+    pub(crate) fn reset(&mut self) {
+        if self.wipe {
+            zero(&mut self.data);
+        }
+        self.filled = 0;
+        self.pos = 0;
+        self.pin = None;
+        self.eof = false;
+    }
+
+    /// Frees the allocation when nothing is buffered or pinned; returns
+    /// whether memory was released.
+    pub(crate) fn shrink(&mut self) -> bool {
+        let pinned = self.pin.is_some_and(|(start, end)| end > start);
+        if self.pos != self.filled || pinned || self.data.capacity() == 0 {
+            return false;
+        }
+        drop(self.take_storage());
+        true
+    }
+
+    pub(crate) fn set_wipe(&mut self, wipe: bool) {
+        self.wipe = wipe;
+    }
+
+    /// Zeroes the bytes of a finished message, from its pinned start to the
+    /// read cursor (head, body, and framing), when wiping is on.
+    pub(crate) fn wipe_consumed(&mut self) {
+        if self.wipe {
+            let start = self.pin().min(self.pos);
+            let end = self.pos;
+            if let Some(region) = self.data.get_mut(start..end) {
+                zero(region);
+            }
         }
     }
 
@@ -52,6 +135,14 @@ impl Buffer {
     #[inline]
     pub(crate) fn from(&self, start: usize) -> &[u8] {
         self.data.get(start..self.filled).unwrap_or(&[])
+    }
+
+    /// Bytes from absolute `start` to the end of input, writable: the
+    /// client's obs-fold leniency rewrites folds in place.
+    #[inline]
+    pub(crate) fn tail_mut(&mut self, start: usize) -> &mut [u8] {
+        let filled = self.filled;
+        self.data.get_mut(start..filled).unwrap_or(&mut [])
     }
 
     /// Bytes in the absolute range `start..end`.
@@ -164,8 +255,18 @@ impl Buffer {
         };
         let live = self.filled - self.pos;
         self.data.copy_within(self.pos..self.filled, kept);
+        let old_filled = self.filled;
         self.pos = kept;
         self.filled = kept + live;
+        if self.wipe {
+            // Everything before the new end was overwritten by the moved
+            // bytes; what lies between the new and the old end is a stale
+            // copy (consumed body, the head's old place, the unread bytes'
+            // old place).
+            if let Some(stale) = self.data.get_mut(self.filled..old_filled) {
+                zero(stale);
+            }
+        }
     }
 }
 

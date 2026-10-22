@@ -4,7 +4,7 @@
 //! line costs one load and one mask per byte. The table is built at compile
 //! time from the ABNF, which keeps the rules in one reviewable place.
 
-use crate::error::HttpError;
+use crate::{error::HttpError, write::Output};
 
 /// `tchar`: the characters allowed in a token (method, field name, coding).
 const TCHAR: u8 = 1;
@@ -425,7 +425,7 @@ pub(crate) fn find_byte(needle: u8, hay: &[u8]) -> Option<usize> {
 }
 
 /// Writes `n` in lowercase hexadecimal.
-pub(crate) fn push_hex(out: &mut alloc::vec::Vec<u8>, n: u64) {
+pub(crate) fn push_hex<O: Output + ?Sized>(out: &mut O, n: u64) {
     let mut digits = [0u8; 16];
     let mut i = digits.len();
     let mut v = n;
@@ -437,11 +437,11 @@ pub(crate) fn push_hex(out: &mut alloc::vec::Vec<u8>, n: u64) {
             break;
         }
     }
-    out.extend_from_slice(&digits[i..]);
+    out.put(&digits[i..]);
 }
 
 /// Writes `n` in decimal.
-pub(crate) fn push_decimal(out: &mut alloc::vec::Vec<u8>, n: u64) {
+pub(crate) fn push_decimal<O: Output + ?Sized>(out: &mut O, n: u64) {
     let mut digits = [0u8; 20];
     let mut i = digits.len();
     let mut v = n;
@@ -453,7 +453,7 @@ pub(crate) fn push_decimal(out: &mut alloc::vec::Vec<u8>, n: u64) {
             break;
         }
     }
-    out.extend_from_slice(&digits[i..]);
+    out.put(&digits[i..]);
 }
 
 #[cfg(test)]

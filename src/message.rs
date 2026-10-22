@@ -14,10 +14,12 @@ use core::fmt;
 
 use crate::{
     error::HttpError,
-    head::{check_target, is_h2c},
+    forward::is_hop_by_hop,
+    head::{BodyFraming, RequestHead, check_target, is_h2c},
     method::Method,
     redact::{SerializedFields, serialized_fields},
     syntax::{check_field_value, is_protocol, is_token, trim_ows},
+    write::Output,
 };
 
 /// How an outgoing message's body is supplied.
@@ -74,17 +76,36 @@ const TRAILER_FORBIDDEN: &[&str] = &[
 /// Validates outgoing trailer fields (all of them, before anything is
 /// written), then appends the last chunk and the trailer section:
 /// `0\r\n`, the fields, and the blank line.
-pub(crate) fn push_last_chunk_with_trailers(
-    out: &mut Vec<u8>,
+pub(crate) fn push_last_chunk_with_trailers<O: Output + ?Sized>(
+    out: &mut O,
     trailers: &[(&str, &[u8])],
 ) -> Result<(), HttpError> {
     check_trailers(trailers)?;
-    out.extend_from_slice(b"0\r\n");
+    out.put(b"0\r\n");
     for &(name, value) in trailers {
         write_field(out, name, value);
     }
-    out.extend_from_slice(b"\r\n");
+    out.put(b"\r\n");
     Ok(())
+}
+
+/// Checks the protocol of a `101`: a token or a `name/version` product
+/// token, never `h2c` (RFC 9113 section 3.1).
+pub(crate) fn check_upgrade_protocol(protocol: &[u8]) -> Result<(), HttpError> {
+    if !is_protocol(protocol) {
+        Err(HttpError::InvalidHeaderValue)
+    } else if is_h2c(protocol) {
+        Err(HttpError::UpgradeNotOffered)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks one outgoing response field with the rules of
+/// [`Response::header`]; returns whether it is the `date` field.
+pub(crate) fn check_response_field(name: &str, value: &[u8]) -> Result<bool, HttpError> {
+    check_field(name, value, RESPONSE_RESERVED)?;
+    Ok(name.eq_ignore_ascii_case("date"))
 }
 
 /// Validates outgoing trailer fields without writing them. Also used for a
@@ -120,11 +141,11 @@ fn check_field(name: &str, value: &[u8], reserved: &[&str]) -> Result<(), HttpEr
     check_field_value(value)
 }
 
-fn write_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
-    out.extend_from_slice(name.as_bytes());
-    out.extend_from_slice(b": ");
-    out.extend_from_slice(value);
-    out.extend_from_slice(b"\r\n");
+pub(crate) fn write_field<O: Output + ?Sized>(out: &mut O, name: &str, value: &[u8]) {
+    out.put(name.as_bytes());
+    out.put(b": ");
+    out.put(value);
+    out.put(b"\r\n");
 }
 
 /// Validates a field and appends `name: value\r\n`.
@@ -289,12 +310,8 @@ impl Response {
     pub fn switching_protocols(protocol: &str) -> Self {
         let mut r = Self::new(101);
         r.upgrade = true;
-        if !is_protocol(protocol.as_bytes()) {
-            r.error = Some(HttpError::InvalidHeaderValue);
-            return r;
-        }
-        if is_h2c(protocol.as_bytes()) {
-            r.error = Some(HttpError::UpgradeNotOffered);
+        if let Err(e) = check_upgrade_protocol(protocol.as_bytes()) {
+            r.error = Some(e);
             return r;
         }
         r.fields
@@ -396,6 +413,34 @@ impl Response {
     pub fn close(mut self) -> Self {
         self.close = true;
         self
+    }
+
+    /// Resets the response to `Response::new(status)` while keeping the
+    /// allocation of its field storage, so one `Response` per connection
+    /// can be reused without allocating for every request. An owned body is
+    /// dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::Response;
+    ///
+    /// let mut r = Response::new(200).header("x-request", "1").close();
+    /// r.clear(204);
+    /// assert_eq!(r.status(), 204);
+    /// assert_eq!(r.header_value("x-request"), None);
+    /// assert!(!r.closes());
+    /// r = r.header("x-request", "2"); // reuses the field storage
+    /// assert_eq!(r.header_value("x-request"), Some(&b"2"[..]));
+    /// ```
+    pub fn clear(&mut self, status: u16) {
+        self.status = status;
+        self.fields.clear();
+        self.body = OutBody::Full(Cow::Borrowed(&[]));
+        self.close = false;
+        self.upgrade = false;
+        self.has_date = false;
+        self.error = None;
     }
 
     /// The status code.
@@ -625,6 +670,77 @@ impl Request {
     #[must_use]
     pub fn options(target: &str) -> Self {
         Self::new("OPTIONS", target)
+    }
+
+    /// A request for an upstream server built from a received head, for a
+    /// proxy: the same method and target, every field except the hop-by-hop
+    /// ones (RFC 9110 section 7.6.1: `connection`, `keep-alive`,
+    /// `proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`,
+    /// and any name the head's `Connection` lists; see
+    /// [`is_hop_by_hop`](crate::is_hop_by_hop)) in their original order,
+    /// except `content-length`, which the connection derives again from
+    /// the body mode of the head's framing: a chunked body stays
+    /// chunked, a length stays that length (stream it with
+    /// [`ClientConn::send_body`](crate::ClientConn::send_body)). The
+    /// connection writes its own framing and connection fields.
+    ///
+    /// The target is copied as received: an absolute-form target (a request
+    /// to a proxy) stays absolute, which an origin server also accepts (RFC
+    /// 9112 section 3.2.2); rewrite it with [`Request::new`] if the upstream
+    /// wants origin form. `Host` is forwarded as a field. Add `via` and
+    /// forwarding fields with [`header`](Self::header); requests are
+    /// re-serialized, never passed through as raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Recorded and returned by
+    /// [`ClientConn::send_request`](crate::ClientConn::send_request):
+    /// [`HttpError::InvalidState`] for an upgrade request (the upgrade is
+    /// hop-by-hop; a proxy tunnels it instead), and the builder errors of
+    /// [`Request::new`] and [`Request::header`] (for example a missing or
+    /// second `host` surfaces at send).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ClientConn, Request, ServerConn, ServerEvent};
+    ///
+    /// let mut downstream = ServerConn::new();
+    /// let _ = downstream.feed(b"POST /api HTTP/1.1\r\nHost: app\r\nConnection: X-Hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\nAccept: */*\r\nContent-Length: 2\r\n\r\nhi");
+    /// let ServerEvent::Request(head) = downstream.poll()? else { unreachable!() };
+    /// let upstream_req = Request::forward_from(&head).header("via", "1.1 proxy");
+    ///
+    /// let mut upstream = ClientConn::new();
+    /// let mut out = Vec::new();
+    /// upstream.send_request(&upstream_req, &mut out)?;
+    /// assert_eq!(out, b"POST /api HTTP/1.1\r\nHost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
+    /// # Ok::<(), http_net::HttpError>(())
+    /// ```
+    #[must_use]
+    pub fn forward_from(head: &RequestHead<'_>) -> Self {
+        let mut request = Self::new(head.method_str(), head.target());
+        if head.is_upgrade() {
+            if request.error.is_none() {
+                request.error = Some(HttpError::InvalidState(
+                    "an upgrade request is hop-by-hop; tunnel it instead of forwarding it",
+                ));
+            }
+            return request;
+        }
+        for (name, value) in head.headers() {
+            // `content-length` is end-to-end, but the connection derives it
+            // from the body mode below, so it is not copied as a field.
+            if !is_hop_by_hop(name, head.connection_options())
+                && !name.eq_ignore_ascii_case("content-length")
+            {
+                request = request.header(name, value);
+            }
+        }
+        match head.framing() {
+            BodyFraming::Chunked => request.chunked(),
+            BodyFraming::Length(n) => request.content_length(n),
+            _ => request,
+        }
     }
 
     /// Adds a header field, validated as for [`Response::header`]. A second
