@@ -200,26 +200,41 @@ impl Decoder {
                     return Ok(Step::Data(n));
                 }
                 State::ChunkSize => {
-                    let Some(end) = find_line(
-                        input,
-                        0,
-                        &mut self.scan,
-                        limits.max_start_line(),
-                        HttpError::ChunkLineTooLong,
-                    )?
-                    else {
-                        return if eof {
-                            Err(HttpError::UnexpectedEof)
-                        } else {
-                            Ok(Step::NeedMore)
-                        };
+                    // The common chunk line, `<hex digits>` CR LF, in one
+                    // pass; anything else (an extension, more than 16
+                    // digits, a line begun on earlier input) takes the
+                    // general path, which decides exactly as before.
+                    let fast = if self.scan == 0 {
+                        fast_chunk_size(input).filter(|&(_, len)| len <= limits.max_start_line())
+                    } else {
+                        None
                     };
-                    let (size, ext_len) = parse_chunk_line(&input[..end])?;
-                    self.ext_bytes += ext_len;
-                    if self.ext_bytes > limits.max_header_bytes() {
-                        return Err(HttpError::ChunkExtensionsTooLarge);
-                    }
-                    *consume += self.scan;
+                    let size = if let Some((size, len)) = fast {
+                        *consume += len;
+                        size
+                    } else {
+                        let Some(end) = find_line(
+                            input,
+                            0,
+                            &mut self.scan,
+                            limits.max_start_line(),
+                            HttpError::ChunkLineTooLong,
+                        )?
+                        else {
+                            return if eof {
+                                Err(HttpError::UnexpectedEof)
+                            } else {
+                                Ok(Step::NeedMore)
+                            };
+                        };
+                        let (size, ext_len) = parse_chunk_line(&input[..end])?;
+                        self.ext_bytes += ext_len;
+                        if self.ext_bytes > limits.max_header_bytes() {
+                            return Err(HttpError::ChunkExtensionsTooLarge);
+                        }
+                        *consume += self.scan;
+                        size
+                    };
                     self.scan = 0;
                     if size == 0 {
                         trailers.reset();
@@ -284,6 +299,25 @@ impl Decoder {
 /// `chunk-ext = *( BWS ";" BWS ext-name [ BWS "=" BWS ext-val ] )`, where
 /// `ext-val` is a token or a quoted string. Extensions are validated and
 /// discarded: their meaning is defined per extension and none is in use.
+/// A chunk line of hex digits and CR LF, nothing else: returns the size and
+/// the line's length with its CR LF. `None` for any other line, and for one
+/// not yet complete, so the general path decides it. At most 16 digits, so
+/// the size cannot overflow; the general path refuses longer sizes.
+#[inline(always)]
+fn fast_chunk_size(input: &[u8]) -> Option<(u64, usize)> {
+    let mut size = 0u64;
+    for (i, &b) in input.iter().enumerate().take(MAX_CHUNK_DIGITS + 1) {
+        match hex_value(b) {
+            Some(d) => size = (size << 4) | u64::from(d),
+            None if i > 0 && b == b'\r' && input.get(i + 1) == Some(&b'\n') => {
+                return Some((size, i + 2));
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
 pub(crate) fn parse_chunk_line(line: &[u8]) -> Result<(u64, usize), HttpError> {
     let digits = line.iter().take_while(|b| b.is_ascii_hexdigit()).count();
     if digits == 0 || digits > MAX_CHUNK_DIGITS {
@@ -437,6 +471,54 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn test_fast_chunk_size_agrees_with_the_general_path() {
+        const BYTES: &[u8] = b"0123456789abcdefABCDEFg; =\t\r\n\"x";
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut fast = 0;
+        for i in 0..200_000usize {
+            let mut line: Vec<u8> = (0..(i % 20))
+                .map(|_| {
+                    if next() % 6 == 0 {
+                        BYTES[(next() % BYTES.len() as u64) as usize]
+                    } else {
+                        BYTES[(next() % 22) as usize]
+                    }
+                })
+                .collect();
+            if i % 3 != 0 {
+                line.extend_from_slice(b"\r\n");
+            }
+            let Some((size, len)) = fast_chunk_size(&line) else {
+                continue;
+            };
+            fast += 1;
+            let mut scan = 0;
+            let end = find_line(&line, 0, &mut scan, 8192, HttpError::ChunkLineTooLong)
+                .expect("an accepted line ends")
+                .expect("an accepted line is complete");
+            assert_eq!(scan, len, "{line:?}");
+            assert_eq!(parse_chunk_line(&line[..end]), Ok((size, 0)), "{line:?}");
+        }
+        assert!(fast > 10_000, "the fast path accepted only {fast} lines");
+        // Sixteen digits are the most; seventeen go to the general path,
+        // which refuses them.
+        assert_eq!(
+            fast_chunk_size(b"ffffffffffffffff\r\n"),
+            Some((u64::MAX, 18))
+        );
+        assert_eq!(fast_chunk_size(b"1ffffffffffffffff\r\n"), None);
+        assert_eq!(fast_chunk_size(b"\r\n"), None);
+        assert_eq!(fast_chunk_size(b"5;x\r\n"), None);
+        assert_eq!(fast_chunk_size(b"5\r"), None);
+    }
 
     fn decode_all(
         framing: BodyFraming,
