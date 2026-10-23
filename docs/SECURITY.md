@@ -83,6 +83,7 @@ whether the attack test exists in this build.
 | identical CL list | accepting | refused | no hop can pick another value | none known |
 | chunk size over 16 hex digits | must parse | refused | keeps the overflow check exact | none legitimate |
 | space after a chunk size without an extension | not in the grammar | refused | other parsers accept it only with a lenient flag | none |
+| response `Transfer-Encoding` not ending in `chunked` | read the body until the connection closes | refused | a coding other than `chunked` is not supported, and guessing the body's end invites a desync | a server that sends one gets no response through |
 | status line without the space after the code (client) | senders must send it | accepted | harmless to framing; real servers omit it | none |
 
 ## Where http-net is stricter than httparse
@@ -105,6 +106,26 @@ for one of these reasons (counts from the 0.3 run):
 
 The one case where http-net accepts and httparse refuses is HTTP/1.2 to
 1.9, which RFC 9110 section 2.5 says to process as 1.1.
+
+Responses get the same comparison since 0.7 (`tests/prop_httparse_response.rs`,
+twelve seed responses, 47,249 single-byte mutations plus three 8,192-case
+property tests): on every response head both accept, they agree on the
+length, status, version, reason, and fields. Of the single-byte mutations,
+21,003 were accepted identically by both, 24,230 refused by both, and 24
+accepted only by http-net (HTTP/1.2 to 1.9). Where only httparse accepted,
+http-net refused with:
+
+| Refusal | Count |
+|---|---:|
+| `BareLf` | 989 |
+| `InvalidContentLength` | 540 |
+| `InvalidTransferEncoding` | 438 |
+| `InvalidStatus` (a code outside 100 to 599, which httparse accepts) | 24 |
+| `TransferEncodingInHttp10` | 1 |
+
+The comparison covers heads, not body framing: httparse does no framing, so
+a disagreement on where a body ends is covered by the framing tests above,
+not by this differential.
 
 ## Costs of the security measures
 
