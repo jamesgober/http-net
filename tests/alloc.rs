@@ -412,6 +412,23 @@ fn test_endless_chunk_extensions_stay_bounded_and_end_extensions_too_large() {
     assert_bounded(&limits, &m);
 }
 
+/// T-11 / T-27: one endless chunk line (a size, `;`, and an extension name
+/// that never ends) is refused with `ChunkLineTooLong` once it passes the
+/// line budget, and memory stays within the buffer's bound however much of
+/// the 10 MiB stream arrives.
+#[test]
+fn test_endless_chunk_line_stays_bounded_and_ends_chunk_line_too_long() {
+    let limits = Limits::new();
+    let (err, m) = hostile_stream(
+        limits,
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;",
+        b"aaaaaaaaaaaaaaaa",
+        TEN_MIB,
+    );
+    assert_eq!(err, Some(HttpError::ChunkLineTooLong));
+    assert_bounded(&limits, &m);
+}
+
 #[test]
 fn test_huge_declared_body_is_refused_on_the_header_line() {
     let limits = Limits::new();

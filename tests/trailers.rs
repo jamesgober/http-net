@@ -228,6 +228,54 @@ fn test_client_trailers_reported_when_on_and_absent_when_off() {
     }
 }
 
+/// T-13 on the client: trailer fields cannot reframe a pipelined response
+/// stream. With two GETs in flight, a `Content-Length: 50` in the first
+/// response's trailers is not applied to anything: the second response is
+/// framed by its own head, so the bodies are `z` then `ok`, with trailer
+/// reporting on or off and the input split at every byte.
+#[test]
+fn test_client_trailers_cannot_reframe_the_next_pipelined_response() {
+    let wire: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\nContent-Length: 50\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let get = || Request::get("/").header("host", "a");
+    for report in [false, true] {
+        for cut in 0..wire.len() {
+            let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(2));
+            conn.set_report_trailers(report);
+            let mut out = Vec::new();
+            conn.send_request(&get(), &mut out).unwrap();
+            conn.send_request(&get(), &mut out).unwrap();
+            let mut pieces = split(wire, &[cut]).into_iter();
+            let (mut bodies, mut body, mut trailers) = (Vec::new(), Vec::new(), Vec::new());
+            loop {
+                match conn.poll().unwrap() {
+                    ClientEvent::Response(_) => body.clear(),
+                    ClientEvent::Body(b) => body.extend_from_slice(b),
+                    ClientEvent::Trailers(t) => {
+                        trailers.extend(t.map(|(n, v)| (n.to_string(), v.to_vec())));
+                    }
+                    ClientEvent::ResponseEnd => {
+                        bodies.push(String::from_utf8_lossy(&body).into_owned());
+                    }
+                    ClientEvent::NeedInput => {
+                        let piece = pieces.next().expect("input ran out before two responses");
+                        assert_eq!(conn.feed(piece), piece.len());
+                    }
+                    ClientEvent::Idle => break,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(bodies, ["z", "ok"], "report {report}, cut {cut}");
+            let expected: Vec<(String, Vec<u8>)> = if report {
+                vec![("Content-Length".into(), b"50".to_vec())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(trailers, expected, "report {report}, cut {cut}");
+            assert_eq!(conn.outstanding(), 0);
+        }
+    }
+}
+
 fn streaming_server(request: &[u8]) -> (ServerConn, Vec<u8>) {
     let mut conn = ServerConn::new();
     let _ = conn.feed(request);

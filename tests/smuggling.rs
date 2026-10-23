@@ -7,7 +7,7 @@
 mod common;
 
 use common::{Ev, drive_server};
-use http_net::{HttpError, Limits, Response, ServerConn, ServerEvent};
+use http_net::{ClientConn, HttpError, Limits, Request, Response, ServerConn, ServerEvent};
 
 const VECTORS: &[(&str, &[u8], HttpError)] = &[
     (
@@ -196,19 +196,184 @@ fn test_outgoing_messages_cannot_inject_framing() {
     let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
     let mut out = Vec::new();
-    for bad in [
-        Response::new(200).header("x", "a\r\nContent-Length: 0"),
-        Response::new(200).header("x", "a\nb"),
-        Response::new(200).header("Transfer-Encoding", "chunked"),
-        Response::new(200).header("Content-Length", "1"),
-        Response::new(200).header("Connection", "keep-alive"),
-        Response::new(200).header("Upgrade", "x"),
-        Response::new(200).header("x\r\ny", "1"),
+    for (bad, expected) in [
+        (
+            Response::new(200).header("x", "a\r\nContent-Length: 0"),
+            HttpError::BareCr,
+        ),
+        (
+            Response::new(200).header("x", "a\nb"),
+            HttpError::InvalidHeaderValue,
+        ),
+        (
+            Response::new(200).header("Transfer-Encoding", "chunked"),
+            HttpError::ReservedHeader,
+        ),
+        (
+            Response::new(200).header("Content-Length", "1"),
+            HttpError::ReservedHeader,
+        ),
+        (
+            Response::new(200).header("Connection", "keep-alive"),
+            HttpError::ReservedHeader,
+        ),
+        (
+            Response::new(200).header("Upgrade", "x"),
+            HttpError::ReservedHeader,
+        ),
+        (
+            Response::new(200).header("x\r\ny", "1"),
+            HttpError::InvalidHeaderName,
+        ),
     ] {
-        assert!(conn.respond(&bad, &mut out).is_err(), "{bad:?}");
+        assert_eq!(conn.respond(&bad, &mut out), Err(expected), "{bad:?}");
         assert!(out.is_empty(), "nothing is written for a refused response");
     }
     conn.respond(&Response::new(200), &mut out).unwrap();
+}
+
+/// T-22, response splitting and CRLF injection through the builders: a CR,
+/// LF, or space in a request target or method, and a NUL, VT, CR, bare LF,
+/// or surrounding space in a field value, is refused with its documented
+/// error when the message is written (`send_request` / `respond`). Nothing
+/// is written, and the connection stays usable for a valid message.
+#[test]
+fn test_builder_injection_is_refused_and_writes_nothing() {
+    let mut client = ClientConn::new();
+    let mut out = Vec::new();
+    for (request, expected) in [
+        (
+            Request::get("/a HTTP/1.1\r\nX: y"),
+            HttpError::InvalidTarget,
+        ),
+        (Request::get("/a\r\nX: y"), HttpError::InvalidTarget),
+        (Request::get("/a\nX: y"), HttpError::InvalidTarget),
+        (Request::get("/a b"), HttpError::InvalidTarget),
+        (Request::new("GET\r\n", "/"), HttpError::InvalidMethod),
+        (Request::new("GET /x", "/"), HttpError::InvalidMethod),
+        (Request::new("G\nET", "/"), HttpError::InvalidMethod),
+        (
+            Request::get("/").header("x", "a\r\nX-Injected: 1"),
+            HttpError::BareCr,
+        ),
+        (
+            Request::get("/").header("x", "a\nX-Injected: 1"),
+            HttpError::InvalidHeaderValue,
+        ),
+        (
+            Request::get("/").header("x", "a\0b"),
+            HttpError::InvalidHeaderValue,
+        ),
+    ] {
+        let request = request.header("host", "a");
+        assert_eq!(
+            client.send_request(&request, &mut out),
+            Err(expected),
+            "{request:?}"
+        );
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    }
+    client
+        .send_request(&Request::get("/").header("host", "a"), &mut out)
+        .unwrap();
+    assert!(out.starts_with(b"GET / HTTP/1.1\r\n"));
+
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    while !matches!(conn.poll().unwrap(), ServerEvent::RequestEnd) {}
+    let mut out = Vec::new();
+    for (value, expected) in [
+        (&b"a\0b"[..], HttpError::InvalidHeaderValue),
+        (b"a\x0bb", HttpError::InvalidHeaderValue),
+        (b"a ", HttpError::InvalidHeaderValue),
+        (b" a", HttpError::InvalidHeaderValue),
+        (b"a\t", HttpError::InvalidHeaderValue),
+        (b"a\nX-Injected: 1", HttpError::InvalidHeaderValue),
+        (b"a\r\nX-Injected: 1", HttpError::BareCr),
+    ] {
+        let response = Response::new(200).header("x-value", value);
+        assert_eq!(
+            conn.respond(&response, &mut out),
+            Err(expected),
+            "{:?}",
+            String::from_utf8_lossy(value)
+        );
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    }
+    conn.respond(&Response::new(200), &mut out).unwrap();
+    assert!(out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+}
+
+/// T-23, caller-set framing fields on the request side: `content-length`,
+/// `transfer-encoding`, `connection`, and `upgrade`, in any case, are owned
+/// by the connection. Setting one by hand is `ReservedHeader` at
+/// `send_request`, nothing is written, and the connection stays usable.
+#[test]
+fn test_request_builder_refuses_framing_fields_in_any_case() {
+    let mut conn = ClientConn::new();
+    let mut out = Vec::new();
+    for name in [
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "upgrade",
+    ] {
+        let mixed: String = name
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        for spelled in [name.to_string(), name.to_ascii_uppercase(), mixed] {
+            let request = Request::get("/").header("host", "a").header(&spelled, "x");
+            assert_eq!(
+                conn.send_request(&request, &mut out),
+                Err(HttpError::ReservedHeader),
+                "{spelled}"
+            );
+            assert!(
+                out.is_empty(),
+                "{spelled}: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+    conn.send_request(&Request::get("/").header("host", "a"), &mut out)
+        .unwrap();
+}
+
+/// T-3, TE.TE across fields: the coding list is every `Transfer-Encoding`
+/// field joined in order, so `chunked` in two fields repeats it
+/// (`InvalidTransferEncoding`), and `gzip` then `chunked` in two fields
+/// asks for a coding other than chunked (`UnsupportedTransferEncoding`,
+/// answered 501). Whole and at every split, with no body delivered.
+#[test]
+fn test_transfer_encoding_split_across_fields_is_refused() {
+    for (input, expected) in [
+        (
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"[..],
+            HttpError::InvalidTransferEncoding,
+        ),
+        (
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            HttpError::UnsupportedTransferEncoding,
+        ),
+    ] {
+        let name = String::from_utf8_lossy(input);
+        let whole = drive_server(&[input], Limits::new());
+        assert_eq!(whole, [Ev::Err(expected)], "{name}");
+        for cut in 1..input.len() {
+            let split = drive_server(&[&input[..cut], &input[cut..]], Limits::new());
+            assert_eq!(whole, split, "{name}: split at {cut} changed the result");
+        }
+    }
+    assert_eq!(HttpError::InvalidTransferEncoding.status(), Some(400));
+    assert_eq!(HttpError::UnsupportedTransferEncoding.status(), Some(501));
 }
 
 /// T-9, Funky Chunks (TERM.EXT and EXT.TERM): a CR or LF inside a chunk

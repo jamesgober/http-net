@@ -409,6 +409,10 @@ fn test_slow_request_is_cut_off_by_the_request_timeout() {
     t.join().unwrap();
 }
 
+/// T-25, slow body: the head arrives at once and the body one byte every
+/// 150 ms, each well inside the read timeout. The request deadline (1 s)
+/// still ends the request: the server answers `408 Request Timeout` and
+/// closes long before the body would be complete.
 #[test]
 fn test_slow_body_is_cut_off_by_the_request_timeout() {
     let server = Server::bind("127.0.0.1:0").unwrap().with_config(
@@ -437,6 +441,11 @@ fn test_slow_body_is_cut_off_by_the_request_timeout() {
     assert!(
         took < Duration::from_secs(4),
         "connection held for {took:?}"
+    );
+    assert!(
+        sink.starts_with(b"HTTP/1.1 408 "),
+        "{}",
+        String::from_utf8_lossy(&sink)
     );
     t.join().unwrap();
 }
@@ -557,6 +566,83 @@ fn test_lingering_close_has_a_total_deadline() {
         String::from_utf8_lossy(&reply)
     );
     t.join().unwrap();
+}
+
+/// T-40, lingering-close abuse, byte cap: after a `connection: close`
+/// answer the server drains what the client still sends, at most 256 KiB,
+/// so a client that writes 8 MiB as fast as it can does not keep the only
+/// connection slot (`max_connections(1)`). The answer arrives, and a new
+/// connection is served 200 instead of 503, within 2 s of the request.
+///
+/// The bound is generous on purpose: on loopback the byte cap ends the
+/// drain within milliseconds, but a loaded CI runner can be slow, and the
+/// drain's 1 s total-time cap would also end it inside 2 s. So this test
+/// proves the slot is freed while the peer is still sending, not which cap
+/// freed it (a bound under 1 s would tell them apart, at the cost of
+/// flakiness). The new connection is retried while the server finishes the
+/// drain, since the slot is released a moment after the answer is read;
+/// each refusal on the way must be a 503 (or a reset of the refused
+/// socket), never a hang.
+#[test]
+fn test_lingering_close_drain_is_capped_in_bytes() {
+    let server = Server::bind("127.0.0.1:0").unwrap().with_config(
+        ServerConfig::new()
+            .with_max_connections(1)
+            .with_read_timeout(Some(Duration::from_secs(10))),
+    );
+    let running = start(server, echo);
+    let mut stream = connect(running.addr);
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let started = Instant::now();
+    let flood = thread::spawn(move || {
+        // Unpaced; the server closing the socket first is the expected end.
+        let _ = writer.write_all(&vec![b'x'; 8 << 20]);
+    });
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply);
+    let answered = started.elapsed();
+    assert!(
+        reply.starts_with(b"HTTP/1.1 200 "),
+        "{}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert!(
+        answered < Duration::from_secs(2),
+        "answered after {answered:?}"
+    );
+
+    let deadline = started + Duration::from_secs(2);
+    let mut refusals = 0;
+    let served = loop {
+        let mut next = connect(running.addr);
+        let _ = next.write_all(b"GET /n HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let mut reply = Vec::new();
+        let _ = next.read_to_end(&mut reply);
+        if reply.starts_with(b"HTTP/1.1 200 ") {
+            break true;
+        }
+        assert!(
+            reply.is_empty() || reply.starts_with(b"HTTP/1.1 503 "),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        refusals += 1;
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let took = started.elapsed();
+    assert!(
+        served,
+        "the slot was still held after {took:?} ({refusals} refusals)"
+    );
+    assert!(took < Duration::from_secs(2), "slot freed after {took:?}");
+    drop(stream);
+    flood.join().unwrap();
 }
 
 #[test]

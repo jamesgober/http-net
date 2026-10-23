@@ -360,6 +360,36 @@ fn test_wipe_zeroes_finished_requests_and_the_released_buffer() {
     assert!(back.iter().all(|&b| b == 0));
 }
 
+/// Threat T-36: `reset` with wiping on zeroes the whole buffer, so a
+/// request cut off mid-body (the socket closed) leaves no credentials for
+/// the next peer of a pooled connection. Wiping is switched off after the
+/// reset so the storage is taken as the reset left it; the control run
+/// without wiping shows the secret would otherwise stay.
+#[test]
+fn test_wipe_on_reset_zeroes_a_request_cut_off_mid_body() {
+    let secret = b"RESET-SECRET";
+    let run = |wipe: bool| -> Vec<u8> {
+        let mut conn = ServerConn::new();
+        conn.set_wipe(wipe);
+        let _ = conn.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nCookie: session=RESET-SECRET\r\nContent-Length: 10\r\n\r\nab",
+        );
+        assert!(matches!(conn.poll(), Ok(ServerEvent::Request(_))));
+        conn.reset();
+        conn.set_wipe(false);
+        conn.into_buffer()
+    };
+    let kept = run(false);
+    assert!(
+        contains(&kept, secret),
+        "control: without wiping, reset keeps the bytes"
+    );
+    let wiped = run(true);
+    assert!(!contains(&wiped, secret));
+    assert!(!contains(&wiped, b"Cookie"));
+    assert!(wiped.iter().all(|&b| b == 0));
+}
+
 /// Compaction moves the unread bytes to the front; with wiping on, the
 /// stale copies it leaves behind are zeroed too.
 #[test]
