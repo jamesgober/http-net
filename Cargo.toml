@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.6.0"
+version = "0.7.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -87,6 +87,10 @@ required-features = ["std"]
 
 [[example]]
 name              = "get"
+required-features = ["std"]
+
+[[example]]
+name              = "soak"
 required-features = ["std"]
 
 

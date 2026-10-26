@@ -11,8 +11,8 @@ mod common;
 
 use common::{Ev, drive_client, drive_server, server_error};
 use http_net::{
-    BodyFraming, ClientConn, ClientEvent, HttpError, Limits, Request, Response, ServerConn,
-    ServerEvent,
+    BodyFraming, ClientConn, ClientEvent, HttpError, Limits, Progress, Request, Response,
+    ServerConn, ServerEvent,
 };
 
 /// Polls once and expects the request head (the whole head is always fed
@@ -865,5 +865,328 @@ fn test_switching_protocols_must_name_an_offered_protocol() {
         if !ok {
             assert_eq!(result, Err(HttpError::UpgradeNotOffered));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit additions: upgrade answers, chunk lines, unanswered floods, error
+// answers
+// ---------------------------------------------------------------------------
+
+fn upgrade_request() -> Request {
+    Request::get("/").header("host", "a").upgrade("websocket")
+}
+
+/// T-21, upgrade smuggling: a client that asked to upgrade and got a final
+/// answer other than 101 (a 426, or a plain 200) stays in HTTP. The answer
+/// is read as an ordinary response framed by its own `Content-Length`, at
+/// every split; the connection never reports `Upgraded`, and `progress()`
+/// never says `Upgraded`.
+#[test]
+fn test_client_upgrade_answered_without_101_stays_http() {
+    for (answer, status) in [
+        (
+            &b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 2\r\n\r\nno"[..],
+            426,
+        ),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno", 200),
+    ] {
+        let whole = drive_client(&upgrade_request(), &[answer], Limits::new());
+        let bytes: Vec<&[u8]> = answer.chunks(1).collect();
+        let bytewise = drive_client(&upgrade_request(), &bytes, Limits::new());
+        assert_eq!(whole, bytewise, "{status}: split changed the result");
+        assert!(
+            matches!(&whole[0], Ev::Status { status: s, .. } if *s == status),
+            "{whole:?}"
+        );
+        assert_eq!(whole[1..], [Ev::Body(b"no".to_vec()), Ev::End], "{whole:?}");
+
+        let mut conn = ClientConn::new();
+        conn.send_request(&upgrade_request(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(conn.feed(answer), answer.len());
+        let mut seen = Vec::new();
+        loop {
+            let event = match conn.poll().unwrap() {
+                ClientEvent::Response(r) => format!("Response {}", r.status()),
+                ClientEvent::Body(b) => format!("Body {}", String::from_utf8_lossy(b)),
+                ClientEvent::ResponseEnd => "ResponseEnd".to_string(),
+                ClientEvent::Idle => break,
+                other => panic!("{status}: unexpected {other:?}"),
+            };
+            seen.push(event);
+            assert!(!conn.is_upgraded(), "{status}: {seen:?}");
+            assert_ne!(conn.progress(), Progress::Upgraded, "{status}: {seen:?}");
+        }
+        assert_eq!(
+            seen,
+            [
+                format!("Response {status}"),
+                "Body no".into(),
+                "ResponseEnd".into()
+            ]
+        );
+        assert!(!conn.is_upgraded());
+        assert_eq!(conn.progress(), Progress::Idle);
+    }
+}
+
+/// T-21: a 101 with no `Upgrade` field, or an empty one, names no protocol
+/// to switch to, so even in answer to a request that asked to upgrade it is
+/// refused with `UnexpectedUpgrade` and the connection is closed, never
+/// switched.
+#[test]
+fn test_client_101_without_an_upgrade_protocol_is_unexpected_upgrade() {
+    for answer in [
+        &b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\r\n"[..],
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade:\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: \r\n\r\n",
+    ] {
+        let shown = String::from_utf8_lossy(answer);
+        let events = drive_client(&upgrade_request(), &[answer], Limits::new());
+        assert_eq!(events, [Ev::Err(HttpError::UnexpectedUpgrade)], "{shown}");
+
+        let mut conn = ClientConn::new();
+        conn.send_request(&upgrade_request(), &mut Vec::new())
+            .unwrap();
+        let _ = conn.feed(answer);
+        assert_eq!(
+            conn.poll().unwrap_err(),
+            HttpError::UnexpectedUpgrade,
+            "{shown}"
+        );
+        assert!(!conn.is_upgraded(), "{shown}");
+        assert_eq!(conn.progress(), Progress::Closed, "{shown}");
+        assert!(matches!(conn.poll(), Ok(ClientEvent::Closed)), "{shown}");
+    }
+}
+
+/// T-21: the server switches only once the upgrade request has been read
+/// to its end. A 101 at the `Request` event, while the declared body is
+/// still unread, is refused with `InvalidState` and writes nothing (the
+/// unread body would otherwise reach the new protocol as its first bytes);
+/// once the body is read, the same 101 succeeds.
+#[test]
+fn test_server_101_before_the_upgrade_request_body_is_read_is_refused() {
+    let head = b"POST / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: websocket\r\nContent-Length: 5\r\n\r\n";
+    let mut conn = ServerConn::new();
+    assert_eq!(conn.feed(head), head.len());
+    let ServerEvent::Request(req) = conn.poll().unwrap() else {
+        panic!("expected a request");
+    };
+    assert!(req.is_upgrade());
+    let mut out = Vec::new();
+    assert!(matches!(
+        conn.respond(&Response::switching_protocols("websocket"), &mut out),
+        Err(HttpError::InvalidState(_))
+    ));
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert!(!conn.is_upgraded());
+
+    assert!(matches!(conn.poll().unwrap(), ServerEvent::NeedInput));
+    let _ = conn.feed(b"hello");
+    assert!(matches!(conn.poll().unwrap(), ServerEvent::Body(b"hello")));
+    assert!(matches!(conn.poll().unwrap(), ServerEvent::RequestEnd));
+    conn.respond(&Response::switching_protocols("websocket"), &mut out)
+        .unwrap();
+    assert!(out.starts_with(b"HTTP/1.1 101 "));
+    assert!(conn.is_upgraded());
+    assert!(matches!(conn.poll().unwrap(), ServerEvent::Upgraded));
+}
+
+/// A chunked request whose first chunk line is `1;e=` followed by `ext`
+/// bytes of `x` and CRLF, then one data byte and the last chunk.
+fn chunk_line_request(ext: usize) -> Vec<u8> {
+    let mut input = chunked_head();
+    input.extend_from_slice(b"1;e=");
+    input.extend(std::iter::repeat_n(b'x', ext));
+    input.extend_from_slice(b"\r\nz\r\n0\r\n\r\n");
+    input
+}
+
+/// T-11 / T-27: one chunk-size line longer than the line budget
+/// (`Limits::max_start_line`, 8 KiB by default) is refused with
+/// `ChunkLineTooLong`, whole and split at every byte, before any chunk data
+/// is delivered.
+#[test]
+fn test_chunk_line_over_the_line_budget_is_chunk_line_too_long() {
+    let events = whole_and_split(&chunk_line_request(8200));
+    assert_eq!(
+        events.last(),
+        Some(&Ev::Err(HttpError::ChunkLineTooLong)),
+        "{:?}",
+        events.first()
+    );
+    assert_eq!(targets(&events), ["/"]);
+    assert!(!events.iter().any(|e| matches!(e, Ev::Body(_))));
+    assert_eq!(HttpError::ChunkLineTooLong.status(), Some(400));
+}
+
+/// T-11 / T-27: the chunk-line budget counts the whole line with its CRLF
+/// (`find_line` refuses a line whose LF ends past `max_start_line` bytes,
+/// and a partial line once it holds `max_start_line` bytes with no LF). A
+/// line of exactly the budget is accepted; one byte more is
+/// `ChunkLineTooLong`. Both whole and at every split.
+#[test]
+fn test_chunk_line_of_exactly_the_budget_is_accepted_one_more_is_refused() {
+    let budget = Limits::new().max_start_line();
+    // "1;e=" (4 bytes) + ext + CRLF (2 bytes) is the line length.
+    let at = whole_and_split(&chunk_line_request(budget - 6));
+    assert!(at.contains(&Ev::Body(b"z".to_vec())), "{at:?}");
+    assert!(at.contains(&Ev::End), "{at:?}");
+    assert!(!at.iter().any(|e| matches!(e, Ev::Err(_))), "{at:?}");
+
+    let over = whole_and_split(&chunk_line_request(budget - 5));
+    assert_eq!(
+        over.last(),
+        Some(&Ev::Err(HttpError::ChunkLineTooLong)),
+        "{over:?}"
+    );
+    assert!(!over.iter().any(|e| matches!(e, Ev::Body(_))));
+}
+
+/// T-29, pipelining flood: a peer that pipelines 100,000 requests and never
+/// reads a response gets exactly one request parsed. The rest waits in the
+/// bounded input buffer: `feed` takes at most `Limits::buffer_capacity()`
+/// bytes in all and then returns 0, and `poll` reports `AwaitingResponse`
+/// until the response is written. Nothing taken is lost: once answered,
+/// the next request is parsed.
+#[test]
+fn test_unanswered_pipelining_flood_stays_in_the_bounded_buffer() {
+    let one: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    let capacity = Limits::new().buffer_capacity();
+    let mut conn = ServerConn::new();
+    let mut taken = 0usize;
+    let mut full = false;
+    let mut kinds = Vec::with_capacity(100_000);
+    for i in 0..100_000 {
+        let n = conn.feed(one);
+        if full {
+            assert_eq!(n, 0, "offer {i}: feed took bytes after the buffer filled");
+        }
+        full |= n < one.len();
+        taken += n;
+        kinds.push(match conn.poll().unwrap() {
+            ServerEvent::Request(_) => "Request",
+            ServerEvent::RequestEnd => "RequestEnd",
+            ServerEvent::AwaitingResponse => "AwaitingResponse",
+            other => panic!("offer {i}: unexpected {other:?}"),
+        });
+    }
+    assert!(full, "100,000 requests fit in the buffer");
+    assert!(taken <= capacity, "took {taken} bytes, capacity {capacity}");
+    assert!(conn.remaining_input().len() <= capacity);
+    assert_eq!(kinds[..2], ["Request", "RequestEnd"]);
+    assert!(
+        kinds[2..].iter().all(|k| *k == "AwaitingResponse"),
+        "{:?}",
+        kinds.iter().find(|k| **k != "AwaitingResponse")
+    );
+    assert_eq!(conn.progress(), Progress::AwaitingResponse);
+
+    conn.respond(&Response::new(204), &mut Vec::new()).unwrap();
+    assert!(matches!(conn.poll(), Ok(ServerEvent::Request(r)) if r.path() == "/"));
+}
+
+/// Every variant of `HttpError`, for the `from_error` checks below. The
+/// enum is `#[non_exhaustive]`, so a new variant must be added here by hand.
+const ALL_ERRORS: &[HttpError] = &[
+    HttpError::InvalidStartLine,
+    HttpError::InvalidMethod,
+    HttpError::InvalidTarget,
+    HttpError::InvalidVersion,
+    HttpError::UnsupportedVersion,
+    HttpError::Http2Preface,
+    HttpError::InvalidStatus,
+    HttpError::StartLineTooLong,
+    HttpError::HeadersTooLarge,
+    HttpError::TooManyHeaders,
+    HttpError::FieldLineTooLong,
+    HttpError::BareCr,
+    HttpError::BareLf,
+    HttpError::ObsFold,
+    HttpError::InvalidHeaderName,
+    HttpError::WhitespaceBeforeColon,
+    HttpError::InvalidHeaderValue,
+    HttpError::MissingHost,
+    HttpError::InvalidHost,
+    HttpError::InvalidContentLength,
+    HttpError::DuplicateContentLength,
+    HttpError::ConflictingFraming,
+    HttpError::InvalidTransferEncoding,
+    HttpError::UnsupportedTransferEncoding,
+    HttpError::TransferEncodingInHttp10,
+    HttpError::InvalidChunkSize,
+    HttpError::InvalidChunkExtension,
+    HttpError::InvalidChunkTerminator,
+    HttpError::ChunkLineTooLong,
+    HttpError::ChunkExtensionsTooLarge,
+    HttpError::BodyTooLarge,
+    HttpError::UnexpectedEof,
+    HttpError::UnexpectedData,
+    HttpError::UnexpectedUpgrade,
+    HttpError::TooManyInterim,
+    HttpError::ReservedHeader,
+    HttpError::BodyNotAllowed,
+    HttpError::BodyLengthMismatch,
+    HttpError::UpgradeNotOffered,
+    HttpError::InterimNotAllowed,
+    HttpError::TrailerNotAllowed,
+    HttpError::InvalidState("rule"),
+];
+
+/// T-37, error text reflecting attacker bytes: for every peer error that
+/// has a status, `Response::from_error` answers with exactly that status,
+/// the error's static `Display` text as the whole body, and `close`; the
+/// errors without a status get 400 the same way.
+#[test]
+fn test_from_error_uses_the_status_and_static_text_of_every_variant() {
+    let mut with_status = 0;
+    for e in ALL_ERRORS {
+        let r = Response::from_error(e);
+        if let Some(status) = e.status() {
+            assert!(e.is_peer_error(), "{e:?}");
+            with_status += 1;
+            assert_eq!(r.status(), status, "{e:?}");
+        } else {
+            assert_eq!(r.status(), 400, "{e:?}");
+        }
+        assert_eq!(r.body_bytes(), Some(e.to_string().as_bytes()), "{e:?}");
+        assert!(r.closes(), "{e:?}");
+    }
+    assert_eq!(with_status, 30, "peer errors with a status");
+}
+
+/// T-37: the answer to a refused request carries none of the refused
+/// bytes, only the static text.
+#[test]
+fn test_error_answer_never_reflects_the_refused_bytes() {
+    for (input, expected) in [
+        (
+            &b"GET / HTTP/1.1\r\nHost: a\r\nX-ATTACKER\x00: 1\r\n\r\n"[..],
+            HttpError::InvalidHeaderName,
+        ),
+        (
+            b"GET /<script>ATTACKER</script> HTTP/1.1\r\nHost: a\r\n\r\n",
+            HttpError::InvalidTarget,
+        ),
+        (
+            b"GET / HTTP/1.1\r\nHost: ATTACKER host\r\n\r\n",
+            HttpError::InvalidHost,
+        ),
+    ] {
+        let mut conn = ServerConn::new();
+        let _ = conn.feed(input);
+        let err = conn.poll().unwrap_err();
+        assert_eq!(err, expected);
+        let mut out = Vec::new();
+        conn.respond(&Response::from_error(&err), &mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 400 "));
+        assert!(out.ends_with(err.to_string().as_bytes()));
+        assert!(
+            !out.windows(8).any(|w| w == b"ATTACKER"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }

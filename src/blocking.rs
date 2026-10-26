@@ -651,25 +651,18 @@ impl Server {
     {
         let handler = Arc::new(handler);
         let active = Arc::new(Active::default());
-        let mut consecutive_errors = 0u32;
+        let mut backoff = AcceptBackoff::default();
         for incoming in self.listener.incoming() {
             if self.stop.load(Ordering::SeqCst) {
                 break;
             }
             let stream = match incoming {
                 Ok(stream) => {
-                    consecutive_errors = 0;
+                    backoff.success();
                     stream
                 }
                 Err(e) => {
-                    // Aborted handshakes and descriptor exhaustion are
-                    // transient; back off briefly instead of spinning, and
-                    // give up only if accept never recovers.
-                    consecutive_errors += 1;
-                    if consecutive_errors > 1000 {
-                        return Err(e);
-                    }
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(backoff.failure(e)?);
                     continue;
                 }
             };
@@ -694,6 +687,35 @@ impl Server {
         }
         active.wait_idle();
         Ok(())
+    }
+}
+
+/// What the accept loop does after an accept error (threat T-41). Aborted
+/// handshakes and descriptor exhaustion are transient, so it waits instead
+/// of spinning a core, and gives up only when accept never recovers.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    consecutive: u32,
+}
+
+impl AcceptBackoff {
+    /// The wait after each failed accept.
+    const WAIT: Duration = Duration::from_millis(10);
+    /// Consecutive failures tolerated before `serve` returns the error.
+    const LIMIT: u32 = 1000;
+
+    fn success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// The wait before the next accept, or the error to stop with.
+    fn failure(&mut self, error: io::Error) -> io::Result<Duration> {
+        self.consecutive += 1;
+        if self.consecutive > Self::LIMIT {
+            Err(error)
+        } else {
+            Ok(Self::WAIT)
+        }
     }
 }
 
@@ -2041,6 +2063,33 @@ pub fn now_date() -> HttpDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-41: a listener whose accept keeps failing never spins a core (every
+    /// failure waits) and the loop gives up only after 1,000 failures in a
+    /// row; a success in between starts the count again.
+    #[test]
+    fn test_accept_errors_back_off_and_end_after_the_limit() {
+        let error = || io::Error::from(io::ErrorKind::ConnectionAborted);
+        let mut backoff = AcceptBackoff::default();
+        for _ in 0..AcceptBackoff::LIMIT {
+            let wait = backoff.failure(error()).expect("still tolerated");
+            assert!(wait >= Duration::from_millis(10), "a failure must wait");
+        }
+        let last = backoff.failure(error()).expect_err("the limit is reached");
+        assert_eq!(last.kind(), io::ErrorKind::ConnectionAborted);
+
+        let mut backoff = AcceptBackoff::default();
+        for _ in 0..3 {
+            for _ in 0..AcceptBackoff::LIMIT {
+                assert!(backoff.failure(error()).is_ok());
+            }
+            backoff.success();
+        }
+        assert!(
+            backoff.failure(error()).is_ok(),
+            "a success resets the count"
+        );
+    }
 
     #[test]
     fn test_now_date_is_the_current_second() {

@@ -5,7 +5,10 @@
 //! `<redacted N bytes>`, for every spelling of the field name, in both the
 //! compact and the pretty form. Accessors keep returning the real values.
 
-use http_net::{ClientConn, ClientEvent, Request, Response, ServerConn, ServerEvent};
+use http_net::{
+    Asked, ClientConn, ClientEvent, FieldSpan, Limits, OwnedRequestHead, Parsed, Request, Response,
+    ServerConn, ServerEvent, parse_request_head, parse_response_head,
+};
 
 /// The four credential fields, each in several spellings.
 const SPELLINGS: &[&str] = &[
@@ -169,6 +172,69 @@ fn test_empty_credential_value_is_redacted_as_zero_bytes() {
         panic!("expected a request");
     };
     assert!(format!("{req:?}").contains("<redacted 0 bytes>"));
+}
+
+/// T-35: the views that copy or rebuild a head redact like the borrowed
+/// ones. An `Authorization: Bearer s3cr3t` request head through
+/// `RequestHead::to_owned`, through `OwnedRequestHead::from_parts` of its
+/// own `into_parts`, and through `parse_request_head` (the `Parsed` result
+/// and the head), and a response with `Set-Cookie` through
+/// `parse_response_head`, never print the secret in `{:?}` or `{:#?}` and
+/// print `<redacted N bytes>` instead.
+#[test]
+fn test_owned_and_stateless_views_debug_redact_credentials() {
+    let value = "Bearer s3cr3t";
+    let input = request_with("Authorization", value);
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(&input);
+    let ServerEvent::Request(req) = conn.poll().unwrap() else {
+        panic!("expected a request");
+    };
+    let owned = req.to_owned();
+    for shown in both(&owned) {
+        assert_redacted("OwnedRequestHead (to_owned)", &shown, value);
+        assert!(shown.contains("shown"), "{shown}");
+    }
+    for shown in both(&owned.view()) {
+        assert_redacted("OwnedRequestHead::view", &shown, value);
+    }
+    let (bytes, fields, facts) = owned.into_parts();
+    let rebuilt = OwnedRequestHead::from_parts(bytes, fields, facts).unwrap();
+    for shown in both(&rebuilt) {
+        assert_redacted("OwnedRequestHead (from_parts)", &shown, value);
+    }
+    assert_eq!(
+        rebuilt.view().header("authorization"),
+        Some(value.as_bytes())
+    );
+
+    let mut slots = [FieldSpan::default(); 16];
+    let parsed = parse_request_head(&input, &Limits::new(), &mut slots).unwrap();
+    for shown in both(&parsed) {
+        assert_redacted("Parsed<ParsedRequest>", &shown, value);
+    }
+    let Parsed::Complete { head, .. } = parsed else {
+        panic!("expected a complete head");
+    };
+    for shown in both(&head).into_iter().chain(both(&head.view())) {
+        assert_redacted("ParsedRequest", &shown, value);
+    }
+
+    let cookie = "sid=s3cr3t-session; HttpOnly";
+    let input = response_with("Set-Cookie", cookie);
+    let mut slots = [FieldSpan::default(); 16];
+    let parsed = parse_response_head(&input, &Limits::new(), Asked::default(), &mut slots).unwrap();
+    for shown in both(&parsed) {
+        assert_redacted("Parsed<ParsedResponse>", &shown, cookie);
+    }
+    let Parsed::Complete { head, .. } = parsed else {
+        panic!("expected a complete head");
+    };
+    for shown in both(&head).into_iter().chain(both(&head.view())) {
+        assert_redacted("ParsedResponse", &shown, cookie);
+        assert!(shown.contains("shown"), "{shown}");
+    }
+    assert_eq!(head.view().header("set-cookie"), Some(cookie.as_bytes()));
 }
 
 #[cfg(feature = "std")]

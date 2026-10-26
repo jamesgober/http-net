@@ -5,6 +5,25 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.6 to 0.7
+
+### A `101` must name a protocol the client offered
+
+**What changed.** `ClientConn` now switches on a `101 Switching Protocols`
+only when every protocol in the response's `Upgrade` field is one the
+request offered with `Request::upgrade` (names compare case-insensitively,
+and a bare name matches a versioned one either way). Any other `101` is
+`UnexpectedUpgrade`, as a `101` nobody asked for already was.
+
+**Why.** RFC 9110 section 7.8 lets a server switch only to a protocol the
+client listed. Accepting any protocol let a back end answering a
+`websocket` request take the connection over for something else (threat
+T-21).
+
+**What to do.** Nothing for a server that answers with the protocol it was
+offered. If you talk to a server that answers with a different spelling of
+the same protocol, offer that spelling.
+
 ## 0.5 to 0.6
 
 Nothing a 0.5 user can notice changes: every message is accepted or

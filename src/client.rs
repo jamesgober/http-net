@@ -7,7 +7,8 @@ use crate::{
     buffer::Buffer,
     error::HttpError,
     head::{
-        Asked, HeadKind, HeadScanner, Headers, ResponseHead, ResponseInfo, Scan, interpret_response,
+        Asked, HeadKind, HeadScanner, Headers, ResponseHead, ResponseInfo, Scan,
+        interpret_response, switches_to_offered,
     },
     limits::{Limits, MAX_PIPELINE_DEPTH},
     message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
@@ -288,6 +289,9 @@ pub struct ClientConn {
     info: ResponseInfo,
     asked: Asked,
     upgrade_asked: bool,
+    /// The protocols the outstanding upgrade request offered, comma
+    /// separated; a `101` may switch only to these.
+    upgrade_offer: Vec<u8>,
     state: State,
     req: ReqWrite,
     keep_alive: bool,
@@ -447,6 +451,7 @@ impl ClientConn {
                 connect: false,
             },
             upgrade_asked: false,
+            upgrade_offer: Vec::new(),
             state: State::Idle,
             req: ReqWrite::Sent,
             keep_alive: true,
@@ -609,6 +614,15 @@ impl ClientConn {
             connect: method == Method::Connect,
         };
         self.upgrade_asked = request.upgrade;
+        if request.upgrade {
+            self.upgrade_offer.clear();
+            for offer in request.upgrade_offers() {
+                if !self.upgrade_offer.is_empty() {
+                    self.upgrade_offer.push(b',');
+                }
+                self.upgrade_offer.extend_from_slice(offer);
+            }
+        }
         self.keep_alive = !request.close;
         self.idempotent = method.is_idempotent();
         self.req_chunked = matches!(request.body, OutBody::Chunked);
@@ -1039,7 +1053,16 @@ impl ClientConn {
             self.info = info;
             let status = info.status;
             let switched = if status == 101 {
-                if !self.upgrade_asked || !info.upgrade_field {
+                // RFC 9110 section 7.8: a 101 names the protocols it switches
+                // to, and only to ones the request offered.
+                let offered = self.upgrade_asked
+                    && info.upgrade_field
+                    && switches_to_offered(
+                        self.buf.from(start),
+                        &self.scanner.fields,
+                        &self.upgrade_offer,
+                    );
+                if !offered {
                     return Err(self.fail(HttpError::UnexpectedUpgrade));
                 }
                 true
@@ -1402,6 +1425,54 @@ mod tests {
         let mut conn = ClientConn::new();
         let _ = conn.feed(b"HTTP/1.1 200 OK\r\n\r\n");
         assert_eq!(conn.poll().unwrap_err(), HttpError::UnexpectedData);
+    }
+
+    /// T-21: a `101` switches only to a protocol the request offered (RFC
+    /// 9110 section 7.8); a back end answering an upgrade to something else
+    /// must not take over the connection.
+    #[test]
+    fn test_switching_protocols_must_name_an_offered_protocol() {
+        let answer = |offers: &[&str], upgrade: &str| {
+            let mut request = Request::get("/").header("host", "a");
+            for offer in offers {
+                request = request.upgrade(offer);
+            }
+            let mut conn = ClientConn::new();
+            conn.send_request(&request, &mut Vec::new()).unwrap();
+            let response = alloc::format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n{upgrade}\r\n"
+            );
+            let _ = conn.feed(response.as_bytes());
+            match conn.poll() {
+                Ok(ClientEvent::Response(r)) => {
+                    assert_eq!(r.status(), 101);
+                    matches!(conn.poll(), Ok(ClientEvent::Upgraded))
+                }
+                Err(e) => {
+                    assert_eq!(e, HttpError::UnexpectedUpgrade);
+                    false
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        // The protocol offered, in any case, with or without a version.
+        assert!(answer(&["websocket"], "Upgrade: websocket\r\n"));
+        assert!(answer(&["websocket"], "Upgrade: WebSocket\r\n"));
+        assert!(answer(&["websocket/13"], "Upgrade: websocket\r\n"));
+        assert!(answer(&["websocket"], "Upgrade: websocket/13\r\n"));
+        // One of several offers.
+        assert!(answer(&["foo", "websocket"], "Upgrade: websocket\r\n"));
+        // Anything not offered, h2c above all, or no protocol at all.
+        assert!(!answer(&["websocket"], "Upgrade: h2c\r\n"));
+        assert!(!answer(&["websocket"], "Upgrade: foo\r\n"));
+        assert!(!answer(&["websocket"], "Upgrade: websocket, foo\r\n"));
+        assert!(!answer(
+            &["websocket"],
+            "Upgrade: websocket\r\nUpgrade: foo\r\n"
+        ));
+        assert!(!answer(&["websocket/13"], "Upgrade: websocket/14\r\n"));
+        assert!(!answer(&["websocket"], "Upgrade:\r\n"));
+        assert!(!answer(&["websocket"], ""));
     }
 
     #[test]

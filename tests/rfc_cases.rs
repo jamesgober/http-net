@@ -846,6 +846,29 @@ fn test_response_cases() {
     }
 }
 
+/// T-38, HTTP/0.9 messages on the client: an HTTP/0.9 server answers a GET
+/// with the bare body and no status line. A client must not read that as a
+/// response: bytes without a status line are `InvalidStartLine`, and a
+/// status line that says `HTTP/0.9` is `UnsupportedVersion`. Whole and fed
+/// one byte at a time.
+#[test]
+fn test_http09_response_to_the_client_is_refused() {
+    for (input, expected) in [
+        (&b"<html>hi</html>\r\n\r\n"[..], HttpError::InvalidStartLine),
+        (b"HTTP/0.9 200 OK\r\n\r\n", HttpError::UnsupportedVersion),
+    ] {
+        let name = String::from_utf8_lossy(input);
+        let whole = drive_client(&get(), &[input], Limits::new());
+        assert_eq!(whole, [Ev::Err(expected)], "{name}");
+        let bytes: Vec<&[u8]> = input.chunks(1).collect();
+        assert_eq!(
+            drive_client(&get(), &bytes, Limits::new()),
+            whole,
+            "{name}: split changed the result"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 0.3 edge-case rows (specification section 12.3)
 // ---------------------------------------------------------------------------

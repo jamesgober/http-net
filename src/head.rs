@@ -607,6 +607,29 @@ pub(crate) fn protocol_matches(chosen: &[u8], element: &[u8]) -> bool {
             .is_some_and(|i| element[..i].eq_ignore_ascii_case(chosen))
 }
 
+/// Whether a `101` switches only to protocols the request offered: the
+/// response's `Upgrade` fields name at least one protocol, and every one of
+/// them matches an element of `offer` (the request's `Upgrade` value).
+/// Names compare ASCII case-insensitively; a bare name matches a versioned
+/// one either way (`websocket` and `websocket/13`).
+pub(crate) fn switches_to_offered(head: &[u8], fields: &[Field], offer: &[u8]) -> bool {
+    let mut named = false;
+    for field in fields {
+        if !field.name.get(head).eq_ignore_ascii_case(b"upgrade") {
+            continue;
+        }
+        for chosen in list_elements(field.value.get(head)) {
+            named = true;
+            let offered = list_elements(offer)
+                .any(|o| protocol_matches(chosen, o) || protocol_matches(o, chosen));
+            if !offered {
+                return false;
+            }
+        }
+    }
+    named
+}
+
 pub(crate) fn parse_version(v: &[u8]) -> Result<Version, HttpError> {
     match v {
         [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
