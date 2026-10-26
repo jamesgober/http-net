@@ -22,7 +22,7 @@ use crate::{
     },
     limits::Limits,
     method::Method,
-    syntax::{check_field_value, find_byte, is_ows, is_token},
+    scan::{check_field_value, find_byte, is_ows, is_token},
 };
 
 /// The bytes of a head and the spans of its parts, all relative to

@@ -13,8 +13,8 @@ use crate::{
     limits::{Limits, MAX_PIPELINE_DEPTH},
     message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
     method::Method,
+    scan::find_byte,
     server::Progress,
-    syntax::find_byte,
 };
 
 /// The error for sending a body the server declined (a final status in

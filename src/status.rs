@@ -219,7 +219,7 @@ pub(crate) fn write_status_line<O: crate::Output + ?Sized>(out: &mut O, status: 
         out.put(line);
     } else {
         out.put(b"HTTP/1.1 ");
-        crate::syntax::push_decimal(out, u64::from(status));
+        crate::scan::push_decimal(out, u64::from(status));
         out.put(b" \r\n");
     }
 }

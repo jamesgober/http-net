@@ -116,9 +116,9 @@ mod method;
 mod preface;
 mod raw;
 mod redact;
+mod scan;
 mod server;
 pub mod status;
-mod syntax;
 mod write;
 
 #[cfg(feature = "std")]
