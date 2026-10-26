@@ -11,6 +11,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The generic RFC 9110 field grammar now comes from the first-party crate
+  `parse-net` 0.7 (published version, `default-features = false`, itself
+  dependency-free and `no_std` without `alloc`): tokens and `tchar`, OWS
+  trimming, the field-value check, `qdtext`, hex digits, decimal parsing,
+  and the calendar behind `HttpDate`. Behaviour is unchanged byte for byte,
+  checked by equality tests against the 0.7 implementation; the public API
+  is unchanged. HTTP/1.1 framing (request-target and `Host` checks, the
+  reason phrase, the head's byte scanners, the `#list` walker, the number
+  writers) stays in this crate. http-net still has no third-party runtime
+  dependency.
+
 ---
 
 ## [0.7.0] - 2026-10-26
