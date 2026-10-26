@@ -89,6 +89,10 @@ required-features = ["std"]
 name              = "get"
 required-features = ["std"]
 
+[[example]]
+name              = "soak"
+required-features = ["std"]
+
 
 # RELEASE PROFILE
 # #################################
