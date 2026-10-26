@@ -56,7 +56,12 @@ std = []
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None. The parser, framing, and blocking adapter are all in this crate.
+# The shared RFC 9110 field grammar (tokens, OWS, field values, decimal and
+# hex digits, the civil calendar of HTTP-date). First party, zero runtime
+# dependencies of its own, `no_std` without `alloc`; by published version
+# only, never a path (spec OD-1, NFR-1). Its default feature set is empty;
+# `default-features = false` keeps it that way if one is ever added.
+parse-net = { version = "0.7", default-features = false }
 
 
 # DEV DEPENDENCIES

@@ -1,62 +1,39 @@
-//! Byte classes and small scanners for the RFC 9110 / RFC 9112 grammar.
+//! Byte classes and scanners for the RFC 9110 / RFC 9112 grammar.
 //!
-//! Every classification is a lookup in one 256-entry table, so validating a
-//! line costs one load and one mask per byte. The table is built at compile
-//! time from the ABNF, which keeps the rules in one reviewable place.
+//! Every call site in the crate reaches the grammar through this one module.
+//! The generic RFC 9110 field grammar comes from `parse-net` (spec section
+//! 7.9, OD-1): `tchar` and tokens, OWS and its trimming, the field-value
+//! check, `qdtext`, `1*DIGIT`, and hex digits. Each is a thin wrapper or a
+//! re-export, so the behaviour is parse-net's, and the tests at the end of
+//! this file hold it to the 0.7 local implementation byte for byte.
+//!
+//! What stays here is HTTP/1.1 wire framing, or grammar whose parse-net
+//! counterpart answers differently (dev/PLAN.md, D-59 and D-60): the
+//! request-target and `Host` checks, the reason phrase, the printable-run
+//! and byte-search scanners of the head's hot path, the infallible `#list`
+//! walker, and the number writers.
+
+use parse_net::{
+    ErrorKind,
+    class::{self, Class},
+    num,
+};
+pub(crate) use parse_net::{
+    class::{hex_value, is_qdtext, is_tchar},
+    text::{is_ows, is_token, trim_ows},
+};
 
 use crate::{error::HttpError, write::Output};
 
-/// `tchar`: the characters allowed in a token (method, field name, coding).
-const TCHAR: u8 = 1;
-/// `field-vchar / SP / HTAB`: the characters allowed inside a field value.
-const FIELD: u8 = 2;
-/// RFC 3986 characters allowed in a request target (`%` is checked apart).
-const TARGET: u8 = 4;
-/// `HEXDIG`.
-const HEX: u8 = 8;
-/// `qdtext`: characters allowed unescaped inside a quoted string.
-const QDTEXT: u8 = 16;
-
-const fn build_classes() -> [u8; 256] {
-    let mut t = [0u8; 256];
+/// RFC 3986 characters allowed in a request target (`%` is checked apart):
+/// `unreserved / sub-delims / ":" / "@" / "/" / "?"` and the `%` that
+/// introduces a `pct-encoded` triple.
+const fn build_target() -> [bool; 256] {
+    let mut t = [false; 256];
     let mut b = 0usize;
     while b < 256 {
         let c = b as u8;
-        let mut class = 0u8;
-        let alpha = c.is_ascii_alphabetic();
-        let digit = c.is_ascii_digit();
-        // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "."
-        //       / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
-        if alpha
-            || digit
-            || matches!(
-                c,
-                b'!' | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-        {
-            class |= TCHAR;
-        }
-        // field-vchar = VCHAR / obs-text, plus SP and HTAB inside a value.
-        if c == b'\t' || (c >= 0x20 && c != 0x7f) {
-            class |= FIELD;
-        }
-        // unreserved / sub-delims / ":" / "@" / "/" / "?" and the "%" that
-        // introduces a pct-encoded triple (whose digits are checked apart).
-        if alpha
-            || digit
+        t[b] = c.is_ascii_alphanumeric()
             || matches!(
                 c,
                 b'-' | b'.'
@@ -78,76 +55,17 @@ const fn build_classes() -> [u8; 256] {
                     | b'/'
                     | b'?'
                     | b'%'
-            )
-        {
-            class |= TARGET;
-        }
-        if c.is_ascii_hexdigit() {
-            class |= HEX;
-        }
-        // qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
-        if c == b'\t'
-            || c == b' '
-            || c == 0x21
-            || (c >= 0x23 && c <= 0x5b)
-            || (c >= 0x5d && c <= 0x7e)
-            || c >= 0x80
-        {
-            class |= QDTEXT;
-        }
-        t[b] = class;
+            );
         b += 1;
     }
     t
 }
 
-static CLASSES: [u8; 256] = build_classes();
+static TARGET: [bool; 256] = build_target();
 
 #[inline]
-fn has(b: u8, class: u8) -> bool {
-    CLASSES[b as usize] & class != 0
-}
-
-/// Whether `b` may appear in a token.
-#[inline]
-pub(crate) fn is_tchar(b: u8) -> bool {
-    has(b, TCHAR)
-}
-
-/// Whether `s` is a non-empty token.
-#[inline]
-pub(crate) fn is_token(s: &[u8]) -> bool {
-    !s.is_empty() && s.iter().all(|&b| is_tchar(b))
-}
-
-/// Whether `b` is optional whitespace (`SP / HTAB`).
-#[inline]
-pub(crate) fn is_ows(b: u8) -> bool {
-    b == b' ' || b == b'\t'
-}
-
-/// Strips `OWS` (spaces and tabs only) from both ends.
-///
-/// `<[u8]>::trim_ascii` is deliberately not used: it also strips vertical tab
-/// and form feed, which are invalid in a field value and must be rejected,
-/// not silently removed.
-#[inline]
-pub(crate) fn trim_ows(mut s: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = s {
-        if is_ows(*first) {
-            s = rest;
-        } else {
-            break;
-        }
-    }
-    while let [rest @ .., last] = s {
-        if is_ows(*last) {
-            s = rest;
-        } else {
-            break;
-        }
-    }
-    s
+fn is_target_char(b: u8) -> bool {
+    TARGET[b as usize]
 }
 
 /// The length of the run of printable ASCII (`0x20` to `0x7e`) at the start
@@ -161,8 +79,9 @@ pub(crate) fn printable_run(s: &[u8]) -> usize {
         let mut word = [0u8; 8];
         word.copy_from_slice(chunk);
         let w = u64::from_le_bytes(word);
-        // As in `check_field_value`; a marker can be false only above a true
-        // one, so the lowest is exact.
+        // The masks of the SWAR field-value check: below 0x20, DEL, high
+        // bit. A marker can be false only above a true one, so the lowest is
+        // exact.
         let low = w.wrapping_sub(0x2020_2020_2020_2020) & !w & 0x8080_8080_8080_8080;
         let del = {
             let x = w ^ 0x7f7f_7f7f_7f7f_7f7f;
@@ -181,52 +100,24 @@ pub(crate) fn printable_run(s: &[u8]) -> usize {
         .unwrap_or(rest.len())
 }
 
-/// Validates a field value (already trimmed of OWS).
+/// Validates a field value (already trimmed of OWS), with parse-net's SWAR
+/// check.
 ///
 /// A CR is reported as [`HttpError::BareCr`] because that is the smuggling
-/// vector it represents; every other control byte is
-/// [`HttpError::InvalidHeaderValue`].
+/// vector it represents; every other control byte (parse-net's `LineFeed`,
+/// `Nul`, and `Control` kinds) is [`HttpError::InvalidHeaderValue`].
 #[inline]
 pub(crate) fn check_field_value(value: &[u8]) -> Result<(), HttpError> {
-    // Fast path: plain printable ASCII, eight bytes at a time.
-    let mut chunks = value.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
-        let w = u64::from_le_bytes(word);
-        // A byte is "suspicious" when it is below 0x20, equal to 0x7f, or has
-        // the high bit set. Suspicious words drop to the exact per-byte check.
-        let low = w.wrapping_sub(0x2020_2020_2020_2020) & !w & 0x8080_8080_8080_8080;
-        let del = {
-            let x = w ^ 0x7f7f_7f7f_7f7f_7f7f;
-            x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
-        };
-        let high = w & 0x8080_8080_8080_8080;
-        if low | del | high != 0 {
-            check_field_bytes(chunk)?;
-        }
-    }
-    check_field_bytes(chunks.remainder())
-}
-
-#[inline]
-fn check_field_bytes(bytes: &[u8]) -> Result<(), HttpError> {
-    for &b in bytes {
-        if !has(b, FIELD) {
-            return Err(if b == b'\r' {
-                HttpError::BareCr
-            } else {
-                HttpError::InvalidHeaderValue
-            });
-        }
-    }
-    Ok(())
+    parse_net::scan::check_field_value(value).map_err(|e| match e.kind() {
+        ErrorKind::BareCr => HttpError::BareCr,
+        _ => HttpError::InvalidHeaderValue,
+    })
 }
 
 /// Validates a reason phrase: `*( HTAB / SP / VCHAR / obs-text )`.
 #[inline]
 pub(crate) fn is_reason(s: &[u8]) -> bool {
-    s.iter().all(|&b| has(b, FIELD))
+    class::all(s, Class::FIELD_TEXT)
 }
 
 /// Validates the characters of a request target: RFC 3986 characters only,
@@ -235,12 +126,12 @@ pub(crate) fn is_target_chars(s: &[u8]) -> bool {
     let mut i = 0;
     while i < s.len() {
         let b = s[i];
-        if !has(b, TARGET) {
+        if !is_target_char(b) {
             return false;
         }
         if b == b'%' {
             match (s.get(i + 1), s.get(i + 2)) {
-                (Some(&h1), Some(&h2)) if has(h1, HEX) && has(h2, HEX) => i += 3,
+                (Some(&h1), Some(&h2)) if class::is_hexdig(h1) && class::is_hexdig(h2) => i += 3,
                 _ => return false,
             }
         } else {
@@ -321,7 +212,7 @@ fn host_pct_ok(host: &[u8]) -> bool {
     while let Some(off) = host.get(i..).and_then(|rest| find_byte(b'%', rest)) {
         let at = i + off;
         match (host.get(at + 1), host.get(at + 2)) {
-            (Some(&h1), Some(&h2)) if has(h1, HEX) && has(h2, HEX) => i = at + 3,
+            (Some(&h1), Some(&h2)) if class::is_hexdig(h1) && class::is_hexdig(h2) => i = at + 3,
             _ => return false,
         }
     }
@@ -337,36 +228,11 @@ pub(crate) fn is_protocol(s: &[u8]) -> bool {
     }
 }
 
-/// Parses `1*DIGIT` into a `u64`, refusing signs, spaces, and overflow.
+/// Parses `1*DIGIT` into a `u64`, refusing signs, spaces, and overflow
+/// (parse-net's `parse_u64`, whose every error is `None` here).
+#[inline]
 pub(crate) fn parse_decimal(s: &[u8]) -> Option<u64> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut n: u64 = 0;
-    for &b in s {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        n = n.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
-    }
-    Some(n)
-}
-
-/// The value of one hex digit, if `b` is one.
-#[inline]
-pub(crate) fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Whether `b` may appear unescaped inside a quoted string.
-#[inline]
-pub(crate) fn is_qdtext(b: u8) -> bool {
-    has(b, QDTEXT)
+    num::parse_u64(s).ok()
 }
 
 /// Iterates the elements of a comma-separated list value, trimmed of OWS,
@@ -375,8 +241,13 @@ pub(crate) fn is_qdtext(b: u8) -> bool {
 /// A comma inside a quoted string does not end an element: `a="x,y", b` is
 /// two elements, `a="x,y"` and `b` (a backslash escapes the next byte
 /// inside the quotes). An unterminated quote runs to the end of the value.
-/// This is the walker `parse-net` specifies; it stays here until http-net
-/// takes that crate as a dependency.
+///
+/// This stays local although parse-net has a list walker (dev/PLAN.md,
+/// D-60): parse-net's `list` validates as it splits and refuses inputs this
+/// walker accepts (an unterminated quote, an unbalanced `)`, more than 16
+/// empty elements or 1024 members), and it treats `(...)` as a comment, so
+/// `(a, b)` is one element there and two here. Moving would change which
+/// requests http-net accepts.
 pub(crate) fn list_elements(value: &[u8]) -> ListSplit<'_> {
     ListSplit {
         rest: value,
@@ -530,19 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn test_field_value_fast_path_agrees_with_bytewise() {
-        for b in 0u8..=255 {
-            for pos in 0..17 {
-                let mut v = alloc::vec![b'a'; 17];
-                v[pos] = b;
-                let fast = check_field_value(&v).is_ok();
-                let slow = check_field_bytes(&v).is_ok();
-                assert_eq!(fast, slow, "byte {b:#x} at {pos}");
-            }
-        }
-    }
-
-    #[test]
     fn test_trim_ows_only_strips_space_and_tab() {
         assert_eq!(trim_ows(b" \t a b \t"), b"a b");
         assert_eq!(trim_ows(b"\x0ba\x0c"), b"\x0ba\x0c");
@@ -687,5 +545,395 @@ mod tests {
         out.push(b' ');
         push_decimal(&mut out, u64::MAX);
         assert_eq!(out, b"0 deadbeef 0 18446744073709551615");
+    }
+}
+
+/// The section 7.9 equality tests: every item that now comes from parse-net
+/// against a copy of the http-net 0.7 implementation it replaced.
+#[cfg(test)]
+mod parity_07 {
+    use alloc::{vec, vec::Vec};
+
+    use super::*;
+
+    /// The http-net 0.7 grammar, copied verbatim as the reference.
+    mod old {
+        use crate::error::HttpError;
+
+        pub(super) const TCHAR: u8 = 1;
+        pub(super) const FIELD: u8 = 2;
+        pub(super) const TARGET: u8 = 4;
+        pub(super) const HEX: u8 = 8;
+        pub(super) const QDTEXT: u8 = 16;
+
+        const fn build_classes() -> [u8; 256] {
+            let mut t = [0u8; 256];
+            let mut b = 0usize;
+            while b < 256 {
+                let c = b as u8;
+                let mut class = 0u8;
+                let alpha = c.is_ascii_alphabetic();
+                let digit = c.is_ascii_digit();
+                if alpha
+                    || digit
+                    || matches!(
+                        c,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+                {
+                    class |= TCHAR;
+                }
+                if c == b'\t' || (c >= 0x20 && c != 0x7f) {
+                    class |= FIELD;
+                }
+                if alpha
+                    || digit
+                    || matches!(
+                        c,
+                        b'-' | b'.'
+                            | b'_'
+                            | b'~'
+                            | b'!'
+                            | b'$'
+                            | b'&'
+                            | b'\''
+                            | b'('
+                            | b')'
+                            | b'*'
+                            | b'+'
+                            | b','
+                            | b';'
+                            | b'='
+                            | b':'
+                            | b'@'
+                            | b'/'
+                            | b'?'
+                            | b'%'
+                    )
+                {
+                    class |= TARGET;
+                }
+                if c.is_ascii_hexdigit() {
+                    class |= HEX;
+                }
+                if c == b'\t'
+                    || c == b' '
+                    || c == 0x21
+                    || (c >= 0x23 && c <= 0x5b)
+                    || (c >= 0x5d && c <= 0x7e)
+                    || c >= 0x80
+                {
+                    class |= QDTEXT;
+                }
+                t[b] = class;
+                b += 1;
+            }
+            t
+        }
+
+        static CLASSES: [u8; 256] = build_classes();
+
+        pub(super) fn has(b: u8, class: u8) -> bool {
+            CLASSES[b as usize] & class != 0
+        }
+
+        pub(super) fn is_token(s: &[u8]) -> bool {
+            !s.is_empty() && s.iter().all(|&b| has(b, TCHAR))
+        }
+
+        pub(super) fn is_ows(b: u8) -> bool {
+            b == b' ' || b == b'\t'
+        }
+
+        pub(super) fn trim_ows(mut s: &[u8]) -> &[u8] {
+            while let [first, rest @ ..] = s {
+                if is_ows(*first) {
+                    s = rest;
+                } else {
+                    break;
+                }
+            }
+            while let [rest @ .., last] = s {
+                if is_ows(*last) {
+                    s = rest;
+                } else {
+                    break;
+                }
+            }
+            s
+        }
+
+        pub(super) fn check_field_value(value: &[u8]) -> Result<(), HttpError> {
+            let mut chunks = value.chunks_exact(8);
+            for chunk in &mut chunks {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(chunk);
+                let w = u64::from_le_bytes(word);
+                let low = w.wrapping_sub(0x2020_2020_2020_2020) & !w & 0x8080_8080_8080_8080;
+                let del = {
+                    let x = w ^ 0x7f7f_7f7f_7f7f_7f7f;
+                    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+                };
+                let high = w & 0x8080_8080_8080_8080;
+                if low | del | high != 0 {
+                    check_field_bytes(chunk)?;
+                }
+            }
+            check_field_bytes(chunks.remainder())
+        }
+
+        pub(super) fn check_field_bytes(bytes: &[u8]) -> Result<(), HttpError> {
+            for &b in bytes {
+                if !has(b, FIELD) {
+                    return Err(if b == b'\r' {
+                        HttpError::BareCr
+                    } else {
+                        HttpError::InvalidHeaderValue
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn is_reason(s: &[u8]) -> bool {
+            s.iter().all(|&b| has(b, FIELD))
+        }
+
+        pub(super) fn parse_decimal(s: &[u8]) -> Option<u64> {
+            if s.is_empty() {
+                return None;
+            }
+            let mut n: u64 = 0;
+            for &b in s {
+                if !b.is_ascii_digit() {
+                    return None;
+                }
+                n = n.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+            }
+            Some(n)
+        }
+
+        pub(super) fn hex_value(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        }
+    }
+
+    /// A small deterministic generator (xorshift64*), so the corpus is the
+    /// same on every run and needs no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn test_classifiers_match_07_tables_for_every_byte() {
+        for b in 0u8..=255 {
+            assert_eq!(is_tchar(b), old::has(b, old::TCHAR), "tchar {b:#04x}");
+            assert_eq!(is_qdtext(b), old::has(b, old::QDTEXT), "qdtext {b:#04x}");
+            assert_eq!(class::is_hexdig(b), old::has(b, old::HEX), "hex {b:#04x}");
+            assert_eq!(
+                Class::FIELD_TEXT.contains(b),
+                old::has(b, old::FIELD),
+                "field {b:#04x}"
+            );
+            assert_eq!(
+                is_target_char(b),
+                old::has(b, old::TARGET),
+                "target {b:#04x}"
+            );
+            assert_eq!(is_ows(b), old::is_ows(b), "ows {b:#04x}");
+            assert_eq!(hex_value(b), old::hex_value(b), "hex value {b:#04x}");
+            assert_eq!(is_reason(&[b]), old::is_reason(&[b]), "reason {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn test_is_token_matches_07_on_every_one_and_two_byte_input() {
+        assert_eq!(is_token(b""), old::is_token(b""));
+        for a in 0u8..=255 {
+            assert_eq!(is_token(&[a]), old::is_token(&[a]), "{a:#04x}");
+            for b in 0u8..=255 {
+                let s = [a, b];
+                assert_eq!(is_token(&s), old::is_token(&s), "{a:#04x} {b:#04x}");
+                let s = [b'x', a, b'y', b];
+                assert_eq!(is_token(&s), old::is_token(&s), "{a:#04x} {b:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_field_value_check_matches_07_for_every_byte_at_every_position() {
+        // Filler bytes that keep the SWAR fast path (a), sit on its edges
+        // (SP, `~`), or force the bytewise path (HTAB, obs-text).
+        for filler in [b'a', b' ', b'~', b'\t', 0x80, 0xff] {
+            for b in 0u8..=255 {
+                for pos in 0..17 {
+                    let mut v = vec![filler; 17];
+                    v[pos] = b;
+                    assert_eq!(
+                        check_field_value(&v),
+                        old::check_field_value(&v),
+                        "filler {filler:#04x} byte {b:#04x} at {pos}"
+                    );
+                    assert_eq!(
+                        old::check_field_value(&v),
+                        old::check_field_bytes(&v),
+                        "reference fast path, byte {b:#04x} at {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_field_value_check_reports_the_first_of_two_bad_bytes_as_07() {
+        // CR against every other refused byte, in either order: the error
+        // kind depends on which comes first.
+        let bad: Vec<u8> = (0u8..=255).filter(|&b| !old::has(b, old::FIELD)).collect();
+        for &x in &bad {
+            for &y in &bad {
+                for i in 0..17 {
+                    for j in 0..17 {
+                        if i == j {
+                            continue;
+                        }
+                        let mut v = vec![b'a'; 17];
+                        v[i] = x;
+                        v[j] = y;
+                        assert_eq!(
+                            check_field_value(&v),
+                            old::check_field_value(&v),
+                            "{x:#04x} at {i}, {y:#04x} at {j}"
+                        );
+                    }
+                }
+            }
+        }
+        for len in 0..40 {
+            let v = vec![b'a'; len];
+            assert_eq!(check_field_value(&v), old::check_field_value(&v));
+        }
+    }
+
+    #[test]
+    fn test_trim_ows_matches_07_for_every_byte_pair_at_both_ends() {
+        for a in 0u8..=255 {
+            for b in 0u8..=255 {
+                for s in [
+                    &[a, b][..],
+                    &[a, b, b'x'],
+                    &[b'x', a, b],
+                    &[a, b, b'x', a, b],
+                    &[a, b, b'x', b'y', b, a],
+                ] {
+                    assert_eq!(trim_ows(s), old::trim_ows(s), "{s:?}");
+                }
+            }
+        }
+        assert_eq!(trim_ows(b""), old::trim_ows(b""));
+    }
+
+    #[test]
+    fn test_parse_decimal_matches_07_on_edge_cases() {
+        let mut cases: Vec<Vec<u8>> = [
+            &b""[..],
+            b"0",
+            b"00",
+            b"007",
+            b"+1",
+            b"-1",
+            b" 1",
+            b"1 ",
+            b"1\t",
+            b"1_000",
+            b"1,000",
+            b"0x10",
+            b"1e3",
+            b"\xef\xbc\x91",
+            b"18446744073709551615",
+            b"18446744073709551616",
+            b"18446744073709551620",
+            b"99999999999999999999",
+            b"184467440737095516150",
+            b"000000000000000000000000000018446744073709551615",
+            b"000000000000000000000000000018446744073709551616",
+        ]
+        .iter()
+        .map(|s| s.to_vec())
+        .collect();
+        // Every power of ten and its neighbours, to the edge of u64.
+        let mut p: u64 = 1;
+        loop {
+            for n in [p - 1, p, p + 1] {
+                cases.push(alloc::format!("{n}").into_bytes());
+            }
+            match p.checked_mul(10) {
+                Some(next) => p = next,
+                None => break,
+            }
+        }
+        for d in 0..=9u8 {
+            let mut over = b"1844674407370955161".to_vec();
+            over.push(b'0' + d);
+            cases.push(over);
+        }
+        for s in &cases {
+            assert_eq!(parse_decimal(s), old::parse_decimal(s), "{s:?}");
+        }
+        for a in 0u8..=255 {
+            assert_eq!(parse_decimal(&[a]), old::parse_decimal(&[a]), "{a:#04x}");
+            for b in 0u8..=255 {
+                let s = [a, b];
+                assert_eq!(parse_decimal(&s), old::parse_decimal(&s), "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_decimal_matches_07_on_a_generated_corpus() {
+        // Mostly digits, with the bytes a Content-Length attack uses mixed in.
+        const ALPHABET: &[u8] = b"0123456789012345678901234567890123456789+- \t,.x\x00\xff";
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..200_000 {
+            let len = rng.below(26);
+            let s: Vec<u8> = (0..len)
+                .map(|_| ALPHABET[rng.below(ALPHABET.len())])
+                .collect();
+            assert_eq!(parse_decimal(&s), old::parse_decimal(&s), "{s:?}");
+        }
+        for _ in 0..200_000 {
+            let n = rng.next() >> rng.below(64);
+            let s = alloc::format!("{n}").into_bytes();
+            assert_eq!(parse_decimal(&s), Some(n));
+            assert_eq!(parse_decimal(&s), old::parse_decimal(&s));
+        }
     }
 }
