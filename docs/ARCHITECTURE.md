@@ -18,8 +18,10 @@ see [`SECURITY.md`](SECURITY.md).
   checked before the bytes it governs are buffered.
 - **Zero-copy views.** Parsed heads are offsets into the connection's own
   buffer; accessors return slices of the bytes that arrived.
-- **No dependencies, no `unsafe`.** `#![forbid(unsafe_code)]`; the core is
-  `no_std` + `alloc`.
+- **No third-party dependencies, no `unsafe`.** `#![forbid(unsafe_code)]`;
+  the core is `no_std` + `alloc`. The one runtime dependency is the
+  first-party `parse-net` (the shared field grammar, below), itself
+  dependency-free and `no_std` without `alloc`.
 
 ## Modules
 
@@ -29,7 +31,7 @@ see [`SECURITY.md`](SECURITY.md).
 | `error.rs` | `HttpError`, the status to answer with, peer and usage categories |
 | `limits.rs` | `Limits`: every budget, and the derived buffer capacity |
 | `buffer.rs` | the bounded input buffer: pinned head, read cursor, lazy growth, compaction, pooling, wiping |
-| `syntax.rs` | the 256-entry byte-class table, word-at-a-time (SWAR) scanners, token, field-value, target, and `Host` checks, the quote-aware list walker, number writers |
+| `scan.rs` | the one module every call site uses for grammar: thin wrappers over `parse-net` (tokens, OWS, field values, `qdtext`, digits) and the HTTP/1.1 wire scanners kept here (word-at-a-time (SWAR) byte search and printable run, request-target and `Host` checks, reason phrase, the quote-aware list walker, number writers) |
 | `head.rs` | the resumable head scanner, field parsing, interpretation (framing, `Host`, `Expect`, `Upgrade`), and the borrowed views (`RequestHead`, `ResponseHead`, `Headers`, `HeaderValues`, `ListElements`) |
 | `method.rs` | `Method`, `MethodSet` |
 | `status.rs` | the status registry: `reason_phrase`, `StatusClass`, the `status` constants |
@@ -204,9 +206,42 @@ recipient could otherwise read a message differently from another hop:
 
 ## Shared grammar
 
-The generic field grammar (tokens, field values, quoted strings, list
-splitting, HTTP-date) is specified by the sibling crate `parse-net`. Until
-it is published, http-net keeps it internally behind the same shapes (the
-quote-aware list walker, the IMF-fixdate formatter); the HTTP/1.1 wire
-scanners (line finding, chunk lines, request-target and `Host` checks, the
-status line) stay here because they are framing, not field grammar.
+The generic RFC 9110 field grammar comes from the first-party crate
+`parse-net` (0.7, by published version, `default-features = false`;
+dev/PLAN.md D-59 and D-60). Every call site reaches it through `scan.rs`,
+which wraps or re-exports:
+
+| Item | parse-net function |
+|---|---|
+| `is_tchar`, `is_token` | `class::is_tchar`, `text::is_token` |
+| `is_ows`, `trim_ows` | `text::is_ows`, `text::trim_ows` (SP and HTAB only) |
+| `check_field_value` | `scan::check_field_value`; `BareCr` stays `HttpError::BareCr`, every other kind is `HttpError::InvalidHeaderValue` |
+| `is_qdtext`, `hex_value` | `class::is_qdtext`, `class::hex_value` |
+| `parse_decimal` | `num::parse_u64(..).ok()` |
+| reason phrase and `%XX` digit classes | `class::all(.., Class::FIELD_TEXT)`, `class::is_hexdig` |
+| `HttpDate` calendar | `date::civil_from_days`, `date::weekday_from_days` (both `const fn`) |
+
+What stays here, and why:
+
+- **HTTP/1.1 framing:** line finding, chunk lines, the request-target
+  character table and `%XX` check, `Host` validation (until a URL crate
+  owns RFC 3986), the status-line reason check, and the number writers.
+- **The hot-path scanners:** `find_byte` and `printable_run` sit in the
+  head scanner's inner loop and stay local until a measured parity run
+  says otherwise.
+- **The `#list` walker:** parse-net's `list` validates while it splits and
+  refuses values http-net's walker accepts (an unterminated quote, an
+  unbalanced `)`, more than 16 empty elements or 1024 members), and it reads
+  `(...)` as a comment. Moving it would change which messages are accepted.
+- **The `Date` layout and cache:** parse-net's `HttpDate::format` writes the
+  same 29 bytes, but it is not a `const fn`, and the public
+  `HttpDate::from_unix_seconds` and `DateCache::new` are. Only the calendar
+  arithmetic moved.
+
+Equality tests in `scan.rs` and `date.rs` hold every moved item to a copy of
+the 0.7 implementation: each classifier over all 256 bytes, the field-value
+check over every byte at every position of a 17-byte value (six fillers)
+and every ordered pair of refused bytes, OWS trimming for every byte pair at
+both ends, tokens and decimals over every one- and two-byte input plus a
+generated corpus of 400,000 cases, and the `Date` output for every day from
+1970 to 9999.

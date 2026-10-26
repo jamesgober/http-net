@@ -26,7 +26,7 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no third-party dependencies (one first-party: <code>parse-net</code>, the shared field grammar).
     </p>
     <blockquote>
         <strong>Status: pre-1.0 (<code>0.7.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.

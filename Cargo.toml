@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Sans-IO HTTP/1.1 server and client: strict RFC 9112 parsing, smuggling defences, bounded buffers, keep-alive, chunked bodies, upgrades, a blocking std adapter, no dependencies."
+description = "Sans-IO HTTP/1.1 server and client: strict RFC 9112 parsing, smuggling defences, bounded buffers, keep-alive, chunked bodies, upgrades, a blocking std adapter, no third-party dependencies."
 
 # Keywords (5 max)
 keywords = ["http", "server", "client", "sans-io", "protocol"]
