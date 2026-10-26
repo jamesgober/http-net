@@ -197,11 +197,14 @@ Exit criteria:
 Exit criteria:
 - [x] No open fuzz or Garden finding (Garden not run, D-58); every threat test green; soak RSS growth under 5% (3.4%); one new defence idea evaluated and recorded in `dev/PLAN.md` (the response-side httparse differential: held).
 
-## v0.8.0 - Alpha
-- [ ] Integration with first consumers: the `serve-net` engine adapter, the WASP `gateway-io` skeleton, the first `fetch-net`, LexerSketch Studio moved to 0.8. API changes from their feedback are recorded in `docs/MIGRATION.md`.
+## v0.8.0 - Alpha (DONE, 2026-10-26, two of three consumers)
+- [x] Integration with first consumers: the `serve-net` engine adapter and LexerSketch Studio run green against 0.8 with no change; the WASP `gateway-io` skeleton and the first `fetch-net` do not exist yet (D-62). No API change came from their feedback.
+- [x] The shared grammar comes from `parse-net` 0.7 (D-59 to D-61; supersedes D-13).
 
 Exit criteria:
-- [ ] Three consumers run end to end against 0.8; every P0 and P1 gap they report closed; benchmarks within 5% of 0.6.
+- [ ] Three consumers run end to end against 0.8: two do (serve-net, LexerSketch Studio); the third waits for `gateway-io` or `fetch-net` (D-62).
+- [x] Every P0 and P1 gap they report closed (none reported).
+- [x] Benchmarks within 5% of 0.6 (D-61).
 
 ## v0.9.0 - Beta and release candidates
 - [ ] API frozen as the 1.0 candidate; `0.9.x` releases contain fixes only.
