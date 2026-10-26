@@ -11,6 +11,17 @@
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-10-26
+
+Hardening: a 24-CPU-hour fuzz campaign per target, an 8-hour soak of the
+blocking server, an attack test for every threat in the specification
+(which found and fixed one client upgrade gap), a response-side
+differential against httparse, and the completed `docs/SECURITY.md` and
+`docs/PLATFORM-NOTES.md`. See `docs/MIGRATION.md` for the one change a 0.6
+user can notice.
+
 ### Security
 
 - The client switches protocols on a `101` only when every protocol its
@@ -25,6 +36,19 @@
   workload, one status line per minute, resident memory on Linux).
 - An attack test for the accept loop's back-off on persistent accept
   errors (threat T-41).
+- Attack tests for every gap the 0.7 threat audit found: non-101 answers
+  and protocol-less 101s to an upgrade, a server 101 before the body is
+  read, HTTP/0.9 responses, over-long chunk lines (and a 10 MiB stream of
+  one), an unanswered pipelining flood, the lingering-close byte cap, a
+  slow body answered `408`, wiping on reset, builder injection through
+  targets, methods, and values, reserved request fields, `Transfer-Encoding`
+  split across fields, redaction of every owned and stateless view,
+  `from_error` for every variant, and client trailers that cannot reframe.
+- `tests/prop_httparse_response.rs`: the response-side differential against
+  httparse (47,249 single-byte mutations and three property tests).
+- `docs/PLATFORM-NOTES.md`: timeouts, lingering close, ports and
+  TIME_WAIT, memory measurement, `no_std` targets, and fuzzing per
+  platform. `docs/SECURITY.md` complete, with the 0.7 hardening record.
 
 ---
 
@@ -452,7 +476,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/http-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/http-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/http-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/http-net/compare/v0.3.0...v0.4.0

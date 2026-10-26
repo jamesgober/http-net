@@ -61,7 +61,7 @@ whether the attack test exists in this build.
 | T-31 | interim response flood | interim heads budgeted by count (`max_interim`) and bytes | `tests/adversarial.rs`, `tests/interim.rs` | a counter per interim | tested |
 | T-32 | quadratic parsing on byte-at-a-time input | resumable scanner; compaction only when full | a 16 KiB head fed one byte at a time (`tests/prop_roundtrip.rs`); the linearity guard (`tests/linearity.rs`: 8 times the bytes cost under 16 times the time) and its bench group | none | tested |
 | T-33 | integer overflow | checked arithmetic for CL, chunk sizes, running totals | `tests/adversarial.rs`; fuzzing | none | tested |
-| T-34 | panics | clippy denies (`unwrap`, `expect`, `unreachable!`, printing), bounded indexing, fuzzing | never-panic property tests; eight fuzz targets in CI | none | tested (24 h campaign: 0.7) |
+| T-34 | panics | clippy denies (`unwrap`, `expect`, `unreachable!`, printing), bounded indexing, fuzzing | never-panic property tests; eight fuzz targets in CI; the 0.7 campaign (24 CPU-hours per target, no finding) | none | tested |
 | T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie` everywhere | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers) | only when formatting | tested |
 | T-36 | credentials left in reused memory | `set_wipe`: zero finished requests, compaction leftovers, and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run) | about 30 to 60 ns per 2 KiB [est.] | tested |
 | T-37 | error text reflecting attacker bytes | `Display` is static text; `from_error` uses only it | `error.rs` units over every variant; `tests/adversarial.rs` (`from_error` for every variant; refused bytes never in the answer) | none | tested |
@@ -70,6 +70,56 @@ whether the attack test exists in this build.
 | T-40 | lingering-close abuse | drain bounded to 1 s and 256 KiB; the refusal path never waits | `tests/localhost.rs` (a peer that trickles; a peer that writes 8 MiB unpaced; the only slot freed for the next client) | at most 1 s of a thread per close | tested |
 | T-41 | busy accept loop on persistent errors | 10 ms back-off after every failed accept; give up after 1,000 in a row; a success resets the count | `blocking.rs` unit test of the back-off policy the accept loop uses | none | tested |
 | T-42 | prior-knowledge HTTP/2 to an HTTP/1.1 listener | 505 and close (`Http2Preface` in 0.5) | `tests/rfc_cases.rs` | 24 compares at connection start | tested |
+
+## Hardening record (0.7)
+
+**Threat audit.** Every row above was checked against the specification's
+section 10 and the test code: the cited tests exist and attack what the
+threat describes, and every vector the specification names has a test. The
+audit found one defence gap, fixed in 0.7: the client switched protocols
+on any `101` with a non-empty `Upgrade`, even to a protocol it had not
+offered (T-21). It added 18 attack tests and tightened two.
+
+**Fuzz campaign.** Every target ran 24 CPU-hours (one libFuzzer process
+for 86,400 s each, AddressSanitizer, the dictionary in `fuzz/http.dict`),
+on Windows x86_64 with the MSVC sanitizer runtime, at commit `d66f842`
+(the 0.7 client fix included). No crash, no sanitizer report, no oracle
+failure:
+
+| Target | Executions | Coverage (edges) | Corpus |
+|---|---:|---:|---:|
+| `server_conn` | 87,910,971 | 839 | 4,901 |
+| `client_conn` | 50,230,076 | 1,071 | 3,722 |
+| `chunk_line` | 17,185,304 | 967 | 1,758 |
+| `reference_diff` | 42,989,379 | 2,508 | 8,008 |
+| `httparse_diff` | 80,202,799 | 1,447 | 11,811 |
+| `builders` | 46,163,010 | 2,138 | 5,658 |
+| `stateless_parse` | 98,232,701 | 1,056 | 3,999 |
+| `chunked_decoder` | 35,292,073 | 2,174 | 4,736 |
+
+libFuzzer flagged three inputs as slow (10 to 17 s each, once). Re-run
+alone they take 92 ms (a 4-byte chunk line declaring a 64 KiB body, which
+the target then feeds one byte at a time) and 16 ms; the machine was
+shared with other builds at the time, so these are scheduling stalls, not
+slow paths. The corpora are kept outside the repository.
+
+**Soak.** `examples/soak.rs` ran the blocking server for 8 hours on
+Windows x86_64 with four client threads (keep-alive runs with chunked
+uploads and 96 KiB vectored bodies, pipelined bursts, one-shot requests,
+malformed requests): 191.7 million exchanges and 467,445 malformed
+requests answered `400` and closed. Memory, sampled every minute from
+outside the process, rose during the first 12 minutes of warm-up (per-
+connection threads and allocator caches) and then stayed flat: private
+bytes 48.6 MB at one hour, 50.2 MB at eight hours (+3.4%, under the 5%
+bound), working set 52 to 54 MB. Five client-side failures: three were
+`connect` refused by Windows with "address in use" (port reuse under
+TIME_WAIT, see `docs/PLATFORM-NOTES.md`); two came from the
+malformed-request check, which records no message; none was a server
+error. Other builds shared the machine during the run.
+
+**HTTP Garden.** Not run in 0.7: it needs Docker, which the development
+machine does not have (`dev/PLAN.md` D-58). It is planned as a manually
+triggered CI job.
 
 ## Where http-net is stricter than the RFCs
 

@@ -1,9 +1,9 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.6.0`).** This file is the approved
+> and examples. **Status: pre-1.0 (`0.7.0`).** This file is the approved
 > design of the 1.0 surface: each item says the version it ships in. Items
-> marked **exists**, **0.3**, **0.4**, **0.5**, or **0.6** are in this build; items marked
+> marked **exists**, **0.3**, **0.4**, **0.5**, **0.6**, or **0.7** are in this build; items marked
 > with a later version are the plan and are not in the crate yet. The
 > surface may still change in the 0.x series and is frozen at `1.0.0`.
 
@@ -162,14 +162,14 @@ Each entry gives the signature, what it does, its errors, and an example.
 
 ```toml
 [dependencies]
-http-net = "0.6"
+http-net = "0.7"
 ```
 
 `no_std` (the core needs `alloc` only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.6", default-features = false }
+http-net = { version = "0.7", default-features = false }
 ```
 
 ## Quick start

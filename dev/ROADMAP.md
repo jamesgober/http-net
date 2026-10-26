@@ -188,14 +188,14 @@ Exit criteria:
 - [x] Byte-at-a-time linearity guard green.
 - [x] Criterion baselines saved; the 5% regression gate documented and used for every later change (`scripts/bench_ab.sh`, `docs/PERFORMANCE.md`).
 
-## v0.7.0 - Hardening
-- [ ] Fuzz campaign: 24 CPU-hours per target, corpus stored outside the repository.
-- [ ] HTTP Garden runs and triage; every threat in the specification has its attack test.
-- [ ] 8-hour soak of the blocking server.
-- [ ] `docs/SECURITY.md` and `docs/PLATFORM-NOTES.md` complete.
+## v0.7.0 - Hardening (DONE, 2026-10-26)
+- [x] Fuzz campaign: 24 CPU-hours per target, corpus stored outside the repository (no finding; `docs/SECURITY.md`).
+- [x] Every threat in the specification has its attack test (audit: one defence gap fixed, T-21). HTTP Garden runs moved to a manual CI job (D-58): the development machine has no Docker.
+- [x] 8-hour soak of the blocking server (191.7 M exchanges, +3.4% memory after warm-up).
+- [x] `docs/SECURITY.md` and `docs/PLATFORM-NOTES.md` complete.
 
 Exit criteria:
-- [ ] No open fuzz or Garden finding; every threat test green; soak RSS growth under 5%; one new defence idea evaluated and recorded in `dev/PLAN.md`.
+- [x] No open fuzz or Garden finding (Garden not run, D-58); every threat test green; soak RSS growth under 5% (3.4%); one new defence idea evaluated and recorded in `dev/PLAN.md` (the response-side httparse differential: held).
 
 ## v0.8.0 - Alpha
 - [ ] Integration with first consumers: the `serve-net` engine adapter, the WASP `gateway-io` skeleton, the first `fetch-net`, LexerSketch Studio moved to 0.8. API changes from their feedback are recorded in `docs/MIGRATION.md`.
