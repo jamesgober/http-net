@@ -4,7 +4,7 @@
 </h1>
 <p>
   All notable changes to <code>http-net</code> will be documented in this file. The format is based on <a href="https://keepachangelog.com/en/1.1.0/">Keep a Changelog</a>,
-  and this project adheres to <a href="https://semver.org/spec/v2.0.0.html/">Semantic Versioning</a>.
+  and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.
 </p>
 
 ---
@@ -537,5 +537,5 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 [0.5.0]: https://github.com/jamesgober/http-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/http-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/http-net/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/jamesgober/http-net/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/jamesgober/http-net/releases/tag/v0.1.0
+[0.2.0]: https://github.com/jamesgober/http-net/compare/1f3458c...v0.2.0
+[0.1.0]: https://github.com/jamesgober/http-net/commit/1f3458c

@@ -2,7 +2,9 @@
 
 How fast http-net is, how that is measured, how it compares with httparse
 and hyper, and the decisions behind the code that makes it fast. Numbers
-are for 0.6.0.
+are for 0.6.0. 0.7.0 and 0.8.0 were measured against their predecessors
+with no measurable difference ([`release/v0.8.0.md`](./release/v0.8.0.md)),
+so these 0.6.0 numbers stand.
 
 ## Method
 
@@ -10,8 +12,8 @@ are for 0.6.0.
   numbers in WSL2 Ubuntu (kernel 6.6), Rust stable 1.99, release profile
   (`lto = "fat"`, one codegen unit, as published).
 - **Harness:** criterion 0.5, 3 s measurement, 1 s warm-up, 100 samples
-  (flat sampling for the 100,000-request benches), process pinned to one
-  core with `taskset` on Linux.
+  (20 for `pipelined_100k/small_gets`), process pinned to one core with
+  `taskset` on Linux.
 - **Interleaving:** a comparison between two builds runs them alternately,
   round after round (five by default), and reports the median of each
   side, so a change in machine load falls on both. The machine had other
@@ -31,7 +33,7 @@ interleaved comparison of the working tree against a tag and marks any
 bench over the gate:
 
 ```bash
-scripts/bench_ab.sh v0.6.0 5
+scripts/bench_ab.sh v0.8.0 5
 ```
 
 ## Results
@@ -44,7 +46,7 @@ Linux x86_64 (WSL2), medians of five interleaved rounds against 0.5.0:
 | 100,000 pipelined GETs in 16 KiB reads | 10.1 ms | 8.8 ms (11.4 M requests/s) | -13% |
 | client parsing a 1 KiB response | 112 ns | 100 ns | -11% |
 | response with five fields and a 1 KiB body, serialized | 89 ns | 74 ns | -17% |
-| 1 MiB body, `Content-Length`, 16 KiB reads | 14.0 µs | 13.5 µs | -3% |
+| 1 MiB body, `Content-Length`, 16 KiB reads | 14.0 µs | 13.5 µs | -4% |
 | 1 MiB body, chunked in 4 KiB chunks | 17.6 µs | 17.0 µs | -3% (-9% in a separate run) |
 | `write_head`, the same five fields borrowed | | 128 ns | new in 0.5 |
 
@@ -52,12 +54,12 @@ Windows x86_64, the same machine, single runs: browser GET 243 ns,
 pipelined 7.8 ms, client parse 97 ns, response write 72 ns, `write_head`
 110 ns, 1 MiB bodies 13.9 and 17.3 µs. aarch64 has not been measured.
 
-### Against the targets (specification section 11.2)
+### Against the targets
 
 | Workload | Target | 0.6.0 | |
 |---|---|---|---|
 | browser GET parse and 204 | 200 ns | 234 ns | not met |
-| head parse, 12 fields (H1) | 1.20x faster than httparse with SIMD, or OD-8 decided with the gap | parity with httparse with SIMD | OD-8 decided (below) |
+| head parse, 12 fields (H1) | 1.20x faster than httparse with SIMD, or the SIMD question decided with the gap | parity with httparse with SIMD | decided (below) |
 | pipelined small GETs | 15 M requests/s | 11.4 M | not met |
 | 1 MiB `Content-Length` body | 10 µs | 13.5 µs | not met |
 | 1 MiB chunked body | 12 µs | 17.0 µs | not met |
@@ -108,7 +110,7 @@ tree), httparse 1.10.1, hyper 1.12.0:
 
 | Id | Workload | http-net | Competitor | |
 |---|---|---:|---:|---|
-| H1 | request head and framing, 12 fields | 177 ns | httparse with SIMD 172 ns; without SIMD 153 ns; parse only 104 to 114 ns | parity with SIMD, 10% behind without |
+| H1 | request head and framing, 12 fields | 177 ns | httparse with SIMD 172 ns; without SIMD 153 ns; parse only 104 to 114 ns | parity with SIMD, 16% behind without |
 | H2 | full server exchange, five fields and 1 KiB body | 250 ns (prebuilt `Response`), 406 ns (built per request) | hyper 1,382 ns (of which about 310 ns is the runtime) | 3.4 to 5.5x faster |
 | H3 | response head and framing | 50 ns | httparse 46 to 49 ns | parity to 8% behind |
 | H3 | full client exchange | 95 ns | hyper 1,239 ns (about 300 ns runtime) | 13x faster |
@@ -118,7 +120,8 @@ tree), httparse 1.10.1, hyper 1.12.0:
 
 httparse's SIMD path is slower than its own scalar path on this head: its
 lines are short (about 30 bytes), and SIMD setup does not pay off below a
-few dozen bytes per line. H6 (plaintext over sockets) waits for serve-net;
+few dozen bytes per line. H6 (plaintext over sockets) is not measured
+yet; it will run through serve-net;
 the C harnesses the specification lists as report-only (picohttpparser,
 llhttp) are not run.
 
@@ -136,17 +139,17 @@ llhttp) are not run.
 
 ### Decisions
 
-- **OD-8 (SIMD): stay with SWAR, no `unsafe`.** The specification's rule
+- **SIMD: stay with SWAR, no `unsafe`.** The specification's rule
   is to stay safe while the SWAR scanners are within 20% of httparse's
   SIMD path on H1. They are at parity, and httparse's own scalar path is
   faster than its SIMD path on this workload.
-- **NFR-8 (20% faster than the best competitor at equal or stronger
-  security): met on the full exchanges (H2: 3.4x; H5: 3.2x), not met on
-  head parsing (H1: parity with httparse's default configuration, 10%
-  behind its scalar build).** The cause is the extra validation listed
+- **20% faster than the best competitor at equal or stronger security:
+  met on the full exchanges (H2: 3.4x; H5: 3.2x), not met on head parsing
+  (H1: parity with httparse's default configuration, 16% behind its scalar
+  build).** The cause is the extra validation listed
   above, which the comparison counts in http-net's time but which httparse
   leaves to its caller. Reaching 20% ahead on H1 would need SIMD scanning
-  with `unsafe` intrinsics (OD-8 option b) or dropping checks; neither is
+  with `unsafe` intrinsics or dropping checks; neither is
   taken. Recorded as decision D-54.
 
 ## Where the time goes
@@ -157,7 +160,7 @@ Head parsing of the 12-field browser GET, measured by component during
 the request line, target, and `Host` checks the rest).
 
 What 0.6 changed, each change measured by interleaved A/B and kept only if
-it helped (`dev/PLAN.md`, decisions D-45 to D-53):
+it helped ([`dev/PLAN.md`](https://github.com/jamesgober/http-net/blob/main/dev/PLAN.md), decisions D-45 to D-53):
 
 | Change | Result |
 |---|---|

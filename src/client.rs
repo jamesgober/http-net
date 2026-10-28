@@ -256,7 +256,10 @@ enum ReqWrite {
 
 /// The client side of one HTTP/1.1 connection: a sans-IO state machine.
 ///
-/// One request is outstanding at a time. [`send_request`](Self::send_request)
+/// By default one request is outstanding at a time; with
+/// [`Limits::with_pipeline_depth`], idempotent requests may be pipelined
+/// behind it (see [`can_send`](Self::can_send)).
+/// [`send_request`](Self::send_request)
 /// serializes a [`Request`]; [`feed`](Self::feed) and [`poll`](Self::poll)
 /// parse the response. When the response allows it, the connection returns
 /// to [`ClientEvent::Idle`] and can send the next request (keep-alive).
@@ -563,9 +566,11 @@ impl ClientConn {
     ///
     /// - the first error recorded by the [`Request`] builder;
     /// - [`HttpError::MissingHost`] when the request has no `host` header;
-    /// - [`HttpError::InvalidState`] when a request is already outstanding,
-    ///   the connection is closed, or an `expect_continue` request has no
-    ///   streamed body (`content_length` or `chunked`);
+    /// - [`HttpError::InvalidState`] when a request is outstanding and this
+    ///   one cannot be pipelined (depth 1, depth full, or not idempotent with
+    ///   a full body; see [`can_send`](Self::can_send)), when the connection
+    ///   is closed or upgraded, or when an `expect_continue` request has a
+    ///   full body (it needs `content_length` or `chunked`);
     /// - [`HttpError::UnexpectedData`] when response bytes nobody asked for
     ///   are buffered.
     ///
@@ -892,7 +897,8 @@ impl ClientConn {
     ///
     /// [`HttpError::BodyLengthMismatch`] when fewer bytes than declared were
     /// sent; [`HttpError::InvalidState`] when no streamed request is in
-    /// progress.
+    /// progress, or when the server answered an `expect_continue` request
+    /// with a final status (the body must not be sent then).
     ///
     /// # Examples
     ///
@@ -1329,7 +1335,8 @@ impl ClientConn {
 
     /// Whether the connection can carry another request now: no request
     /// is outstanding (or the last response completed) and both sides allow
-    /// keep-alive.
+    /// keep-alive. With pipelining, [`can_send`](Self::can_send) says
+    /// whether another request can be sent while some are outstanding.
     ///
     /// # Examples
     ///

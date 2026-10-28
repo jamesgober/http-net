@@ -9,7 +9,7 @@ about the `blocking` adapter (feature `std`), the build, and the tooling.
 The core (`ServerConn`, `ClientConn`, the Tier-3 parsers and writers) has no
 `cfg(unix)` or `cfg(windows)` code, no I/O, and no clock: the same bytes
 give the same events and errors on every platform and however they are
-split (NFR-13). CI runs the whole test suite on Linux, macOS, and Windows,
+split. CI runs the whole test suite on Linux, macOS, and Windows,
 each on Rust stable and the 1.85 MSRV.
 
 ## Socket timeouts
@@ -22,7 +22,7 @@ the error kind depends on the platform:
 | Linux, macOS, other Unix | `io::ErrorKind::WouldBlock` (`EAGAIN`) |
 | Windows | `io::ErrorKind::TimedOut` (`WSAETIMEDOUT`) |
 
-`blocking` treats both as a timeout (`is_timeout`). A timeout that ran into
+`blocking` treats both as a timeout. A timeout that ran into
 the request deadline is answered `408` (server) or reported as a timed-out
 exchange (client); one that ran into the response deadline ends the
 connection.
@@ -76,7 +76,7 @@ macOS).
 With default features off (`--no-default-features`) the crate builds for
 `no_std` targets that have an allocator: it uses `core` and `alloc` only.
 CI builds `thumbv7em-none-eabihf` (Cortex-M4F) on stable and 1.85 on every
-push; any target with `alloc` should work. The binary still needs a
+push and pull request to `main` and `dev`; any target with `alloc` should work. The binary still needs a
 global allocator from the application. `blocking` and anything that touches
 the clock or sockets need `std`.
 

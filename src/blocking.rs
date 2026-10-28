@@ -63,8 +63,8 @@ pub enum Error {
     /// The peer sent a message this crate refuses, or a call was out of
     /// order.
     Http(HttpError),
-    /// The URL is not `http://host[:port][/path][?query]`; the text says
-    /// which part is wrong.
+    /// The URL is not `http://host[:port][/path[?query]]` (a `#fragment` is
+    /// dropped); the text says which part is wrong.
     InvalidUrl(&'static str),
 }
 
@@ -191,9 +191,9 @@ impl ServerConfig {
         self
     }
 
-    /// Sets the socket read timeout: how long a request may take to arrive,
-    /// and how long an idle keep-alive connection is held. `None` waits
-    /// forever.
+    /// Sets the socket read timeout: the longest a single read may wait for
+    /// bytes (the longest pause within a request), and how long an idle
+    /// keep-alive connection is held. `None` waits forever.
     ///
     /// # Examples
     ///
@@ -377,6 +377,8 @@ impl ServerConfig {
 ///
 /// # Examples
 ///
+/// Not run: it serves until the process ends.
+///
 /// ```no_run
 /// use http_net::{blocking::Server, Response};
 ///
@@ -464,9 +466,13 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
-    /// Asks the server to stop: it accepts no new connections, lets each
-    /// open connection finish its current exchange, waits for them, and
-    /// returns from `serve`.
+    /// Asks the server to stop: it accepts no new connections and returns
+    /// from `serve` once every open connection has ended. The stop is
+    /// checked between exchanges, so an exchange in progress finishes. An
+    /// idle keep-alive connection ends when its read timeout passes, or
+    /// after one more request if the client sends one first; with no read
+    /// timeout, `serve` does not return while a client holds an idle
+    /// connection.
     ///
     /// # Examples
     ///
@@ -579,7 +585,8 @@ impl Server {
     }
 
     /// Sets what happens to a connection after the handler answers with
-    /// `101 Switching Protocols`: `hook` receives the socket on the
+    /// `101 Switching Protocols` (or a 2xx to `CONNECT`): `hook` receives
+    /// the socket on the
     /// connection's thread. Without a hook such connections are closed.
     ///
     /// # Examples
@@ -634,9 +641,13 @@ impl Server {
     /// `Expect: 100-continue` gets `100 Continue` before its body is read;
     /// one with any other expectation is answered `417 Expectation Failed`
     /// without reading its body (RFC 9110 section 10.1.1), and the
-    /// connection is closed. Every response gets a `date` field (from
-    /// [`now_date`]) unless the handler set one. The time limits and the
-    /// request cap of [`ServerConfig`] apply to every connection.
+    /// connection is closed. A handler that returns a streamed response
+    /// (`chunked` or `content_length`, except to `HEAD`), or one that
+    /// [`ServerConn::respond`] refuses, is replaced by a `500` with
+    /// `connection: close`. Every response gets a `date` field (from
+    /// [`now_date`]) unless the handler set one, except the `503` sent to a
+    /// connection over the connection cap. The time limits and the request
+    /// cap of [`ServerConfig`] apply to every connection.
     ///
     /// # Errors
     ///
@@ -1051,7 +1062,7 @@ impl Connection {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use std::time::Duration;
     /// # fn demo(stream: std::net::TcpStream) {
     /// let conn = http_net::blocking::Connection::new(stream, http_net::Limits::new())
@@ -1074,7 +1085,7 @@ impl Connection {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use std::time::Duration;
     /// # fn demo(stream: std::net::TcpStream) {
     /// let conn = http_net::blocking::Connection::new(stream, http_net::Limits::new())
@@ -1279,7 +1290,7 @@ impl Connection {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # fn demo(conn: &mut http_net::blocking::Connection) -> Result<(), http_net::blocking::Error> {
     /// use http_net::Response;
     ///
@@ -1301,7 +1312,7 @@ impl Connection {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # fn demo(conn: &mut http_net::blocking::Connection) -> Result<(), http_net::blocking::Error> {
     /// conn.respond(&http_net::Response::new(200).chunked())?;
     /// conn.send_body(b"first")?;
@@ -1404,7 +1415,7 @@ impl Connection {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # fn demo(mut conn: http_net::blocking::Connection) {
     /// if conn.is_upgraded() {
     ///     let up = conn.into_upgraded().unwrap();
@@ -1448,7 +1459,8 @@ impl Connection {
     }
 }
 
-/// A response fetched by [`get`] or [`Client::get`], fully read.
+/// A response fetched by [`get`], [`post`], [`Client::get`], or
+/// [`Client::request`], fully read.
 ///
 /// # Examples
 ///
@@ -1503,6 +1515,8 @@ impl ClientResponse {
     ///
     /// # Examples
     ///
+    /// Not run: it needs a server on port 8080.
+    ///
     /// ```no_run
     /// let resp = http_net::blocking::get("http://127.0.0.1:8080/")?;
     /// for (name, value) in resp.headers() {
@@ -1517,6 +1531,8 @@ impl ClientResponse {
     /// The first field named `name` (ASCII case-insensitive).
     ///
     /// # Examples
+    ///
+    /// Not run: it needs a server on port 8080.
     ///
     /// ```no_run
     /// let resp = http_net::blocking::get("http://127.0.0.1:8080/")?;
@@ -1555,6 +1571,8 @@ impl ClientResponse {
     ///
     /// # Examples
     ///
+    /// Not run: it needs a server on port 8080.
+    ///
     /// ```no_run
     /// let bytes = http_net::blocking::get("http://127.0.0.1:8080/")?.into_body();
     /// # let _ = bytes;
@@ -1570,7 +1588,8 @@ impl ClientResponse {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidUrl`] for anything but `http://host[:port][/path]`,
+/// [`Error::InvalidUrl`] for anything but `http://host[:port][/path[?query]]`
+/// (a `#fragment` is dropped),
 /// [`Error::Io`] for connection failures and timeouts, [`Error::Http`] for
 /// a response this crate refuses (including one over the body limit).
 ///
@@ -1623,6 +1642,8 @@ pub fn post(url: &str, content_type: &str, body: &[u8]) -> Result<ClientResponse
 ///
 /// # Examples
 ///
+/// Not run: it serves until the process ends.
+///
 /// ```no_run
 /// use http_net::{blocking, Response};
 ///
@@ -1645,6 +1666,8 @@ where
 /// | total deadline for one exchange (connect, write, read) | none |
 ///
 /// # Examples
+///
+/// Not run: it needs a server on port 8080.
 ///
 /// ```no_run
 /// use std::time::Duration;
@@ -1761,7 +1784,9 @@ impl Client {
     /// URL supplies it); [`HttpError::InvalidState`] for a streamed body
     /// (`chunked` or `content_length`: this client sends full bodies) or an
     /// upgrade request (it cannot hand the connection over; use
-    /// [`ClientConn`]).
+    /// [`ClientConn`]). A [`Request::expect_continue`] request with its full
+    /// body fails with [`Error::Http`] of [`HttpError::InvalidState`] (the
+    /// expectation needs a streamed body).
     ///
     /// # Examples
     ///

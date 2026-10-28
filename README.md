@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no third-party dependencies (one first-party: <code>parse-net</code>, the shared field grammar).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.8.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.8.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in). The API is frozen as the 1.0 candidate from 0.9.0; only fixes land before <code>1.0.0</code> (see <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -45,7 +45,7 @@
 - Both connections carry **trailers** (reported on request, sent with `end_body_with_trailers`) and **interim responses** (`send_informational` for `103 Early Hints`; reported to the client on request), and the client can send **`Expect: 100-continue`** and hold its body back. **[`Progress`](./docs/API.md#progress)**, `set_keep_alive`, and `requests_served` give drivers what they need for deadlines and load shedding; **[`DateCache`](./docs/API.md#httpdate-and-datecache)** formats `Date` once per second.
 - **[`Method`](./docs/API.md#method)** and **[`MethodSet`](./docs/API.md#methodset)** classify methods (safe, idempotent, a bit set for routers and `Allow`); [`reason_phrase`](./docs/API.md#reason_phrase) and the [`status`](./docs/API.md#status-constants) constants cover the whole IANA status registry.
 - The client **pipelines** idempotent requests up to a configured depth; both connections can be **reset, pooled, and shrunk** while idle, and the server can **wipe** consumed input so credentials do not linger.
-- **Tier 3** for gateways and proxies, all allocation-free: [spans and copied heads](./docs/API.md#spans-raw-heads-owned-heads) for passing a head to another thread, [stateless head parsers](./docs/API.md#stateless-head-parsers), a standalone [`ChunkedDecoder`](./docs/API.md#chunkeddecoder), the [`Output` writer](./docs/API.md#output-and-the-borrowed-writer) with borrowed fields, [`forward_from`](./docs/API.md#requestforward_from) with hop-by-hop removal, and [HTTP/2 preface detection](./docs/API.md#is_h2_preface).
+- **Tier 3** for gateways and proxies (the parsers, the decoder, the writer, and copying a head into reused buffers allocate nothing): [spans and copied heads](./docs/API.md#spans-raw-heads-owned-heads) for passing a head to another thread, [stateless head parsers](./docs/API.md#stateless-head-parsers), a standalone [`ChunkedDecoder`](./docs/API.md#chunkeddecoder), the [`Output` writer](./docs/API.md#output-and-the-borrowed-writer) with borrowed fields, [`forward_from`](./docs/API.md#requestforward_from) with hop-by-hop removal, and [HTTP/2 preface detection](./docs/API.md#is_h2_preface).
 - The **[`blocking`](./docs/API.md#blocking-adapter)** module (feature `std`) drives both over `std::net`: a bounded thread-per-connection `Server`, a per-connection `Connection`, and `get`.
 
 <br>
@@ -54,17 +54,17 @@ What it guarantees, and how each guarantee is checked:
 
 | Guarantee | How it is held |
 |---|---|
-| Parsing follows RFC 9112; malformed messages get a precise error, never a guess. | 17 request accept cases, 66 request reject cases, and 18 response cases as data (`tests/rfc_cases.rs`), each run whole and one byte at a time; a differential test against an independent whole-buffer reference parser over every single-byte mutation of eight seed requests plus 8,192 random multi-byte mutations (`tests/prop_reference.rs`). |
+| Parsing follows RFC 9112; malformed messages get a precise error, never a guess. | 17 request accept cases, 67 request reject cases, and 18 response cases as data (`tests/rfc_cases.rs`), each run whole and one byte at a time; a differential test against an independent whole-buffer reference parser over every insertion or substitution of 23 boundary bytes and every deletion, at every position of eight seed requests, plus 8,192 random mutations of one to three edits (`tests/prop_reference.rs`). |
 | Request smuggling vectors are refused. | 25 CL.TE / TE.CL / TE.TE / line-ending vectors and 7 chunk-extension line-end vectors (the Funky Chunks classes), each at every split point (`tests/smuggling.rs`); after an error the connection never parses another request; outgoing messages cannot carry framing headers or CR/LF. An adversarial suite (`tests/adversarial.rs`) adds target forms and the authority, `Host` escapes, `Expect: 100-continue` and `Expect`-based desync shapes, 0.CL desync, `h2c` and unoffered upgrades, chunk and trailer edges, cumulative chunk-extension and interim-response budgets, and integer edges. |
-| Limits are enforced before allocation. | Boundary tests at the limit and one past it for line length, header bytes, header count, and body; declared lengths and chunk sizes are checked before their data is read; the input buffer never exceeds `2 * (line + headers) + 16 KiB`, and the test drivers assert the parser never waits for input with a full buffer. |
+| Limits are enforced before allocation. | Boundary tests at the limit and one past it for line length, header bytes, header count, and body; declared lengths and chunk sizes are checked before their data is read; the input buffer never exceeds `Limits::buffer_capacity()`: `head + max(head, max_trailer_bytes) + 16 KiB`, where `head = max_start_line + max_header_bytes` (64 KiB with the defaults), and the test drivers assert the parser never waits for input with a full buffer. |
 | Nothing panics on hostile bytes. | Property tests feed arbitrary bytes and dictionary-built near-HTTP to both connections, from the first byte and behind valid heads (so body, chunk, and trailer states are reached), whole and split, with default and tiny limits. |
 | The parse does not depend on how input is split. | Property tests compare whole, split, and byte-at-a-time feeding. |
 | Serialize and parse round-trip. | Property tests: requests from `ClientConn` parsed by `ServerConn`, responses the other way, with full, chunked, and fixed-length streamed bodies; absolute-form targets; keep-alive intent. |
 | Slow or stuck peers cannot pin the server. | Socket tests: a head or body trickled inside the read timeout is cut off by the request timeout with `408`; a refused client that keeps sending cannot stall the accept loop; lingering close ends after 1 s however the peer behaves. |
 | Credentials never reach logs through `Debug`. | `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` values print as `<redacted N bytes>` in every `Debug` output of the crate; `tests/redaction.rs` checks every type that prints fields, in every case spelling of the names. |
-| Steady-state parsing allocates nothing. | A counting allocator (`tests/alloc.rs`): 10,000 keep-alive requests on one `ServerConn`, and 10,000 responses (also pipelined) on one `ClientConn`, allocate nothing after warm-up; the stateless parsers, the `Output` writer, and the `ChunkedDecoder` allocate nothing at all; 10 MiB hostile streams never grow a connection past its buffer capacity. |
+| Steady-state parsing allocates nothing. | A counting allocator (`tests/alloc.rs`): 10,000 keep-alive requests on one `ServerConn`, and 10,000 responses (also pipelined) on one `ClientConn`, allocate nothing after warm-up; the stateless parsers and the `ChunkedDecoder` allocate nothing at all, and the `Output` writer allocates nothing into a reused buffer; 10 MiB hostile streams never grow a connection past its buffer capacity. |
 | It agrees with other parsers where it accepts. | A differential test against `httparse` (`tests/prop_httparse.rs`): on every request head both accept, the length, method, target, version, and fields match; every head only `httparse` accepts is one of the documented stricter refusals. An RFC 9112 / 9110 conformance table (`tests/conformance.rs`) checks one statement per row. |
-| It survives fuzzing. | Eight cargo-fuzz targets (`fuzz/`): both connections under fuzzer-chosen splits, limits, and options (client fold leniency included), the chunk-line grammar, the builders, the stateless parsers and the `ChunkedDecoder` against the connections, and differential oracles against the reference parser and `httparse`, each run in CI on every push. |
+| It survives fuzzing. | Eight cargo-fuzz targets (`fuzz/`): both connections under fuzzer-chosen splits, limits, and options (client fold leniency included), the chunk-line grammar, the builders, the stateless parsers and the `ChunkedDecoder` against the connections, and differential oracles against the reference parser and `httparse`, each run for 60 seconds in CI on every push and pull request to `main` and `dev`. |
 | It works over real sockets. | `tests/localhost.rs`: the Tier-1 server and client, keep-alive, pipelining, a 200 KB chunked upload echoed back, streamed responses, error answers, `Expect: 100-continue`, the connection cap, the upgrade hand-off, and shutdown. |
 
 <hr>
@@ -110,7 +110,7 @@ thread.join().unwrap()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The server runs one thread per connection, at most 64 at once (the next is answered `503`), with a 10 s read timeout and a 30 s deadline per request (first byte to end of body; a late request gets `408`), answers `Expect: 100-continue` itself, and adds a `date` header to every response. Requests that fail to parse are answered with the matching status (`400`, `413`, `414`, `431`, `501`, `505`) and closed; the handler never sees them. A handler that returns a streamed or invalid response gets a `500` instead of a hung client.
+The server runs one thread per connection, at most 64 at once (the next is answered `503`), with a 10 s read timeout and a 30 s deadline per request (first byte to end of body; a late request gets `408`), answers `Expect: 100-continue` itself, and adds a `date` header to every response except that fixed `503`. Requests that fail to parse are answered with the matching status (`400`, `413`, `414`, `431`, `501`, `505`) and closed; the handler never sees them. A handler that returns a streamed or invalid response gets a `500` instead of a hung client.
 
 ### The sans-IO core
 
@@ -186,6 +186,7 @@ cargo run --example passport    # copy heads out and hand them to a worker threa
 cargo run --example proxy_forward    # forward a request upstream without hop-by-hop fields
 cargo run --example serve -- 127.0.0.1:8080
 cargo run --example get -- http://127.0.0.1:8080/
+cargo run --release --example soak -- 90s 4  # mixed workload for a set time, client threads
 ```
 
 <br>
@@ -193,22 +194,22 @@ cargo run --example get -- http://127.0.0.1:8080/
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- The beta and release candidates (API frozen as the 1.0 candidate, every claim re-checked against the build), and HTTP Garden differential runs in CI: v0.9.x. See the [roadmap](./dev/ROADMAP.md).
+- The beta and release candidates (API frozen as the 1.0 candidate, every claim re-checked against the build), and HTTP Garden differential runs in CI: v0.9.x. See the [roadmap](https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md).
 - An async runtime or adapter: never; drive the sans-IO core from any loop.
-- Content codings (gzip and others): a body is delivered as sent, and a `Transfer-Encoding` other than `chunked` is refused with 501.
+- Content codings (gzip and others): a body is delivered as sent. A transfer coding before `chunked` is refused with 501 (`UnsupportedTransferEncoding`); a `Transfer-Encoding` that does not end in a single `chunked` is refused with 400 (`InvalidTransferEncoding`).
 
 <hr>
 <br>
 
 ## Performance
 
-Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen 9 9950X3D, Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.5.0 build so machine load falls on both. Method, Windows numbers, and every decision behind them: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen 9 9950X3D, Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.5.0 build so machine load falls on both. Method, Windows numbers, and every decision behind them: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). 0.7.0 and 0.8.0 were measured against their predecessors with no measurable difference ([`docs/release/v0.8.0.md`](./docs/release/v0.8.0.md)), so these 0.6.0 numbers stand.
 
 | Benchmark | 0.6.0 | vs 0.5.0 |
 |---|---:|---:|
 | 12-field browser GET, parsed and answered | ~234 ns | -23% |
 | 100,000 pipelined GETs in 16 KiB reads | ~8.8 ms (11.4 M requests/s) | -13% |
-| 1 MiB body, `Content-Length`, 16 KiB reads | ~13.5 µs | -3% |
+| 1 MiB body, `Content-Length`, 16 KiB reads | ~13.5 µs | -4% |
 | 1 MiB body, chunked in 4 KiB chunks | ~17.0 µs | -3% |
 | response with five fields and a 1 KiB body, serialized | ~74 ns | -17% |
 | client parsing a 1 KiB response | ~100 ns | -11% |
@@ -222,7 +223,7 @@ These are library-only numbers: no sockets are involved. Body events borrow the 
 
 ## Contributing
 
-See <a href="./dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for engineering standards and the definition of done. Before a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean.
+See <a href="https://github.com/jamesgober/http-net/blob/main/dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for engineering standards and the definition of done. Before a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean.
 
 <br>
 

@@ -26,8 +26,11 @@ use crate::{
 /// [`RawHead::bytes`](crate::RawHead::bytes) (or into the input of a
 /// stateless parser).
 ///
-/// Offsets are `u32` because every budget in [`Limits`] is capped at
-/// 16 MiB, so a head can never be longer. Spans stay valid when the head
+/// Offsets are `u32` because the head and trailer budgets in [`Limits`]
+/// are each capped at 16 MiB, so
+/// [`Limits::buffer_capacity`](crate::Limits::buffer_capacity) stays far
+/// below `u32::MAX`; body bytes are counted in `u64` and never indexed.
+/// Spans stay valid when the head
 /// bytes are moved or copied, which is what makes a head cheap to copy into
 /// a passport ([`RequestHead::copy_into`]).
 ///
@@ -1198,8 +1201,8 @@ impl fmt::Debug for HeaderValues<'_, '_> {
 
 /// Iterator over the elements of a list field (`#rule`) across every line
 /// with one name: what [`RequestHead::header_list`],
-/// [`ResponseHead::header_list`], and [`RequestHead::upgrade_protocols`]
-/// return. Elements are trimmed of whitespace, empty ones are skipped, and
+/// [`ResponseHead::header_list`], [`RequestHead::upgrade_protocols`], and
+/// [`RequestHead::connection_options`] return. Elements are trimmed of whitespace, empty ones are skipped, and
 /// a comma inside a quoted string does not split an element.
 ///
 /// # Examples
@@ -1648,7 +1651,8 @@ impl<'a> RequestHead<'a> {
 
     /// Whether this is an HTTP/1.1 request to switch protocols: `Connection`
     /// lists `upgrade` and an `Upgrade` field offers at least one protocol
-    /// other than `h2c` (read the offer with `header("upgrade")`). Answer
+    /// other than `h2c` (read the offers with
+    /// [`upgrade_protocols`](Self::upgrade_protocols)). Answer
     /// with [`Response::switching_protocols`](crate::Response::switching_protocols)
     /// naming an offered protocol to hand the connection over.
     ///

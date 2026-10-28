@@ -13,9 +13,10 @@ const BODY_WINDOW: usize = 16 * 1024;
 /// allocated: a declared `Content-Length` above [`max_body`](Limits::max_body)
 /// is refused on the header line, a chunk size is checked against the
 /// remaining body budget before its data is read, and the connection's input
-/// buffer can never grow past `2 * (max_start_line + max_header_bytes)` plus a
-/// fixed 16 KiB body window (64 KiB with the defaults): room for a pinned
-/// head plus one partial chunk line or trailer section.
+/// buffer can never grow past [`buffer_capacity`](Limits::buffer_capacity):
+/// `head + max(head, max_trailer_bytes) + 16 KiB`, where
+/// `head = max_start_line + max_header_bytes` (64 KiB with the defaults):
+/// room for a pinned head plus one partial chunk line or trailer section.
 ///
 /// The defaults are the budgets of LexerSketch Studio's localhost server:
 ///
@@ -28,6 +29,7 @@ const BODY_WINDOW: usize = 16 * 1024;
 /// | trailer section, trailer fields | the header budgets |
 /// | interim (1xx) responses per request (client) | 16 |
 /// | body | 1 MiB |
+/// | requests outstanding at once (client pipelining) | 1, clamped to `1..=32` |
 ///
 /// # Examples
 ///

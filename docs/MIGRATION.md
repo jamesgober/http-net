@@ -126,7 +126,7 @@ new `HttpError::FieldLineTooLong`, answered 431. In 0.3 one line could use
 the whole 16 KiB header section.
 
 **Why.** A single huge line is how a header section budget gets spent in
-one go; 8 KiB matches common proxy limits (open decision OD-21).
+one go; 8 KiB matches common proxy limits.
 
 **What to do.** If you accept very long cookies or tokens, raise it:
 
@@ -139,8 +139,10 @@ assert_eq!(limits.max_field_line(), 16 * 1024);
 
 **What changed.** `ServerConn::send_continue` returns the new
 `HttpError::InterimNotAllowed` (was `InvalidState`) for an HTTP/1.0
-request, after a body byte was read or a response started, and when called
-twice. With no request waiting for its body it is still `InvalidState`.
+request, after a body byte was read or a response started, when called
+twice, and for a request with no body left to read. With no current request
+(none arrived, or the connection failed, closed, or upgraded) it is still
+`InvalidState`.
 
 **What to do.** Match on `InterimNotAllowed` if you matched on the old
 error; both mean "skip the interim response".
@@ -235,7 +237,7 @@ with `<redacted N bytes>`, where `N` is the value's length. This covers
 case-insensitively. In 0.2.0 these values were printed in full.
 
 **Why.** A `{:?}` of a request in a log line printed session cookies and
-bearer tokens (threat T-35, requirement FR-55).
+bearer tokens (threat T-35).
 
 **What to do.** Nothing, unless a test or a log parser compared `Debug`
 output that contained one of these values. To read a value, use the
@@ -269,7 +271,8 @@ RFC 9110 section 7.8 lets a server ignore `Upgrade`, so ignoring `h2c` breaks
 no client: it falls back to HTTP/1.1.
 
 **What to do.** If you answered `h2c` upgrades, stop: route prior-knowledge
-HTTP/2 to an HTTP/2 engine instead (preface detection is planned for 0.5).
+HTTP/2 to an HTTP/2 engine instead (from 0.5, `is_h2_preface` and
+`HttpError::Http2Preface` detect it).
 
 ### A `101` must name a protocol the client offered
 
@@ -303,12 +306,13 @@ you want to handle it explicitly.
 followed by two hex digits (`Host: a%zz`, `Host: a%4`) are now refused:
 `InvalidHost` for the `Host` field, `InvalidTarget` for the authority of a
 `CONNECT` target or an absolute-form target, and `InvalidHost` from
-`Request::header("host", ...)`. Valid escapes (`a%41`), IPvFuture literals,
+`Request::header("host", ...)`. Valid escapes (`a%41`), IPvFuture literals made of hex digits, `.` and
+`:` (such as `[v1.fe80::a]`),
 an empty port (`example.com:`), and an empty `Host` (a target with no
 authority) are still accepted. A port above 65535 is still accepted by
 syntax, as RFC 3986 does not bound it.
 
-**Why.** Requirement FR-12 and threat T-18: hosts that different components
+**Why.** Threat T-18: hosts that different components
 parse differently are a routing and cache-key confusion vector, and RFC 9112
 section 3.2 requires 400 for an invalid `Host`.
 
@@ -321,8 +325,7 @@ answered 400 by the blocking server.
 no reason phrase); `ResponseHead::reason()` is then `""`. In 0.2.0 it was
 `InvalidStartLine`. The server side is unaffected.
 
-**Why.** Real servers send it, and it cannot change framing (requirement
-FR-41).
+**Why.** Real servers send it, and it cannot change framing.
 
 **What to do.** Nothing. If you relied on the error to reject such servers,
 check `reason()` yourself.

@@ -8,7 +8,7 @@
 //! this file hold it to the 0.7 local implementation byte for byte.
 //!
 //! What stays here is HTTP/1.1 wire framing, or grammar whose parse-net
-//! counterpart answers differently (dev/PLAN.md, D-59 and D-60): the
+//! counterpart answers differently (decisions D-59 and D-60): the
 //! request-target and `Host` checks, the reason phrase, the printable-run
 //! and byte-search scanners of the head's hot path, the infallible `#list`
 //! walker, and the number writers.
@@ -242,7 +242,7 @@ pub(crate) fn parse_decimal(s: &[u8]) -> Option<u64> {
 /// two elements, `a="x,y"` and `b` (a backslash escapes the next byte
 /// inside the quotes). An unterminated quote runs to the end of the value.
 ///
-/// This stays local although parse-net has a list walker (dev/PLAN.md,
+/// This stays local although parse-net has a list walker (decision
 /// D-60): parse-net's `list` validates as it splits and refuses inputs this
 /// walker accepts (an unterminated quote, an unbalanced `)`, more than 16
 /// empty elements or 1024 members), and it treats `(...)` as a comment, so
