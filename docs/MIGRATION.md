@@ -5,6 +5,24 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.8 to 0.9
+
+0.9 freezes the API as the 1.0 candidate. One change can be noticed.
+
+### `blocking::Upgraded` is `#[non_exhaustive]`
+
+**What changed.** The struct the blocking server hands to the upgrade hook
+is marked `#[non_exhaustive]`. Its fields (`stream`, `leftover`, `target`)
+are unchanged and still public.
+
+**Why.** The caller receives it and never builds it. Marking it now lets a
+1.x release add a field without breaking anyone.
+
+**What to do.** Nothing if you read its fields or move them out with
+`let Upgraded { stream, leftover, .. } = up;`. A pattern that names every
+field without `..` needs the `..`; code outside the crate can no longer
+build an `Upgraded` with a struct literal.
+
 ## 0.7 to 0.8
 
 Nothing a 0.7 user can notice changes. The generic field grammar (tokens,

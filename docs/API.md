@@ -2694,6 +2694,7 @@ head and its complete body. **Ships:** exists.
 ### `blocking::Upgraded`
 
 ```rust,ignore
+#[non_exhaustive]
 pub struct Upgraded {
     pub stream: TcpStream,
     pub leftover: Vec<u8>,
@@ -2702,7 +2703,9 @@ pub struct Upgraded {
 ```
 
 The socket after a 101, the bytes of the new protocol already read, and the
-request target. **Ships:** exists.
+request target. Handed to the upgrade hook, never built by the caller, so it
+is `#[non_exhaustive]`: a later field is not a breaking change. **Ships:**
+exists; `#[non_exhaustive]` since 0.9.0.
 
 ### `blocking::get`
 

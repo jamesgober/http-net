@@ -11,6 +11,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `blocking::Upgraded` is `#[non_exhaustive]`, so a 1.x release can add a
+  field; its fields are unchanged. A pattern naming every field needs `..`
+  (`docs/MIGRATION.md`).
+
 ---
 
 ## [0.8.0] - 2026-10-26

@@ -394,6 +394,7 @@ impl ServerConfig {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Upgraded {
     /// The socket, now speaking the new protocol.
     pub stream: TcpStream,
