@@ -13,6 +13,36 @@
 
 ---
 
+## [0.8.0] - 2026-10-26
+
+Alpha: the shared RFC 9110 field grammar comes from the first-party crate
+`parse-net`, and the first consumers (serve-net, LexerSketch Studio) run
+end to end against this release with no change. Nothing a 0.7 user can
+notice changes.
+
+### Changed
+
+- The generic RFC 9110 field grammar now comes from the first-party crate
+  `parse-net` 0.7 (published version, `default-features = false`, itself
+  dependency-free and `no_std` without `alloc`): tokens and `tchar`, OWS
+  trimming, the field-value check, `qdtext`, hex digits, decimal parsing,
+  and the calendar behind `HttpDate`. Behaviour is unchanged byte for byte,
+  checked by equality tests against the 0.7 implementation; the public API
+  is unchanged. HTTP/1.1 framing (request-target and `Host` checks, the
+  reason phrase, the head's byte scanners, the `#list` walker, the number
+  writers) stays in this crate. http-net still has no third-party runtime
+  dependency.
+
+### Added
+
+- Equality tests for every item taken from `parse-net`: each classifier
+  over every byte, the field-value check at every position of a 17-byte
+  value and on every pair of refused bytes, OWS trimming at both ends,
+  decimal parsing on 400,000 generated cases, and the `Date` output for
+  every day from 1970 to 9999, each against the 0.7 implementation.
+
+---
+
 ## [0.7.0] - 2026-10-26
 
 Hardening: a 24-CPU-hour fuzz campaign per target, an 8-hour soak of the
@@ -476,7 +506,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/http-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/http-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/http-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/http-net/compare/v0.4.0...v0.5.0

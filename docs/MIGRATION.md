@@ -5,6 +5,15 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.7 to 0.8
+
+Nothing a 0.7 user can notice changes. The generic field grammar (tokens,
+whitespace, the field-value check, decimal and hex digits, the calendar
+behind `Date`) now comes from the first-party crate `parse-net` 0.7; every
+input is accepted or refused exactly as before, with the same errors, and
+every serialized byte is the same. `parse-net` has no dependencies of its
+own and builds without `std` or `alloc`, so `no_std` builds are unaffected.
+
 ## 0.6 to 0.7
 
 ### A `101` must name a protocol the client offered

@@ -26,10 +26,10 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no third-party dependencies (one first-party: <code>parse-net</code>, the shared field grammar).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.7.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.8.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in); the public API may still change in the 0.x series and is frozen at <code>1.0.0</code>, after LexerSketch Studio has used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -74,14 +74,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.7"
+http-net = "0.8"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.7", default-features = false }
+http-net = { version = "0.8", default-features = false }
 ```
 
 <hr>
@@ -193,7 +193,7 @@ cargo run --example get -- http://127.0.0.1:8080/
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- Integration with the first consumers (serve-net, the WASP gateway, fetch-net, LexerSketch Studio), and HTTP Garden differential runs in CI: v0.8.0. See the [roadmap](./dev/ROADMAP.md).
+- The beta and release candidates (API frozen as the 1.0 candidate, every claim re-checked against the build), and HTTP Garden differential runs in CI: v0.9.x. See the [roadmap](./dev/ROADMAP.md).
 - An async runtime or adapter: never; drive the sans-IO core from any loop.
 - Content codings (gzip and others): a body is delivered as sent, and a `Transfer-Encoding` other than `chunked` is refused with 501.
 

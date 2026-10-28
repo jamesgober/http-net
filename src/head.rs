@@ -16,7 +16,7 @@ use crate::{
     limits::Limits,
     method::Method,
     redact::{FieldName, FieldValue},
-    syntax::{
+    scan::{
         ListSplit, check_field_value, find_byte, is_host_value, is_ows, is_reason, is_target_chars,
         is_tchar, is_token, list_elements, parse_decimal, printable_run, trim_ows,
     },

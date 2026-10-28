@@ -2,9 +2,11 @@
 //!
 //! The core has no clock (it is sans-IO and `no_std`): the caller supplies
 //! the time as Unix seconds. The blocking adapter wraps the system clock in
-//! `blocking::now_date`. The formatting grammar is RFC 9110 section 5.6.7;
-//! it moves to `parse-net` once http-net depends on it, and the cache stays
-//! here.
+//! `blocking::now_date`. The formatting grammar is RFC 9110 section 5.6.7:
+//! the civil calendar (days to year, month, day, and weekday) is
+//! `parse-net`'s, the 29-byte layout and the cache stay here (dev/PLAN.md,
+//! D-59). parse-net's own `HttpDate::format` writes the same bytes but is not
+//! a `const fn`, and `HttpDate::from_unix_seconds` and `DateCache::new` are.
 
 use core::fmt;
 
@@ -40,7 +42,8 @@ impl HttpDate {
     /// ```
     #[must_use]
     pub const fn from_unix_seconds(secs: u64) -> Self {
-        const WEEKDAYS: [&[u8; 3]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
+        // ISO 8601 order, as parse-net's `weekday_from_days` counts (1 = Monday).
+        const WEEKDAYS: [&[u8; 3]; 7] = [b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat", b"Sun"];
         const MONTHS: [&[u8; 3]; 12] = [
             b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
             b"Dec",
@@ -50,15 +53,18 @@ impl HttpDate {
         } else {
             secs
         };
-        let days = secs / 86_400;
+        // At most 2,932,896 days after the clamp, so the cast is exact.
+        let days = (secs / 86_400) as i64;
         let rem = secs % 86_400;
-        let (year, month, day) = civil_from_days(days);
+        let (year, month, day) = parse_net::date::civil_from_days(days);
+        let weekday = parse_net::date::weekday_from_days(days);
         let mut out = *b"Thu, 01 Jan 1970 00:00:00 GMT";
-        copy3(&mut out, 0, WEEKDAYS[(days % 7) as usize]);
-        two_digits(&mut out, 5, day);
+        copy3(&mut out, 0, WEEKDAYS[(weekday - 1) as usize]);
+        two_digits(&mut out, 5, day as u64);
         copy3(&mut out, 8, MONTHS[(month - 1) as usize]);
-        two_digits(&mut out, 12, year / 100);
-        two_digits(&mut out, 14, year % 100);
+        // Years 1970 to 9999 after the clamp.
+        two_digits(&mut out, 12, year as u64 / 100);
+        two_digits(&mut out, 14, year as u64 % 100);
         two_digits(&mut out, 17, rem / 3600);
         two_digits(&mut out, 20, rem % 3600 / 60);
         two_digits(&mut out, 23, rem % 60);
@@ -195,21 +201,6 @@ const fn two_digits(dst: &mut [u8; 29], at: usize, v: u64) {
     dst[at + 1] = b'0' + (v % 10) as u8;
 }
 
-/// Days since 1970-01-01 to (year, month 1..=12, day 1..=31), after Howard
-/// Hinnant's `civil_from_days`, for dates on or after the epoch.
-const fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + (month <= 2) as u64;
-    (year, month, day)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +226,8 @@ mod tests {
     fn test_civil_from_days_matches_a_day_by_day_walk() {
         let (mut y, mut m, mut d) = (1970u64, 1u64, 1u64);
         for days in 0..157_000u64 {
-            assert_eq!(civil_from_days(days), (y, m, d), "day {days}");
+            let (py, pm, pd) = parse_net::date::civil_from_days(days as i64);
+            assert_eq!((py as u64, pm as u64, pd as u64), (y, m, d), "day {days}");
             let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
             let len = match m {
                 2 if leap => 29,
@@ -252,6 +244,92 @@ mod tests {
                     y += 1;
                 }
             }
+        }
+    }
+
+    /// The http-net 0.7 formatter, copied verbatim as the reference for the
+    /// section 7.9 equality test.
+    mod old {
+        use super::super::{MAX_SECONDS, copy3, two_digits};
+
+        pub(super) const fn from_unix_seconds(secs: u64) -> [u8; 29] {
+            const WEEKDAYS: [&[u8; 3]; 7] =
+                [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
+            const MONTHS: [&[u8; 3]; 12] = [
+                b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct",
+                b"Nov", b"Dec",
+            ];
+            let secs = if secs > MAX_SECONDS {
+                MAX_SECONDS
+            } else {
+                secs
+            };
+            let days = secs / 86_400;
+            let rem = secs % 86_400;
+            let (year, month, day) = civil_from_days(days);
+            let mut out = *b"Thu, 01 Jan 1970 00:00:00 GMT";
+            copy3(&mut out, 0, WEEKDAYS[(days % 7) as usize]);
+            two_digits(&mut out, 5, day);
+            copy3(&mut out, 8, MONTHS[(month - 1) as usize]);
+            two_digits(&mut out, 12, year / 100);
+            two_digits(&mut out, 14, year % 100);
+            two_digits(&mut out, 17, rem / 3600);
+            two_digits(&mut out, 20, rem % 3600 / 60);
+            two_digits(&mut out, 23, rem % 60);
+            out
+        }
+
+        /// Days since 1970-01-01 to (year, month 1..=12, day 1..=31), after Howard
+        /// Hinnant's `civil_from_days`, for dates on or after the epoch.
+        pub(super) const fn civil_from_days(days: u64) -> (u64, u64, u64) {
+            let z = days + 719_468;
+            let era = z / 146_097;
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + (month <= 2) as u64;
+            (year, month, day)
+        }
+    }
+
+    /// Every day from 1970 to 9999, at a second that moves through every
+    /// hour, minute, and second value: the new formatter writes the bytes
+    /// the 0.7 one wrote, and parse-net's `HttpDate::format` agrees.
+    #[test]
+    fn test_formatter_matches_07_on_every_day_to_9999() {
+        let last_day = MAX_SECONDS / 86_400;
+        for day in 0..=last_day {
+            let secs = day * 86_400 + (day * 7_919) % 86_400;
+            let new = *HttpDate::from_unix_seconds(secs).as_bytes();
+            assert_eq!(new, old::from_unix_seconds(secs), "{secs}");
+            let pn = parse_net::HttpDate::from_unix(secs as i64).map(|d| d.format());
+            assert_eq!(pn, Ok(new), "{secs}");
+        }
+        for secs in [
+            0,
+            1,
+            86_399,
+            MAX_SECONDS - 1,
+            MAX_SECONDS,
+            MAX_SECONDS + 1,
+            u64::MAX / 2,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                *HttpDate::from_unix_seconds(secs).as_bytes(),
+                old::from_unix_seconds(secs),
+                "{secs}"
+            );
+        }
+        for secs in 0..86_400 * 2 {
+            assert_eq!(
+                *HttpDate::from_unix_seconds(secs).as_bytes(),
+                old::from_unix_seconds(secs),
+                "{secs}"
+            );
         }
     }
 

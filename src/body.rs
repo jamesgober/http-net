@@ -4,7 +4,7 @@ use crate::{
     error::HttpError,
     head::{BodyFraming, HeadKind, HeadScanner, Scan, find_line},
     limits::Limits,
-    syntax::{hex_value, is_ows, is_qdtext, is_tchar, push_decimal, push_hex},
+    scan::{hex_value, is_ows, is_qdtext, is_tchar, push_decimal, push_hex},
     write::Output,
 };
 

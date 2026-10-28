@@ -18,7 +18,7 @@ use crate::{
     head::{BodyFraming, RequestHead, check_target, is_h2c},
     method::Method,
     redact::{SerializedFields, serialized_fields},
-    syntax::{check_field_value, is_protocol, is_token, trim_ows},
+    scan::{check_field_value, is_protocol, is_token, trim_ows},
     write::Output,
 };
 
@@ -757,7 +757,7 @@ impl Request {
         if self.error.is_none() {
             let value = value.as_ref();
             let is_host = name.eq_ignore_ascii_case("host");
-            if is_host && (self.has_host || !crate::syntax::is_host_value(value)) {
+            if is_host && (self.has_host || !crate::scan::is_host_value(value)) {
                 self.error = Some(HttpError::InvalidHost);
             } else if let Err(e) = push_field(&mut self.fields, name, value, REQUEST_RESERVED) {
                 self.error = Some(e);

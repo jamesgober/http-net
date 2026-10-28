@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.7.0"
+version = "0.8.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Sans-IO HTTP/1.1 server and client: strict RFC 9112 parsing, smuggling defences, bounded buffers, keep-alive, chunked bodies, upgrades, a blocking std adapter, no dependencies."
+description = "Sans-IO HTTP/1.1 server and client: strict RFC 9112 parsing, smuggling defences, bounded buffers, keep-alive, chunked bodies, upgrades, a blocking std adapter, no third-party dependencies."
 
 # Keywords (5 max)
 keywords = ["http", "server", "client", "sans-io", "protocol"]
@@ -56,7 +56,12 @@ std = []
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None. The parser, framing, and blocking adapter are all in this crate.
+# The shared RFC 9110 field grammar (tokens, OWS, field values, decimal and
+# hex digits, the civil calendar of HTTP-date). First party, zero runtime
+# dependencies of its own, `no_std` without `alloc`; by published version
+# only, never a path (spec OD-1, NFR-1). Its default feature set is empty;
+# `default-features = false` keeps it that way if one is ever added.
+parse-net = { version = "0.7", default-features = false }
 
 
 # DEV DEPENDENCIES
