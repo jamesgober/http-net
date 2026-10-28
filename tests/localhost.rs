@@ -1108,3 +1108,37 @@ fn test_large_full_body_is_written_with_the_head_and_keeps_alive() {
         assert!(matches!(conn.poll().unwrap(), ClientEvent::Idle));
     }
 }
+
+/// A-241: a bare `Connection` whose request misses its request deadline
+/// reports `Error::Io` of kind `TimedOut` on every platform (fixed in
+/// 0.9.0: Unix reported the expired socket timeout as `WouldBlock`).
+#[test]
+fn test_connection_request_deadline_is_timed_out_on_every_platform() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();
+        // Hold the connection open, silent, past the deadline.
+        thread::sleep(Duration::from_millis(1500));
+        drop(stream);
+    });
+    let (stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut conn = Connection::new(stream, Limits::new())
+        .with_request_timeout(Some(Duration::from_millis(300)));
+    let started = Instant::now();
+    let outcome = conn.next_request().map(|r| r.is_some());
+    let waited = started.elapsed();
+    assert!(
+        matches!(&outcome, Err(blocking::Error::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+        "{outcome:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(250) && waited < Duration::from_millis(1400),
+        "the request was cut after {waited:?}"
+    );
+    client.join().unwrap();
+}

@@ -888,7 +888,16 @@ impl ServerConn {
         match self.state {
             ReqState::Head if self.buf.from(self.buf.pin()).is_empty() => Progress::Idle,
             ReqState::Head => Progress::Head,
-            ReqState::Body if self.resp == RespState::Sent => Progress::Closed,
+            // Answered before `RequestEnd` was polled. An unread body closes
+            // the connection (`poll`); a read one (or none) is the same as
+            // `Complete`.
+            ReqState::Body if self.resp == RespState::Sent => {
+                if self.decoder.is_read() && self.keep_alive {
+                    Progress::Idle
+                } else {
+                    Progress::Closed
+                }
+            }
             ReqState::Body if !self.decoder.is_read() => Progress::Body,
             ReqState::Body => Progress::AwaitingResponse,
             ReqState::Complete if self.resp != RespState::Sent => Progress::AwaitingResponse,

@@ -346,7 +346,8 @@ impl fmt::Display for HttpError {
             Self::BodyNotAllowed => "this status code cannot carry a body",
             Self::BodyLengthMismatch => "streamed body length differs from the declared length",
             Self::InterimNotAllowed => {
-                "interim response not allowed now (HTTP/1.0 peer, after the final response,                  or 100 Continue after the body began)"
+                "interim response not allowed now (HTTP/1.0 peer, after the final response, \
+                 or 100 Continue after the body began)"
             }
             Self::TrailerNotAllowed => {
                 "field not allowed in trailers, or trailers on a body that is not chunked"
@@ -448,6 +449,9 @@ mod tests {
                 text.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
                 "{e:?}: {text}"
             );
+            // A missing line continuation leaves a run of indentation.
+            assert!(!text.contains("  "), "{e:?}: {text}");
+            assert_eq!(text.trim(), text, "{e:?}");
         }
     }
 

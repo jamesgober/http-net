@@ -17,6 +17,24 @@
   field; its fields are unchanged. A pattern naming every field needs `..`
   (`docs/MIGRATION.md`).
 
+### Fixed
+
+- **Security (T-35):** `ResponseHeadRef` and `blocking::Connection`
+  printed credential values in their `Debug` output (`ResponseHeadRef`
+  derived it; `Connection` kept the last request body and serialized
+  response and printed both). `ResponseHeadRef` now redacts
+  `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` like
+  every other type, and `Connection` prints its buffers as lengths only.
+  Both are in `tests/redaction.rs`.
+- `ServerConn::progress` reported `Closed` for a keep-alive request with no
+  body left to read that was answered before `RequestEnd` was polled (for
+  example a `GET` answered at `ServerEvent::Request`). It now reports
+  `Idle`, so a driver that closes on `Closed` keeps the connection.
+- `blocking::Connection` reported a missed request deadline as
+  `WouldBlock` on Unix; it is `TimedOut` on every platform, as documented.
+- The `Display` text of `HttpError::InterimNotAllowed` contained a run of
+  spaces (a missing line continuation).
+
 ---
 
 ## [0.8.0] - 2026-10-26

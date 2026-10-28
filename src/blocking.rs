@@ -883,6 +883,14 @@ fn response_timed_out() -> Error {
     ))
 }
 
+/// The error for a request that missed its deadline.
+fn request_timed_out() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the request did not arrive within the request timeout",
+    ))
+}
+
 fn is_timeout(e: &io::Error) -> bool {
     // Unix reports an expired socket timeout as WouldBlock, Windows as
     // TimedOut.
@@ -960,7 +968,6 @@ impl<'a> Incoming<'a> {
 /// assert!(reply.ends_with(b"\r\n\r\n3"));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
     conn: ServerConn,
@@ -986,6 +993,23 @@ pub struct Connection {
     /// before the body is read; a bare `Connection` leaves them to the
     /// caller.
     refuse_unknown_expectations: bool,
+}
+
+/// The buffers print as lengths only: they hold the last request body and
+/// the last serialized response, which may carry credentials.
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("stream", &self.stream)
+            .field("conn", &self.conn)
+            .field("body_len", &self.body.len())
+            .field("out_len", &self.out.len())
+            .field("read_timeout", &self.read_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("response_deadline", &self.response_deadline)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Connection {
@@ -1101,16 +1125,17 @@ impl Connection {
                 self.deadline = Some(Instant::now() + limit);
             }
         }
+        // Whether this read's timeout is the time left before the deadline,
+        // so a timeout means the deadline passed.
+        let mut at_deadline = false;
         match self.deadline {
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the request did not arrive within the request timeout",
-                    )));
+                    return Err(request_timed_out());
                 }
                 let wait = self.read_timeout.map_or(left, |t| t.min(left));
+                at_deadline = wait == left;
                 self.stream.set_read_timeout(Some(wait))?;
                 self.shortened = true;
             }
@@ -1129,6 +1154,9 @@ impl Connection {
         let n = loop {
             match self.stream.read(spare) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // Unix reports the expired socket timeout as `WouldBlock`;
+                // the deadline is reported as `TimedOut` on every platform.
+                Err(e) if at_deadline && is_timeout(&e) => return Err(request_timed_out()),
                 other => break other?,
             }
         };

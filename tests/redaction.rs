@@ -267,3 +267,64 @@ fn test_blocking_client_response_debug_redacts_set_cookie() {
     stop.shutdown();
     thread.join().unwrap().unwrap();
 }
+
+/// `ResponseHeadRef` (the allocation-free writer's head) redacts like every
+/// other type that prints fields (fixed in 0.9.0: it derived `Debug`).
+#[test]
+fn test_response_head_ref_debug_redacts_every_spelling() {
+    use http_net::{OutgoingBody, ResponseHeadRef};
+
+    for &name in SPELLINGS {
+        let value = secret(name);
+        let fields: &[(&str, &[u8])] = &[(name, value.as_bytes()), ("x-visible", b"shown")];
+        let head = ResponseHeadRef::new(200, fields, OutgoingBody::Empty);
+        for shown in both(&head) {
+            assert_redacted(name, &shown, &value);
+            assert!(shown.contains("shown"), "{shown}");
+            assert!(shown.contains("200"), "{shown}");
+        }
+    }
+}
+
+/// `blocking::Connection` holds the last request body and the last
+/// serialized response; its `Debug` prints their lengths only (fixed in
+/// 0.9.0: it derived `Debug` and printed both).
+#[cfg(feature = "std")]
+#[test]
+fn test_blocking_connection_debug_never_prints_its_buffers() {
+    use std::io::{Read, Write};
+
+    use http_net::{Limits, blocking::Connection};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 20\r\n\r\ns3cr3t-request-body!",
+            )
+            .unwrap();
+        let mut reply = Vec::new();
+        let mut buf = [0u8; 512];
+        while !reply.windows(2).any(|w| w == b"ok") {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0);
+            reply.extend_from_slice(&buf[..n]);
+        }
+    });
+    let (stream, _) = listener.accept().unwrap();
+    let mut conn = Connection::new(stream, Limits::new());
+    assert!(conn.next_request().unwrap().is_some());
+    conn.respond(&Response::text(200, "ok").header("set-cookie", "sid=s3cr3t-session"))
+        .unwrap();
+    client.join().unwrap();
+    for shown in both(&conn) {
+        assert!(!shown.contains("s3cr3t"), "secret printed in {shown}");
+        assert!(
+            !shown.contains("115, 51, 99"),
+            "secret bytes printed in {shown}"
+        );
+        assert!(shown.contains("out_len"), "{shown}");
+    }
+}
