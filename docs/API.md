@@ -1,7 +1,7 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.8.0`).** This file describes the 1.0
+> and examples. **Status: pre-1.0 (`0.9.0`).** This file describes the 1.0
 > surface: each item says the version it ships in, and every item listed
 > is in this build (the two planned items are under
 > [Planned after 1.0](#planned-after-10)). The API is frozen as the 1.0
@@ -172,14 +172,14 @@ every example block runs as a doctest (`src/lib.rs`, `ApiDoctests`).
 
 ```toml
 [dependencies]
-http-net = "0.8"
+http-net = "0.9"
 ```
 
 `no_std` (the core needs `alloc` only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.8", default-features = false }
+http-net = { version = "0.9", default-features = false }
 ```
 
 ## Quick start

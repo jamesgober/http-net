@@ -3,7 +3,8 @@
 //! stopped and the buffer compacts only when full, so 8 times the bytes
 //! must cost about 8 times the time; a scanner that re-read the head on
 //! each call would cost about 64 times. The test compares sizes within one
-//! run (best of five each), so it holds on slow and busy machines alike.
+//! run (best of nine each, the sizes alternating), so it holds on slow and
+//! busy machines alike.
 
 use std::time::{Duration, Instant};
 
@@ -45,19 +46,22 @@ fn byte_at_a_time(conn: &mut ServerConn, head: &[u8]) -> Duration {
     }
 }
 
-fn best_of_five(size: usize) -> Duration {
-    let head = head(size);
+/// The best of nine runs at each size, the sizes alternating so a burst of
+/// load on a shared machine falls on both rather than on one.
+fn best_of_nine_interleaved(small: usize, large: usize) -> (Duration, Duration) {
+    let (small, large) = (head(small), head(large));
     let mut conn = ServerConn::with_limits(limits());
-    (0..5)
-        .map(|_| byte_at_a_time(&mut conn, &head))
-        .min()
-        .expect("five runs")
+    let mut best = (Duration::MAX, Duration::MAX);
+    for _ in 0..9 {
+        best.0 = best.0.min(byte_at_a_time(&mut conn, &small));
+        best.1 = best.1.min(byte_at_a_time(&mut conn, &large));
+    }
+    best
 }
 
 #[test]
 fn test_byte_at_a_time_cost_grows_linearly_with_the_head() {
-    let small = best_of_five(4 * 1024);
-    let large = best_of_five(32 * 1024);
+    let (small, large) = best_of_nine_interleaved(4 * 1024, 32 * 1024);
     let ratio = large.as_secs_f64() / small.as_secs_f64();
     assert!(
         ratio < 16.0,

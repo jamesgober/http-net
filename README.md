@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no third-party dependencies (one first-party: <code>parse-net</code>, the shared field grammar).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.8.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in). The API is frozen as the 1.0 candidate from 0.9.0; only fixes land before <code>1.0.0</code> (see <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.9.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in). The API is frozen as the 1.0 candidate from 0.9.0; only fixes land before <code>1.0.0</code> (see <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -74,14 +74,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.8"
+http-net = "0.9"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.8", default-features = false }
+http-net = { version = "0.9", default-features = false }
 ```
 
 <hr>
@@ -194,7 +194,7 @@ cargo run --release --example soak -- 90s 4  # mixed workload for a set time, cl
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- The beta and release candidates (API frozen as the 1.0 candidate, every claim re-checked against the build), and HTTP Garden differential runs in CI: v0.9.x. See the [roadmap](https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md).
+- The triage of the first HTTP Garden runs (the job exists from 0.9.0) and `1.0.0` itself: v0.9.x, then 1.0 after the audit in [`docs/STABILITY-1.0.md`](./docs/STABILITY-1.0.md). See the [roadmap](https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md).
 - An async runtime or adapter: never; drive the sans-IO core from any loop.
 - Content codings (gzip and others): a body is delivered as sent. A transfer coding before `chunked` is refused with 501 (`UnsupportedTransferEncoding`); a `Transfer-Encoding` that does not end in a single `chunked` is refused with 400 (`InvalidTransferEncoding`).
 
@@ -215,6 +215,8 @@ Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen
 | client parsing a 1 KiB response | ~100 ns | -11% |
 
 Against other libraries, on identical bytes ([`http-net-bench`](https://github.com/jamesgober/http-net-bench)): a full server exchange takes ~250 ns against hyper's ~1.4 µs (3.4 to 5.5x faster), 100,000 pipelined requests 7.3 ms against hyper's 23.6 ms, and a client exchange 95 ns against hyper's 1.24 µs. Parsing a head alone is level with httparse (~177 ns against ~172 ns with httparse's SIMD) while also validating the `Host` value, the target, every value byte, and the framing rules, with no `unsafe` code.
+
+Feature by feature against hyper, httparse, h11, llhttp, picohttpparser, and the `http` crate, each cell checked: [`docs/PARITY.md`](./docs/PARITY.md).
 
 These are library-only numbers: no sockets are involved. Body events borrow the input buffer, so the 1 MiB cases measure one copy into the buffer plus framing.
 

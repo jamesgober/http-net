@@ -139,7 +139,7 @@ gate and CI green on every platform and the MSRV), and James approves.
   parser, httparse on requests and responses), counting-allocator, and
   socket tests; every threat T-1 to T-42 has an attack test
   (`docs/SECURITY.md`).
-- **Status:** green at 0.8.0; re-run for 0.9.0.
+- **Status:** green at 0.9.0 (365 tests and 346 doctests).
 
 ### Benchmarks
 
