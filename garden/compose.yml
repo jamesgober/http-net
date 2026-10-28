@@ -1,0 +1,13 @@
+# The http-net origin, merged into the Garden's docker-compose.yml by
+# register.py. The workflow stages the build context: this directory's
+# Dockerfile plus a `git archive` of http-net in images/http_net/http-net.
+http_net:
+  build:
+    args:
+      RUST_TOOLCHAIN: stable
+    context: ./images/http_net
+  x-props:
+    role: origin
+    # The source is copied in, not cloned by commit, so the Garden's
+    # tools/update.py has no hash to bump here.
+    version_frozen: true

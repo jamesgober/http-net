@@ -1,0 +1,203 @@
+name: HTTP Garden
+
+# Differential testing against the HTTP Garden (D-58): manual runs only, on a
+# GitHub runner, never on a developer machine. See garden/README.md.
+#
+# The job fails only when the harness cannot run (an image does not build, a
+# service does not start or answer, http_net does not echo in the Garden
+# format). Discrepancies are findings: they go to the job summary and the
+# garden-results artifact for triage.
+
+on:
+  workflow_dispatch:
+    inputs:
+      garden_ref:
+        description: narfindustries/http-garden commit (full SHA)
+        required: false
+        type: string
+        default: b417e806c1b15e8ea0b9312f81a91fbdcbc7a83e
+      origins:
+        description: Reference origins to compare http_net with (Garden service names, space separated)
+        required: false
+        type: string
+        default: hyper nginx h2o gunicorn
+      transducers:
+        description: Transducers to send each seed through before the origins (space separated, may be empty)
+        required: false
+        type: string
+        default: haproxy
+      mutations:
+        description: Random mutations of the seeds to run after them
+        required: false
+        type: string
+        default: "500"
+      rng_seed:
+        description: Seed for the mutation RNG
+        required: false
+        type: string
+        default: "58"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garden-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  garden:
+    name: Garden differential
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GARDEN_REF: ${{ inputs.garden_ref || 'b417e806c1b15e8ea0b9312f81a91fbdcbc7a83e' }}
+      ORIGINS: ${{ inputs.origins }}
+      TRANSDUCERS: ${{ inputs.transducers }}
+      MUTATIONS: ${{ inputs.mutations || '500' }}
+      RNG_SEED: ${{ inputs.rng_seed || '58' }}
+      # The Garden's tools look for the network "http-garden_default".
+      COMPOSE_PROJECT_NAME: http-garden
+      OUT: ${{ github.workspace }}/garden-results
+    steps:
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          name_list='^[a-z0-9_ ]*$'
+          if ! [[ "$ORIGINS" =~ $name_list && "$TRANSDUCERS" =~ $name_list ]]; then
+            echo "::error::service names are lowercase letters, digits, and underscores, separated by spaces"
+            exit 1
+          fi
+          if ! [[ "$GARDEN_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::garden_ref must be a full 40-character commit SHA"
+            exit 1
+          fi
+          if ! [[ "$MUTATIONS" =~ ^[0-9]+$ && "$RNG_SEED" =~ ^[0-9]+$ ]]; then
+            echo "::error::mutations and rng_seed must be non-negative integers"
+            exit 1
+          fi
+          mkdir -p "$OUT"
+
+      - name: Check out http-net
+        uses: actions/checkout@v5
+        with:
+          path: http-net
+          persist-credentials: false
+
+      - name: Check out the HTTP Garden
+        uses: actions/checkout@v5
+        with:
+          repository: narfindustries/http-garden
+          ref: ${{ env.GARDEN_REF }}
+          path: http-garden
+          persist-credentials: false
+
+      - name: Free disk space for the images
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+
+      - name: Install the Garden's Python environment
+        working-directory: http-garden
+        run: uv sync --frozen
+
+      - name: Register the http-net origin
+        run: |
+          set -euo pipefail
+          ctx=http-garden/images/http_net
+          mkdir -p "$ctx/http-net"
+          cp http-net/garden/Dockerfile "$ctx/Dockerfile"
+          git -C http-net archive --format=tar HEAD | tar -x -C "$ctx/http-net"
+          cd http-garden
+          uv run --frozen python ../http-net/garden/register.py add .
+
+      - name: Build the images
+        working-directory: http-garden
+        run: |
+          set -euo pipefail
+          read -ra origins <<< "$ORIGINS"
+          read -ra transducers <<< "$TRANSDUCERS"
+          ./garden.sh build http_net "${origins[@]}" "${transducers[@]}"
+          docker image ls
+
+      - name: Start the services
+        working-directory: http-garden
+        run: |
+          set -euo pipefail
+          read -ra origins <<< "$ORIGINS"
+          read -ra transducers <<< "$TRANSDUCERS"
+          docker compose up -d http_net "${origins[@]}" "${transducers[@]}"
+          uv run --frozen python tools/http_net_grid.py --ready-only \
+            --origins "$ORIGINS" --transducers "$TRANSDUCERS" --wait 300
+          docker compose ps
+
+      - name: Probe http_net's quirks
+        working-directory: http-garden
+        run: |
+          set -uo pipefail
+          if uv run --frozen ./tools/probe_quirks.py --servers http_net \
+              > "$OUT/http_net_quirks.yml" 2> "$OUT/probe_quirks.err"; then
+            uv run --frozen python ../http-net/garden/register.py set-quirks . "$OUT/http_net_quirks.yml"
+          else
+            echo "::warning::probe_quirks.py failed for http_net; the fallback (no quirks) stays in quirks.yml"
+            cat "$OUT/probe_quirks.err"
+          fi
+
+      - name: Run the differential
+        working-directory: http-garden
+        run: |
+          set -euo pipefail
+          # stderr carries the Garden's per-payload parse notes; keep them in
+          # the artifact and show the tail only if the harness itself fails.
+          if ! uv run --frozen python tools/http_net_grid.py \
+              --origins "$ORIGINS" \
+              --transducers "$TRANSDUCERS" \
+              --trophies TROPHIES.md \
+              --seeds ../http-net/garden/seeds.txt \
+              --mutations "$MUTATIONS" \
+              --rng-seed "$RNG_SEED" \
+              --garden-ref "$GARDEN_REF" \
+              --http-net-ref "$GITHUB_SHA" \
+              --out "$OUT" 2> "$OUT/grid.err"; then
+            tail -n 60 "$OUT/grid.err"
+            exit 1
+          fi
+          cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect logs
+        if: always()
+        working-directory: http-garden
+        run: |
+          set -uo pipefail
+          docker compose logs --no-color > "$OUT/compose.log" 2>&1
+          docker compose logs --no-color http_net > "$OUT/http_net.log" 2>&1
+          cp docker-compose.yml quirks.yml "$OUT/"
+          if grep -q 'panicked at' "$OUT/http_net.log"; then
+            echo "::warning::http_net panicked during the run; see http_net.log in the artifact"
+            {
+              echo "## http_net panics"
+              echo
+              echo '```'
+              grep -A3 'panicked at' "$OUT/http_net.log" | head -n 80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: garden-results-${{ github.run_id }}
+          path: garden-results
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop the services
+        if: always()
+        working-directory: http-garden
+        run: docker compose down || true
