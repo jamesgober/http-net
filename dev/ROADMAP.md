@@ -206,12 +206,18 @@ Exit criteria:
 - [x] Every P0 and P1 gap they report closed (none reported).
 - [x] Benchmarks within 5% of 0.6 (D-61).
 
-## v0.9.0 - Beta and release candidates
-- [ ] API frozen as the 1.0 candidate; `0.9.x` releases contain fixes only.
-- [ ] Every unverified cell of the parity matrix resolved; `docs/STABILITY-1.0.md` drafted; every rustdoc example and README claim re-checked against the build.
+## v0.9.0 - Beta and release candidates (0.9.0 2026-10-28; 0.9.x until the exit criteria hold)
+- [x] API frozen as the 1.0 candidate; `0.9.x` releases contain fixes only (D-63; `cargo semver-checks` against the previous release from 0.9.1 on).
+- [x] Every unverified cell of the parity matrix resolved: `docs/PARITY.md`, evidence in `dev/PARITY-EVIDENCE.md` (D-67).
+- [x] `docs/STABILITY-1.0.md` drafted.
+- [x] Every rustdoc example and README claim re-checked against the build: four code defects found and fixed, the documentation corrected (D-69).
+- [x] HTTP Garden as a manually triggered CI job (D-68); first run after the 0.9.0 merge, findings triaged in 0.9.x.
+- [x] The 0.8 and 0.9 defence ideas evaluated (both rejected, D-64, D-65).
 
 Exit criteria:
-- [ ] Two consecutive weeks without an API change; full documentation set present; full local gate and CI green on all platforms and MSRV.
+- [ ] Two consecutive weeks without an API change, counted from 0.9.0 (D-66).
+- [x] Full documentation set present (`docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, `docs/SECURITY.md`, `docs/PLATFORM-NOTES.md`, `docs/STABILITY-1.0.md`, plus `docs/PARITY.md`).
+- [ ] Full local gate and CI green on all platforms and MSRV (each 0.9.x release).
 
 ## v1.0.0 - Stable
 - [ ] The full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.

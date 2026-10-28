@@ -126,8 +126,12 @@ gate and CI green on every platform and the MSRV), and James approves.
 ### Documentation
 
 - Every factual claim in the README, `docs/`, the changelog, and the
-  rustdoc was re-checked against the build at 0.9.0.
-- **Status:** in progress for 0.9.0.
+  rustdoc was re-checked against the build for 0.9.0. The audit found four
+  code defects (two `Debug` outputs that printed credentials, a wrong
+  `progress()` value, a platform-dependent timeout kind, a `Display` text),
+  fixed in 0.9.0 with regression tests, and corrected the documentation
+  everywhere else (`dev/PLAN.md` D-69).
+- **Status:** done for 0.9.0; repeated before 1.0.
 
 ### Tests
 
@@ -152,14 +156,17 @@ gate and CI green on every platform and the MSRV), and James approves.
 - Fuzz campaign (24 CPU-hours per target, no finding), 8-hour soak (+3.4%
   memory after warm-up), threat audit (T-21 fixed), response-side
   differential: `docs/SECURITY.md`, hardening record.
-- HTTP Garden: not yet run (D-58).
+- HTTP Garden: a manually triggered job (`.github/workflows/garden.yml`,
+  D-68) compares http-net with hyper, nginx, h2o, and gunicorn, directly
+  and through haproxy. Its first run follows the 0.9.0 merge.
 - **Status:** open until the Garden results are triaged.
 
 ### Parity with other implementations
 
-- The parity matrix of the specification compared with hyper, httparse,
-  h11, llhttp, picohttpparser, and the `http` crate.
-- **Status:** in progress for 0.9.0.
+- Every cell compared with hyper, httparse, h11, llhttp, picohttpparser,
+  and the `http` crate, by running them where possible and from source
+  otherwise: [`docs/PARITY.md`](PARITY.md) (D-67).
+- **Status:** done.
 
 ### Consumers
 
