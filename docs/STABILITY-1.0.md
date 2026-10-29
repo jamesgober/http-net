@@ -142,7 +142,7 @@ gate and CI green on every platform and the MSRV), and James approves.
   (`docs/SECURITY.md`).
 - 0.9.1 adds a regression test for each fix of the 0.9.x review and a
   unit test that tells the lingering-close byte cap from its time cap.
-- **Status:** green at 0.9.1 (371 tests and 346 doctests).
+- **Status:** green at 0.9.1 (372 tests and 346 doctests).
 
 ### Benchmarks
 
@@ -175,7 +175,9 @@ gate and CI green on every platform and the MSRV), and James approves.
   D-73) found no smuggling, desync, panic, or memory defect; it found an
   error answer to `HEAD` with content, pipelining after a response that
   closes, and body bytes in `Debug`, all fixed in 0.9.1 with tests.
-  FUZZ-STAB-PLACEHOLDER GARDEN-STAB-PLACEHOLDER
+  Every fuzz target ran again for 15 minutes on the 0.9.1 code with no
+  finding in the crate (one overflow in a test oracle, fixed, D-74), and
+  the HTTP Garden ran again with the same result as its first run.
 - **Status:** done.
 
 ### Parity with other implementations

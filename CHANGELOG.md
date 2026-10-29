@@ -62,6 +62,12 @@ change (`cargo semver-checks` against 0.9.0: no change).
 - Regression tests for each fix (`tests/rfc_cases.rs`,
   `tests/pipelining_reuse.rs`, `tests/redaction.rs`,
   `tests/localhost.rs`) and a unit test for the lingering-close byte cap.
+- The reference parser behind the `reference_diff` fuzz target and
+  `tests/prop_reference.rs` overflowed on a chunk size near `u64::MAX`
+  (found by the fuzz rerun; the crate itself refuses such a size). Fixed,
+  with `test_huge_chunk_sizes_agree`.
+- Every fuzz target ran again for 15 minutes, and the HTTP Garden ran
+  again, on this code: no finding in the crate.
 - A `wipe` group in `benches/bench.rs`; a manual benchmark workflow for
   aarch64 (`.github/workflows/bench.yml`).
 

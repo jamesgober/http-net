@@ -164,6 +164,11 @@ server saw the input, on a mutant whose chunk length overflowed its
 regular expression; the driver now skips such mutants and reports how
 many (one in the run above).
 
+The Garden ran again on the 0.9.1 code (2026-10-29, the same Garden
+commit, seeds, and mutation seed): the same 679 cases, the same 156
+differences, no case whose result changed, and still no quirk recorded
+for http-net.
+
 ## Review record (0.9.1)
 
 A second, independent review of the frozen 0.9.0 code (every source file,
