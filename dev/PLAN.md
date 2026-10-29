@@ -50,13 +50,20 @@ hand-off), `serve-net` (engine slot), WASP `gateway-io` (parser slot),
 | `message.rs` | `Request` and `Response` builders, `Response::from_error` |
 | `server.rs` | `ServerConn`, `ServerEvent` |
 | `client.rs` | `ClientConn`, `ClientEvent` |
+| `chunked.rs` | `ChunkedDecoder`, the standalone chunked decoder over the connection's own `body::Decoder` (D-42) |
+| `raw.rs` | Tier 3: `Span`, `FieldSpan`, `RawHead`, `HeadFacts`, `OwnedRequestHead`, copy-out, and the stateless `parse_request_head` / `parse_response_head` |
+| `write.rs` | `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan`, and the `ServerConn` methods that write into any `Output` (D-37) |
+| `forward.rs` | `is_hop_by_hop` and the hop-by-hop rule `Request::forward_from` uses |
+| `date.rs` | `HttpDate` (IMF-fixdate from caller-supplied Unix seconds) and `DateCache` |
+| `preface.rs` | detection of the HTTP/2 connection preface (D-27) |
 | `blocking.rs` | (feature `std`) bounded thread-per-connection server, per-connection driver, minimal client |
 
-Target layout at 1.0 adds `chunked.rs` (standalone decoder), `trailers.rs`,
-`write.rs` (`Output`, allocation-free writer), `forward.rs`, `date.rs`,
-`parse.rs` (stateless parsers), and splits `blocking` into a directory; each
-module keeps one responsibility and the public surface is exactly
-`docs/API.md`.
+This is the layout of the 1.0 candidate. The specification's target
+layout also named `trailers.rs`, `parse.rs`, and a `blocking` directory;
+trailers live with the body decoder and encoder they belong to, the
+stateless parsers with the spans and owned heads in `raw.rs`, and
+`blocking.rs` stays one file (D-71). Each module keeps one responsibility
+and the public surface is exactly `docs/API.md`.
 
 ## 3. Data flow (server side)
 
@@ -121,8 +128,8 @@ without the space after the code (client, from 0.3).
 ## 6. Memory
 
 - Input buffer: one `Vec<u8>` per connection, grown lazily from 4 KiB by
-  doubling, capped at `2 * (max_start_line + max_header_bytes) + 16 KiB`
-  (64 KiB by default). Compaction moves only the pinned head and the
+  doubling, capped at `head + max(head, max_trailer_bytes) + 16 KiB`, where
+  `head` is `max_start_line + max_header_bytes` (64 KiB by default). Compaction moves only the pinned head and the
   unread tail, and only when spare space is exhausted: total copying is
   linear in the input.
 - Field index: one `Vec` of 16-byte records per connection, reused; at
@@ -237,13 +244,21 @@ without the space after the code (client, from 0.3).
 | D-69 | 2026-10-28 | The 0.9 documentation audit (every factual claim in the README, `docs/`, the changelog, and the rustdoc checked against the build) found four code defects, fixed in 0.9.0 as fixes, not API changes: `ResponseHeadRef` and `blocking::Connection` printed credential values in `Debug` (T-35); `ServerConn::progress` reported `Closed` for a keep-alive request answered before `RequestEnd`; a missed request deadline was `WouldBlock` on Unix; one `Display` text had a run of spaces. Each has a regression test. The rest were documentation corrections, applied in the same release. | The freeze (D-63) covers signatures; a behaviour that contradicts its documentation is a defect, and these four contradicted it. None changes a signature: `cargo semver-checks` still reports only the `Upgraded` change. |
 | D-70 | 2026-10-29 | The first HTTP Garden run finds no defect, so nothing in the crate changes and 0.9.0 ships with the triage recorded in `docs/SECURITY.md`. Of 679 cases (133 seeds direct, 47 through haproxy, 499 mutations), http-net differs from at least one of hyper, nginx, h2o, and gunicorn in 156: 102 documented refusals, 50 acceptances the RFCs allow (hyper agrees on all but `HTTP/1.2`, which http-net reads as 1.1 per RFC 9110 section 2.5), and 4 echo differences where every server accepts. `Transfer-Encoding: ,chunked` stays accepted (an empty list element, RFC 9110 section 5.6.1.2; hyper agrees; with a `Content-Length` it is refused). The job's first dispatch stopped in the Garden's own mutator (a mutant's chunk length overflowed its regex) before any server saw the input; the driver now skips and counts such mutants. | Each difference was classified from the run's `results.json` by which side refused, then the acceptances checked one by one against the RFCs and against hyper. Refusing `,chunked` or an empty `Host` would follow nginx and h2o but break inputs the RFCs define; refusing input is not a fix-only change unless it closes a desync, and neither does: every server that refuses them refuses outright, and haproxy did not forward `,chunked`. |
 
+### 0.9.x polish pass (before 1.0)
+
+| Id | Date | Decision | Reason |
+|---|---|---|---|
+| D-71 | 2026-10-29 | The module layout of the 1.0 candidate is the one in section 2. The specification's target layout also had `trailers.rs`, `parse.rs`, and a `blocking` directory: trailers stay with the body decoder and encoder (`body.rs`), the stateless parsers with the spans and owned heads they return (`raw.rs`), and `blocking.rs` stays one file. | Each module already has one responsibility; splitting `blocking.rs` (one server, one connection driver, one client, sharing private helpers) would add `pub(crate)` seams and no clarity. Internal either way, so it can change in any 1.x release. |
+| D-72 | 2026-10-29 | The 0.9.x performance pass changes no hot-path code. (1) No regression since 0.6: interleaved A/B, nine rounds, pinned, in WSL2, of the 0.9.1 tree against each release puts `request_head` at +0.6% against 0.6.0, +0.0% against 0.7.0, and +2.7% against 0.8.0, and `response_write/five_fields_1k_body` at -6.7%, -0.1%, and -3.2% (a five-round run had flagged `request_head` +8.0% against 0.6.0; the nine-round runs did not repeat it). (2) The response-write benchmarks include reading the request: parsing `GET / HTTP/1.1` with one field and answering a bodiless `204` costs about 62 ns on its own, a prebuilt `Response` with five fields adds 1 to 2 ns to that, and `write_head` adds about 12 ns per borrowed field (single runs of a decomposition probe). (3) Tried and dropped: a one-word length mask in front of the reserved-name lists and one `reserve` for the whole field block in `write_head`, -1.4% on `response_write/write_head`, within noise. (4) The competitor run moves to http-net 0.9.0 (`http-net-bench`, results file `2026-10-29-c1255d143e57`); on a machine shared with fuzzers (load average 6 to 12) every absolute time rose about half for both sides, and the ratios are those of 0.6: H1 head parse 8% behind httparse with SIMD and 20% behind its scalar build, H3 head at parity, H2 5.4x and H3 exchange 11.8x faster than hyper, H4 in place 40% behind and copied out 9% ahead of httparse, H5 3.0x faster than hyper. (5) aarch64 gets a manual benchmark workflow (`.github/workflows/bench.yml`, Linux arm64 and macOS runners); shared runners are noisy, so its numbers are indicative, never the regression gate. | Every hot-path idea left after 0.6 (D-45 to D-53) was measured slower or level; the two tried here are level too, and the rule is to keep only what a repeated A/B shows. The decomposition says where the unmet write targets stand: the time is the request parse the benchmark includes and the per-call validation of borrowed fields, which is the safety `write_head` promises. A quiet-machine H1 run before 1.0 replaces the loaded one. |
+| D-73 | 2026-10-29 | An independent review of the frozen 0.9.0 code finds no smuggling, desync, panic, or memory defect and three smaller defects, fixed in 0.9.1 as fixes, not API changes: (1) after a `HEAD` request line, a failure in the body was answered as a `GET` with the error text as content, and the blocking adapter's `408` to a `HEAD` had content (RFC 9110 section 9.3.2); `start_response` now keeps `HEAD` for a failed connection whose request line was `HEAD` (a head-phase failure still has `RequestInfo::EMPTY`, a `GET`); (2) `ClientConn::can_send` allowed pipelining behind a response whose head says the connection ends with it (RFC 9112 section 9.6); (3) `ServerEvent::Body`, `ClientEvent::Body`, `blocking::Incoming`, and `blocking::Upgraded::leftover` printed their bytes in `Debug`; they print lengths, like `Connection` and `ClientResponse` (manual `Debug` impls, no signature change). Also fixed: `blocking::Server::serve` returned on persistent accept errors without waiting for live connections; it now stops and waits as a shutdown does. Kept: `forward_from` drops every name `Connection` lists, end-to-end ones included (documented); a repeated `connection` line from the request builder; a `205` with caller-supplied content; the clamp in `commit` (documented); case-sensitive methods. | Each kept item is either required by an RFC (7.6.1, method case), legal on the wire (a repeated list field), or a caller's choice that cannot change framing (`205` is framed by RFC 9112 section 6.3 like any other status, and `status_allows_body` says so). Refusing them would be a behaviour change for no defect. `cargo semver-checks` against 0.9.0 reports no change. |
+
 ## 8. Defence ideas (one per version)
 
 | Version | Hypothesis | Method | Expected cost | Outcome |
 |---|---|---|---|---|
 | 0.3 | A differential test against httparse on every input http-net accepts will find any byte where the two disagree on the head boundary or field split, which is what a front-end / back-end desync needs. | Property and fuzz harness: for inputs http-net accepts, httparse (strict config) must accept with the same length and fields; every disagreement is an http-net refusal httparse lacks, or a bug. | dev-only, CI time | `tests/prop_httparse.rs` and the `httparse_diff` fuzz target |
 | 0.4 | An "agreement mode" for proxies: report the facts a lenient hop would read differently (for example a GET with a body) so proxy-net can log or refuse them. | a `quirks` bit set computed during field facts | under 1 ns | Carried to 0.5, where `HeadFacts` (the type that would carry the bits) ships; 0.4 added the facts it needs (`content_length`, `has_unknown_expectation`, the offered upgrade list). |
-| 0.5 | Wiping consumed input removes credential remnants between keep-alive requests at under 2% of a request. | measure `set_wipe(true)` on the head bench | 30-60 ns [est.] | |
+| 0.5 | Wiping consumed input removes credential remnants between keep-alive requests at under 2% of a request. | measure `set_wipe(true)` on the head bench | 30-60 ns [est.] | Shipped in 0.5 (T-36); measured in the 0.9.1 polish pass: +5 ns (+2.1%) on the 453-byte browser GET, medians of nine interleaved rounds (`wipe` bench). At the 2% line, and opt-in. |
 | 0.6 | SWAR scanning of 16 bytes per step closes most of the gap to SIMD without `unsafe`. | bench against httparse with and without SIMD | code size | Rejected: 12% slower on short field lines (D-45). One pass per line (D-48) did more: -20% on the head benchmark. |
 | 0.7 | HTTP Garden runs find no discrepancy class that hyper does not also have. | containerised origin in the Garden | CI time | Deferred: Garden needs Docker, which the development machine does not have (D-58). Evaluated instead: a response-side differential against httparse finds no disagreement other than documented stricter refusals. Held: 47,249 single-byte mutations and 24,576 property cases, no disagreement on any head both accept (`tests/prop_httparse_response.rs`). |
 | 0.8 | A per-connection strike counter lets drivers ban abusive sources earlier. | `ServerConn::strikes()` | one increment per refusal || Rejected: every refusal already ends the connection, so the count is 0 or 1; counting per source belongs to the driver (D-64). |

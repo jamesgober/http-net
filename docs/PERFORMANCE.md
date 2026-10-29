@@ -4,7 +4,9 @@ How fast http-net is, how that is measured, how it compares with httparse
 and hyper, and the decisions behind the code that makes it fast. Numbers
 are for 0.6.0. 0.7.0 and 0.8.0 were measured against their predecessors
 with no measurable difference ([`release/v0.8.0.md`](./release/v0.8.0.md)),
-so these 0.6.0 numbers stand.
+and the 0.9.x pass measured the 0.9.1 code against every release from
+0.6.0 with no regression ([below](#the-09x-pass)), so these 0.6.0
+numbers stand.
 
 ## Method
 
@@ -45,14 +47,14 @@ Linux x86_64 (WSL2), medians of five interleaved rounds against 0.5.0:
 | 12-field browser GET (453 bytes), parsed and answered with 204 | 304 ns | 234 ns | -23% |
 | 100,000 pipelined GETs in 16 KiB reads | 10.1 ms | 8.8 ms (11.4 M requests/s) | -13% |
 | client parsing a 1 KiB response | 112 ns | 100 ns | -11% |
-| response with five fields and a 1 KiB body, serialized | 89 ns | 74 ns | -17% |
+| response with five fields and a 1 KiB body, serialized (after reading a one-field `GET`) | 89 ns | 74 ns | -17% |
 | 1 MiB body, `Content-Length`, 16 KiB reads | 14.0 µs | 13.5 µs | -4% |
 | 1 MiB body, chunked in 4 KiB chunks | 17.6 µs | 17.0 µs | -3% (-9% in a separate run) |
 | `write_head`, the same five fields borrowed | | 128 ns | new in 0.5 |
 
 Windows x86_64, the same machine, single runs: browser GET 243 ns,
 pipelined 7.8 ms, client parse 97 ns, response write 72 ns, `write_head`
-110 ns, 1 MiB bodies 13.9 and 17.3 µs. aarch64 has not been measured.
+110 ns, 1 MiB bodies 13.9 and 17.3 µs. aarch64 is measured only on CI runners, on demand ([below](#the-09x-pass)).
 
 ### Against the targets
 
@@ -63,8 +65,8 @@ pipelined 7.8 ms, client parse 97 ns, response write 72 ns, `write_head`
 | pipelined small GETs | 15 M requests/s | 11.4 M | not met |
 | 1 MiB `Content-Length` body | 10 µs | 13.5 µs | not met |
 | 1 MiB chunked body | 12 µs | 17.0 µs | not met |
-| response write, five fields, 1 KiB | 50 ns | 74 ns | not met |
-| `write_head`, five fields | 40 ns, zero allocations | 128 ns, zero allocations | allocations met; time not met |
+| response write, five fields, 1 KiB | 50 ns | 74 ns, of which about 62 ns is reading the request the bench answers | not met as measured; the write alone is about 15 ns |
+| `write_head`, five fields | 40 ns, zero allocations | 128 ns, zero allocations, the same 62 ns included | allocations met; time not met (about 12 ns per borrowed field) |
 | client response parse, 1 KiB | 70 ns | 100 ns | not met |
 | byte-at-a-time head feeding | at most 3x the whole-buffer time per byte | linear growth (below) | the guard holds; the literal ratio cannot (D-51) |
 | steady-state allocations | 0 per request | 0 | met |
@@ -151,6 +153,60 @@ llhttp) are not run.
   leaves to its caller. Reaching 20% ahead on H1 would need SIMD scanning
   with `unsafe` intrinsics or dropping checks; neither is
   taken. Recorded as decision D-54.
+
+## The 0.9.x pass
+
+Before 1.0 the frozen code was measured again: for regressions, for where
+the time of the unmet write targets goes, and against the competitors on
+the current release ([`dev/PLAN.md`](https://github.com/jamesgober/http-net/blob/main/dev/PLAN.md) D-72).
+
+**No regression since 0.6.** Interleaved A/B, nine rounds, pinned to one
+core in WSL2, the 0.9.1 tree against each release:
+
+| Bench | against 0.6.0 | against 0.7.0 | against 0.8.0 |
+|---|---:|---:|---:|
+| `request_head` (browser GET) | +0.6% | +0.0% | +2.7% |
+| `response_write/five_fields_1k_body` | -6.7% | -0.1% | -3.2% |
+
+A five-round run had shown `request_head` 8% slower than 0.6.0; the
+nine-round runs did not repeat it, which is the noise the method section
+describes. `response_parse`, both 1 MiB bodies, and `pipelined_100k` were
+within 4% in the five-round run.
+
+**What the write benchmarks contain.** Each iteration of
+`response_write` reads a one-field `GET` before it answers, so the
+numbers above include a parse. A decomposition probe (single runs) put
+reading that request and answering a bodiless `204` at about 62 ns; a
+prebuilt `Response` with five fields adds 1 to 2 ns to it, and
+`write_head` adds about 12 ns per borrowed field, which is the token,
+reserved-name, and value check of each field on every call plus four
+writes per field. Two ways to cut that cost, a length mask in front of
+the reserved-name lists and one `reserve` for the whole field block, came
+out level (-1.4%, within noise) and were dropped.
+
+**Wiping** (`set_wipe(true)`, the `wipe` bench): +5 ns, +2.1%, on the
+453-byte browser GET, medians of nine interleaved rounds.
+
+**Against the competitors on 0.9.0** ([`http-net-bench`](https://github.com/jamesgober/http-net-bench),
+results `2026-10-29-c1255d143e57`). The machine was shared with fuzzers
+(load average 6 to 12), and every time rose by about half on both sides
+against the 0.6 run, so only the ratios are reported; they are those of
+0.6:
+
+| Id | http-net against the competitor |
+|---|---|
+| H1 head and framing | 8% behind httparse with SIMD, 20% behind its scalar build |
+| H2 full server exchange | 5.4x faster than hyper (prebuilt `Response`) |
+| H3 response head and framing | at parity with httparse |
+| H3 full client exchange | 11.8x faster than hyper |
+| H4 chunked framing, data in place | 40% behind httparse's `parse_chunk_size` loop |
+| H4 the same with the body copied out | 9% ahead |
+| H5 100,000 pipelined requests | 3.0x faster than hyper |
+
+**aarch64.** `.github/workflows/bench.yml` runs `cargo bench` on GitHub's
+Linux arm64 and macOS runners on demand. Shared runners are noisy, so
+those numbers are indicative only; the regression gate stays the
+interleaved A/B on one machine.
 
 ## Where the time goes
 

@@ -1,7 +1,7 @@
 # http-net - Stability (1.0)
 
 > What http-net 1.0.0 commits to, what a 1.x release may change, what only a
-> 2.0 may change, and the audit that 1.0.0 is released on. **Draft (0.9.0):**
+> 2.0 may change, and the audit that 1.0.0 is released on. **Draft (0.9.1):**
 > the API is frozen as the 1.0 candidate; the audit record at the end is
 > filled in as each part is done, and 1.0.0 ships only when every part is
 > recorded and James approves the release.
@@ -121,6 +121,7 @@ gate and CI green on every platform and the MSRV), and James approves.
   became `#[non_exhaustive]`.
 - Every public item has rustdoc with a runnable example, and an entry in
   `docs/API.md`.
+- `cargo semver-checks` 0.9.0 to 0.9.1: no change (196 checks).
 - **Status:** freeze done; two-week clock running from the 0.9.0 release.
 
 ### Documentation
@@ -139,7 +140,9 @@ gate and CI green on every platform and the MSRV), and James approves.
   parser, httparse on requests and responses), counting-allocator, and
   socket tests; every threat T-1 to T-42 has an attack test
   (`docs/SECURITY.md`).
-- **Status:** green at 0.9.0 (365 tests and 346 doctests).
+- 0.9.1 adds a regression test for each fix of the 0.9.x review and a
+  unit test that tells the lingering-close byte cap from its time cap.
+- **Status:** green at 0.9.1 (371 tests and 346 doctests).
 
 ### Benchmarks
 
@@ -149,7 +152,14 @@ gate and CI green on every platform and the MSRV), and James approves.
   0.7 and 0.8 showed no measurable change against 0.6 (`dev/PLAN.md` D-61).
 - Head parsing is at parity with httparse, not 20% ahead: the shortfall and
   its cause are published (D-54).
-- **Status:** done for the frozen code; re-checked before 1.0.
+- The 0.9.x pass (D-72): no regression against 0.6.0, 0.7.0, or 0.8.0
+  (interleaved, nine rounds); the competitor ratios of 0.6 hold on 0.9.0;
+  the unmet targets decomposed in `docs/PERFORMANCE.md` (the response-write
+  benches include reading the request; `write_head` validates each
+  borrowed field per call).
+- **Status:** done for the frozen code; the H1 comparison is rerun on a
+  quiet machine before 1.0 (the 0.9.x run shared the machine with
+  fuzzers, so only its ratios are used).
 
 ### Security
 
@@ -161,7 +171,12 @@ gate and CI green on every platform and the MSRV), and James approves.
   and through haproxy. The first run (2026-10-29, 679 cases) found no
   defect: each of the 156 differences is a documented refusal, an input
   the RFCs allow, or a limit of the harness (`docs/SECURITY.md`, D-70).
-- **Status:** done; the Garden runs again before 1.0.
+- A second, independent review of the frozen code (0.9.x polish pass,
+  D-73) found no smuggling, desync, panic, or memory defect; it found an
+  error answer to `HEAD` with content, pipelining after a response that
+  closes, and body bytes in `Debug`, all fixed in 0.9.1 with tests.
+  FUZZ-STAB-PLACEHOLDER GARDEN-STAB-PLACEHOLDER
+- **Status:** done.
 
 ### Parity with other implementations
 
@@ -177,3 +192,36 @@ gate and CI green on every platform and the MSRV), and James approves.
   exist yet. The specification also asks for LexerSketch Studio's publish
   step to use the API end to end before 1.0.
 - **Status:** open.
+
+## Open before 1.0
+
+What is still open after the 0.9.x polish pass, and who decides it.
+Everything else in the audit above is done.
+
+**For James:**
+
+- The security-fix support window for 1.x minors and the private channel
+  for reporting a vulnerability ([Support](#support)); a root
+  `SECURITY.md` follows from the channel.
+- The third consumer (D-62): serve-net and LexerSketch Studio run end to
+  end; the WASP gateway and the first fetch-net do not exist yet. Wait for
+  one, or ship 1.0 on two.
+- Whether LexerSketch Studio's publish step must use the API end to end
+  before 1.0, as the specification asks.
+- The 1.0 go or no-go itself, no earlier than 2026-11-12 (two weeks after
+  0.9.0 with no API change, D-66).
+
+**Engineering, before the 1.0 tag** (no API effect):
+
+- An H1 competitor run on a quiet machine (D-72).
+- H6 (plaintext over sockets, through serve-net) and the report-only C
+  harnesses (picohttpparser, llhttp) in `http-net-bench`; the
+  specification lists them, none is run yet.
+- The aarch64 numbers from `.github/workflows/bench.yml` (manual; needs
+  the workflow on the default branch).
+- The documentation check against the build, repeated on the 1.0 tree.
+
+**Targets not met, with the decision on record** (`docs/PERFORMANCE.md`):
+the latency targets for the browser GET, pipelined requests, the 1 MiB
+bodies, the response write, `write_head`, and the client parse; and 20%
+ahead of httparse on head parsing (D-54: parity, kept safe).

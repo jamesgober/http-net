@@ -13,6 +13,60 @@
 
 ---
 
+## [0.9.1] - 2026-10-29
+
+Fixes from the 0.9.x polish pass: a second, independent security review
+of the frozen code, a performance pass against every release since 0.6
+and against the competitors, and a pass over every open item. No API
+change (`cargo semver-checks` against 0.9.0: no change).
+
+### Fixed
+
+- An error answer to a `HEAD` request that failed in its body (a bad
+  chunk, the peer closing mid-body) carried the error text as content; it
+  is now an answer to `HEAD`, without content (RFC 9110 section 9.3.2).
+  The blocking adapter's `408` to a `HEAD` likewise has no content. The
+  answer always closed the connection, so only a front end ignoring
+  `connection: close` could misread it.
+- The pipelining `ClientConn` kept accepting requests after the head of
+  the response being read said the connection ends with it
+  (`Connection: close`, HTTP/1.0 without keep-alive, a body read until
+  close). `can_send` is now false and `send_request` refuses with
+  `InvalidState` (RFC 9112 section 9.6).
+- **Security (T-35):** `Debug` of `ServerEvent::Body`, `ClientEvent::Body`,
+  `blocking::Incoming`, and the `leftover` of `blocking::Upgraded` printed
+  their bytes, which can carry credentials (a form login; a tunnelled
+  request with its `Authorization` field). They print lengths now, like
+  `blocking::Connection` and `ClientResponse`.
+- `blocking::Server::serve` returned on persistent accept errors without
+  waiting for live connections; it now stops them and waits, as a
+  shutdown does.
+
+### Documentation
+
+- `Request::forward_from`: every name `Connection` lists is dropped,
+  end-to-end names included, so a client can strip fields a proxy relies
+  on; check `connection_options()` first. `commit(n)` clamps an `n`
+  larger than `read_buf`.
+- `docs/PERFORMANCE.md`: the 0.9.x pass. No regression against 0.6.0,
+  0.7.0, or 0.8.0 (interleaved, nine rounds); what the response-write
+  benchmarks contain (about 62 ns of their time is reading the request
+  they answer); the measured cost of `set_wipe` (+2.1% on the browser
+  GET, replacing an estimate); the competitor ratios on 0.9.0.
+- `docs/SECURITY.md`: the review record, measured wipe cost, and the T-40
+  byte cap now told apart from the time cap by a test.
+- `dev/PLAN.md` D-71 to D-73; the module table matches the code.
+
+### Testing
+
+- Regression tests for each fix (`tests/rfc_cases.rs`,
+  `tests/pipelining_reuse.rs`, `tests/redaction.rs`,
+  `tests/localhost.rs`) and a unit test for the lingering-close byte cap.
+- A `wipe` group in `benches/bench.rs`; a manual benchmark workflow for
+  aarch64 (`.github/workflows/bench.yml`).
+
+---
+
 ## [0.9.0] - 2026-10-29
 
 Beta: the API is frozen as the 1.0 candidate; `0.9.x` releases contain
@@ -560,7 +614,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/jamesgober/http-net/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/http-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/http-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/http-net/compare/v0.6.0...v0.7.0

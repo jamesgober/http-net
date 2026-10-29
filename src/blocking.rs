@@ -395,7 +395,6 @@ impl ServerConfig {
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-#[derive(Debug)]
 #[non_exhaustive]
 pub struct Upgraded {
     /// The socket, now speaking the new protocol.
@@ -404,6 +403,18 @@ pub struct Upgraded {
     pub leftover: Vec<u8>,
     /// The target of the request that asked for the switch.
     pub target: String,
+}
+
+/// `leftover` prints as its length: after a `CONNECT` it can be a whole
+/// request in clear text, credentials included.
+impl fmt::Debug for Upgraded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Upgraded")
+            .field("stream", &self.stream)
+            .field("leftover", &format_args!("{} bytes", self.leftover.len()))
+            .field("target", &self.target)
+            .finish()
+    }
 }
 
 type UpgradeHook = Arc<dyn Fn(Upgraded) + Send + Sync>;
@@ -652,7 +663,8 @@ impl Server {
     /// # Errors
     ///
     /// Only if accepting connections fails persistently; transient accept
-    /// errors are retried.
+    /// errors are retried. Before the error is returned, live connections
+    /// finish their current exchange, as after a shutdown.
     ///
     /// # Examples
     ///
@@ -673,10 +685,19 @@ impl Server {
                     backoff.success();
                     stream
                 }
-                Err(e) => {
-                    thread::sleep(backoff.failure(e)?);
-                    continue;
-                }
+                Err(e) => match backoff.failure(e) {
+                    Ok(wait) => {
+                        thread::sleep(wait);
+                        continue;
+                    }
+                    Err(e) => {
+                        // Give up as a shutdown does: live connections
+                        // finish their exchange before `serve` returns.
+                        self.stop.store(true, Ordering::SeqCst);
+                        active.wait_idle();
+                        return Err(e);
+                    }
+                },
             };
             if !active.try_enter(self.config.max_connections) {
                 refuse_busy(stream, &self.config);
@@ -860,13 +881,19 @@ fn serve_stream(
 }
 
 fn drain_and_close(mut stream: TcpStream) {
-    // Lingering close (RFC 9112 section 9.6): stop sending, then read what
-    // the peer is still sending so the close does not become a reset that
-    // discards the response before the peer reads it.
-    // The drain is bounded in bytes and in total time, not only per read:
-    // a peer that keeps trickling data must not hold the thread.
+    let _ = lingering_drain(&mut stream);
+}
+
+/// Lingering close (RFC 9112 section 9.6): stops sending, then reads what
+/// the peer is still sending so the close does not become a reset that
+/// discards the response before the peer reads it. Returns the bytes
+/// drained.
+///
+/// The drain is bounded in bytes and in total time, not only per read: a
+/// peer that keeps trickling data must not hold the thread.
+fn lingering_drain(stream: &mut TcpStream) -> usize {
     if stream.flush().is_err() || stream.shutdown(Shutdown::Write).is_err() {
-        return;
+        return 0;
     }
     let deadline = Instant::now() + DRAIN_TOTAL;
     let mut scratch = [0u8; 4096];
@@ -885,6 +912,7 @@ fn drain_and_close(mut stream: TcpStream) {
             Ok(n) => drained += n,
         }
     }
+    drained
 }
 
 fn response_timed_out() -> Error {
@@ -917,10 +945,20 @@ fn is_timeout(e: &io::Error) -> bool {
 /// # Examples
 ///
 /// See [`Connection`].
-#[derive(Debug)]
 pub struct Incoming<'a> {
     head: RequestHead<'a>,
     body: &'a [u8],
+}
+
+/// The body prints as its length, as in [`Connection`] and
+/// [`ClientResponse`].
+impl fmt::Debug for Incoming<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Incoming")
+            .field("head", &self.head)
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .finish()
+    }
 }
 
 impl<'a> Incoming<'a> {
@@ -1124,7 +1162,14 @@ impl Connection {
             .extend_from_slice(b"\r\nconnection: close\r\ndate: ");
         self.out.extend_from_slice(now_date().as_bytes());
         self.out.extend_from_slice(b"\r\n\r\n");
-        self.out.extend_from_slice(BODY);
+        // An answer to HEAD carries no content (RFC 9110 section 9.3.2).
+        if !self
+            .conn
+            .request()
+            .is_some_and(|r| r.method() == Method::Head)
+        {
+            self.out.extend_from_slice(BODY);
+        }
         self.flush_out()
     }
 
@@ -2143,6 +2188,33 @@ mod tests {
             backoff.failure(error()).is_ok(),
             "a success resets the count"
         );
+    }
+
+    /// T-40, byte cap: a peer that keeps sending as fast as it can is
+    /// drained by at most `DRAIN_LIMIT` bytes (plus the last read), then
+    /// the drain stops though the peer has neither stopped nor closed. The
+    /// socket tests in `tests/localhost.rs` show the slot is freed; this
+    /// one shows which cap freed it.
+    #[test]
+    fn test_lingering_drain_stops_at_the_byte_cap() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let flood = thread::spawn(move || {
+            // Ends when the server closes its side; the error is expected.
+            let _ = client.write_all(&vec![b'x'; 16 * DRAIN_LIMIT]);
+            client
+        });
+        let started = Instant::now();
+        let drained = lingering_drain(&mut server);
+        let took = started.elapsed();
+        drop(server);
+        drop(flood.join().unwrap());
+        assert!(
+            (DRAIN_LIMIT..DRAIN_LIMIT + 4096).contains(&drained),
+            "drained {drained} bytes"
+        );
+        assert!(took < DRAIN_TOTAL, "the byte cap ended it, after {took:?}");
     }
 
     #[test]
