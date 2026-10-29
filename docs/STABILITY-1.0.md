@@ -158,8 +158,10 @@ gate and CI green on every platform and the MSRV), and James approves.
   differential: `docs/SECURITY.md`, hardening record.
 - HTTP Garden: a manually triggered job (`.github/workflows/garden.yml`,
   D-68) compares http-net with hyper, nginx, h2o, and gunicorn, directly
-  and through haproxy. Its first run follows the 0.9.0 merge.
-- **Status:** open until the Garden results are triaged.
+  and through haproxy. The first run (2026-10-29, 679 cases) found no
+  defect: each of the 156 differences is a documented refusal, an input
+  the RFCs allow, or a limit of the harness (`docs/SECURITY.md`, D-70).
+- **Status:** done; the Garden runs again before 1.0.
 
 ### Parity with other implementations
 

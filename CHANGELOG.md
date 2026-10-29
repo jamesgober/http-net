@@ -13,7 +13,7 @@
 
 ---
 
-## [0.9.0] - 2026-10-28
+## [0.9.0] - 2026-10-29
 
 Beta: the API is frozen as the 1.0 candidate; `0.9.x` releases contain
 fixes only. A documentation audit against the build found and fixed four
@@ -26,7 +26,9 @@ defects, two of them `Debug` outputs that printed credentials.
 - `docs/PARITY.md`: the feature matrix against hyper, httparse, h11,
   llhttp, picohttpparser, and the `http` crate, every cell checked.
 - An HTTP Garden differential job (`.github/workflows/garden.yml`, manual
-  runs only) with its origin in `garden/` (not part of the package).
+  runs only) with its origin in `garden/` (not part of the package). Its
+  first run compared http-net with hyper, nginx, h2o, and gunicorn over
+  679 cases and found no defect (`docs/SECURITY.md`).
 
 ### Changed
 

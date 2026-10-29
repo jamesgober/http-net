@@ -117,9 +117,52 @@ TIME_WAIT, see `docs/PLATFORM-NOTES.md`); two came from the
 malformed-request check, which records no message; none was a server
 error. Other builds shared the machine during the run.
 
-**HTTP Garden.** Not run in 0.7: it needs Docker, which the development
-machine does not have ([`dev/PLAN.md`](https://github.com/jamesgober/http-net/blob/main/dev/PLAN.md) D-58). It is planned as a manually
-triggered CI job.
+**HTTP Garden.** Run as a manually triggered CI job
+(`.github/workflows/garden.yml`, [`dev/PLAN.md`](https://github.com/jamesgober/http-net/blob/main/dev/PLAN.md) D-68, D-70). The first
+run, on 2026-10-29 at Garden `b417e80`, compared http-net with hyper,
+nginx, h2o, and gunicorn: 133 seeds sent directly, 47 forwarded through
+haproxy, and 499 seeded mutations. The Garden's quirk probe recorded no
+quirk for http-net. In 156 cases http-net's result differs from at least
+one other server's; none is a defect:
+
+- **102 refusals** where another server accepts. Each is a choice in the
+  table below or a rule of the grammar: bare LF, `Content-Length` with
+  `Transfer-Encoding`, duplicate lengths (equal ones included), a
+  repeated `chunked`, a coding before `chunked` (501), a space after a
+  chunk size, a chunk size over 16 digits, extra spaces in the request
+  line, control bytes and obs-text in the target or a field name,
+  `*` with a method other than `OPTIONS`, an authority-form target with a
+  method other than `CONNECT`, and two `Host` fields or an invalid one.
+  `Connection: close, keep-alive` ends the connection after the first
+  request (`close` wins), where gunicorn and h2o read on.
+- **50 acceptances** where another server refuses, each one the RFCs
+  allow and, apart from `HTTP/1.2`, hyper also accepts: empty lines before the
+  request line (RFC 9112 section 2.2), a lowercase or unregistered method
+  (methods are case-sensitive tokens), a tab around a field value, a
+  trailer section (a trailer never frames the message and is never
+  merged into the head), `OPTIONS *`, `Transfer-Encoding: ,chunked` (an
+  empty list element is skipped, RFC 9110 section 5.6.1.2; with a
+  `Content-Length` it is refused), `HTTP/1.2` (read as 1.1, RFC 9110
+  section 2.5; hyper refuses it), an empty `Host` (a valid empty
+  reg-name; `RequestHead::host` returns `Some("")`), an unknown `Expect`
+  (passed to the application; gunicorn answers 417, which the RFC permits
+  but does not require), and a second HTTP/1.0 request after
+  `Connection: keep-alive` (nginx closes instead). Five of the 50 are
+  `Expect: 100-continue` with the body already sent: the other servers
+  answer `100 Continue` first, the Garden origin does not because the
+  body has arrived (RFC 9110 section 10.1.1). That is the driver's
+  choice, not the parser's.
+- **4 cases where every server accepts and the echo differs**: an
+  absolute-form target is reported as received (`RequestHead::host`
+  returns its authority, T-18), where nginx and h2o rewrite it to origin
+  form; the others are fields nginx or h2o leave out of their echo.
+
+The run also showed the harness's limits. A `CONNECT` answered with a
+tunnel cannot be read back by the Garden (the same for hyper), and the
+first dispatch stopped inside the Garden's own mutator, before any
+server saw the input, on a mutant whose chunk length overflowed its
+regular expression; the driver now skips such mutants and reports how
+many (one in the run above).
 
 ## Where http-net is stricter than the RFCs
 

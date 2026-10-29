@@ -194,7 +194,7 @@ cargo run --release --example soak -- 90s 4  # mixed workload for a set time, cl
 ## What is not here yet
 
 - TLS: plain `http://` only.
-- The triage of the first HTTP Garden runs (the job exists from 0.9.0) and `1.0.0` itself: v0.9.x, then 1.0 after the audit in [`docs/STABILITY-1.0.md`](./docs/STABILITY-1.0.md). See the [roadmap](https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md).
+- `1.0.0` itself: fixes only in v0.9.x, then 1.0 after the audit in [`docs/STABILITY-1.0.md`](./docs/STABILITY-1.0.md). See the [roadmap](https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md).
 - An async runtime or adapter: never; drive the sans-IO core from any loop.
 - Content codings (gzip and others): a body is delivered as sent. A transfer coding before `chunked` is refused with 501 (`UnsupportedTransferEncoding`); a `Transfer-Encoding` that does not end in a single `chunked` is refused with 400 (`InvalidTransferEncoding`).
 
