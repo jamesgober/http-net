@@ -214,6 +214,21 @@ Exit criteria:
 - [x] HTTP Garden as a manually triggered CI job (D-68); the first run (after the 0.9.0 merge, 679 cases) found no defect (D-70).
 - [x] The 0.8 and 0.9 defence ideas evaluated (both rejected, D-64, D-65).
 
+### 0.9.x polish pass (0.9.1, 2026-10-29)
+
+Before 1.0, every accepted gap, deferred item, known issue, and missed
+target was revisited, performance measured again, and the security review
+repeated. Fixes ship as 0.9.x patches; what stays open is in
+`docs/STABILITY-1.0.md` ("Open before 1.0").
+
+- [x] Security and edge-case review repeated by an independent reviewer on the frozen code: no smuggling, desync, panic, or memory defect; three defects fixed in 0.9.1 (an error answer to `HEAD` with content, pipelining after a response that closes, body bytes in `Debug`) and `serve` now waits for live connections on persistent accept errors (D-73, `docs/SECURITY.md` review record).
+- [x] Fuzzing repeated on the 0.9.1 code: each of the eight targets for 15 minutes on Linux x86_64 with AddressSanitizer, seeded with the 0.7 corpora (63 million executions in all). The crate had no finding. The `reference_diff` target stopped once inside its own oracle: the independent reference parser in `tests/common/reference.rs` added a chunk size of sixteen `f` digits to the body so far and overflowed, where the crate refuses the size as over the body budget. The oracle now subtracts instead (regression test in `tests/prop_reference.rs`), and the target ran its 15 minutes clean (D-74).
+- [x] HTTP Garden run again on the 0.9.1 branch: the same 679 cases and the same 156 differences as the first run, no case changed, no quirk (D-70).
+- [x] Performance against every release since 0.6.0: no regression (interleaved, nine rounds); the unmet write targets decomposed (about 62 ns of the response-write benches is reading the request; `write_head` costs about 12 ns per borrowed field); two write-path ideas measured level and dropped (D-72).
+- [x] Competitors measured again on 0.9.0 (`http-net-bench`): the 0.6 ratios hold (D-72); aarch64 benchmark workflow added.
+- [x] Deferred and estimated items revisited: the 0.5 wipe idea measured (+2.1%, D-72 and the defence-ideas log); the T-40 caps told apart by a test; the T-36 cost measured; the module layout settled (D-71); `PLAN.md` buffer bound corrected.
+- [ ] Still open (not code, or not this repository): the third consumer (D-62); H6, picohttpparser, and llhttp in `http-net-bench`; a quiet-machine H1 run; the support window and report channel (James).
+
 Exit criteria:
 - [ ] Two consecutive weeks without an API change, counted from 0.9.0 (D-66).
 - [x] Full documentation set present (`docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, `docs/SECURITY.md`, `docs/PLATFORM-NOTES.md`, `docs/STABILITY-1.0.md`, plus `docs/PARITY.md`).

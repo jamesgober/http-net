@@ -314,7 +314,7 @@ pub fn reference(input: &[u8]) -> Option<RefRequest> {
             if size == 0 {
                 break;
             }
-            if body.len() + size > MAX_BODY {
+            if size > MAX_BODY - body.len() {
                 return None;
             }
             let data = input.get(pos..pos + size)?;

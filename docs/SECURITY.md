@@ -44,7 +44,7 @@ whether the attack test exists in this build.
 | T-14 | 0.CL desync | `Content-Length` honoured on every method; answering before reading the body closes | `tests/adversarial.rs` | none | tested |
 | T-15 | `Expect`-based desync | `Expect` never changes framing; `100-continue` matched as a trimmed, case-insensitive list element | eight vectors in `tests/adversarial.rs` | none | tested |
 | T-16 | smuggling a pipelined request after an error | nothing parsed after a parse error | `tests/smuggling.rs`; `tests/conformance.rs` | none | tested |
-| T-17 | response queue poisoning on the client | `UnexpectedData` for bytes with no request outstanding; until-close responses never reused | `client.rs` units, `tests/adversarial.rs`, `tests/connection_control.rs` | none | tested |
+| T-17 | response queue poisoning on the client | `UnexpectedData` for bytes with no request outstanding; until-close responses never reused; no request pipelined behind a response that ends the connection (0.9.1) | `client.rs` units, `tests/adversarial.rs`, `tests/connection_control.rs`, `tests/pipelining_reuse.rs` | none | tested |
 | T-18 | `Host` attacks (two Hosts, junk, `:80`, bad `%XX`) | one valid `Host`; the absolute-form authority wins | `tests/adversarial.rs` | O(Host length) | tested |
 | T-19 | absolute-form tricks (userinfo, empty host, no `//`) | refused | `tests/adversarial.rs` | O(target) | tested |
 | T-20 | h2c smuggling | `h2c` is never an upgrade offer; `switching_protocols("h2c")` refused | `tests/adversarial.rs` | none | tested |
@@ -62,12 +62,12 @@ whether the attack test exists in this build.
 | T-32 | quadratic parsing on byte-at-a-time input | resumable scanner; compaction only when full | a 16 KiB head fed one byte at a time (`tests/prop_roundtrip.rs`); the linearity guard (`tests/linearity.rs`: 8 times the bytes cost under 16 times the time) and its bench group | none | tested |
 | T-33 | integer overflow | checked arithmetic for CL, chunk sizes, running totals | `tests/adversarial.rs`; fuzzing | none | tested |
 | T-34 | panics | clippy denies (`unwrap`, `expect`, `unreachable!`, printing), bounded indexing, fuzzing | never-panic property tests; eight fuzz targets in CI; the 0.7 campaign (24 CPU-hours per target, no finding) | none | tested |
-| T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie` everywhere | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers, `ResponseHeadRef`, and `blocking::Connection`, whose buffers print as lengths only) | only when formatting | tested |
-| T-36 | credentials left in reused memory | `set_wipe`: zero finished requests, compaction leftovers, and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run); the wipe on drop is not tested, since observing it would mean reading the freed block | about 30 to 60 ns per 2 KiB [est.] | tested |
+| T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie` everywhere; body and tunnel bytes print as lengths | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers, `ResponseHeadRef`, `blocking::Connection`, whose buffers print as lengths only, and since 0.9.1 the body events, `blocking::Incoming`, and the leftover bytes of `blocking::Upgraded`) | only when formatting | tested |
+| T-36 | credentials left in reused memory | `set_wipe`: zero finished requests, compaction leftovers, and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run); the wipe on drop is not tested, since observing it would mean reading the freed block | +5 ns (+2.1%) on the 453-byte browser GET, about 11 ns per KiB (0.9.1, `wipe` bench) | tested |
 | T-37 | error text reflecting attacker bytes | `Display` is static text; `from_error` uses only it | `error.rs` units over every variant; `tests/adversarial.rs` (`from_error` for every variant; refused bytes never in the answer) | none | tested |
 | T-38 | HTTP/0.9 messages | a version is required in both start lines | `tests/rfc_cases.rs` (request and response, whole and byte by byte) | none | tested |
 | T-39 | status out of range | refused (`InvalidStatus`) | `tests/rfc_cases.rs` | none | tested |
-| T-40 | lingering-close abuse | drain bounded to 1 s and 256 KiB; the refusal path never waits | `tests/localhost.rs` (a peer that trickles; a peer that writes 8 MiB unpaced; the only slot freed for the next client); no test tells the 256 KiB cap from the 1 s cap: the 8 MiB test passes under either | at most 1 s of a thread per close | tested |
+| T-40 | lingering-close abuse | drain bounded to 1 s and 256 KiB; the refusal path never waits | `tests/localhost.rs` (a peer that trickles; a peer that writes 8 MiB unpaced; the only slot freed for the next client); since 0.9.1 a `blocking.rs` unit test shows the byte cap ends the drain of a peer that never stops (at most 256 KiB plus one read, well inside the 1 s cap) | at most 1 s of a thread per close | tested |
 | T-41 | busy accept loop on persistent errors | 10 ms back-off after every failed accept; give up after more than 1,000 in a row; a success resets the count | `blocking.rs` unit test of the back-off policy the accept loop uses | none | tested |
 | T-42 | prior-knowledge HTTP/2 to an HTTP/1.1 listener | 505 and close (`Http2Preface` in 0.5) | `tests/rfc_cases.rs` | 24 compares at connection start | tested |
 
@@ -164,6 +164,48 @@ server saw the input, on a mutant whose chunk length overflowed its
 regular expression; the driver now skips such mutants and reports how
 many (one in the run above).
 
+The Garden ran again on the 0.9.1 code (2026-10-29, the same Garden
+commit, seeds, and mutation seed): the same 679 cases, the same 156
+differences, no case whose result changed, and still no quirk recorded
+for http-net.
+
+## Review record (0.9.1)
+
+A second, independent review of the frozen 0.9.0 code (every source file,
+against this threat table, `dev/PLAN.md`, and `docs/STABILITY-1.0.md`)
+found nothing that enables smuggling, desync, a panic, or unbounded memory.
+It checked every budget at its limit and one over at every two-piece split
+and byte by byte, every budget at its minimum and maximum `Limits`,
+the `u32` offsets and the `u64` totals at their extremes, the state
+invariants I-S1 to I-S5, client framing of `HEAD`, 204, 304, 1xx, and
+`CONNECT`, outgoing injection through every builder, redaction in every
+`Debug`, and the bounds of the blocking adapter, and added five
+split-invariance properties for paths without one (200,000 cases each,
+all green). It found three defects, fixed in 0.9.1 with regression tests:
+
+- An error answer to a `HEAD` that failed in its body (a bad chunk, EOF
+  mid-body) was written as a `GET` answer, with the error text as content
+  (RFC 9110 section 9.3.2); so was the blocking adapter's `408`. The
+  answer always closed the connection, so only a front end that ignores
+  `connection: close` could read the text as a response.
+- The pipelining client kept sending after the response being read said
+  the connection ends with it (RFC 9112 section 9.6). The extra request
+  was never answered and was counted in `outstanding()`, so there was no
+  desync.
+- `Debug` printed body and tunnel bytes in four places (T-35 above).
+
+It also found that `blocking::Server::serve` returned on persistent
+accept errors without waiting for live connections, as it does on
+shutdown; it now waits. Kept as they are, with the reason
+(`dev/PLAN.md` D-73): `forward_from` drops every name `Connection` lists,
+end-to-end ones included (RFC 9110 section 7.6.1 requires it; now
+documented for proxy authors, and a dropped `host` fails closed); the
+request builder may write `connection` twice (a legal list); a `205` may
+carry content the caller gives it (framing stays explicit, and
+`status_allows_body` describes framing, which RFC 9112 section 6.3 gives a
+205); `commit(n)` clamps an over-long `n` (now documented); a lowercase
+`head` is not `HEAD` (methods are case-sensitive).
+
 ## Where http-net is stricter than the RFCs
 
 | Choice | The RFC permits | http-net | Why | Cost |
@@ -231,5 +273,5 @@ not by this differential.
 | framing facts and refusals | under 5 ns per request [est.] | none |
 | budgets checked before buffering | a compare per line and per chunk | bounded by configuration |
 | redaction | only when `Debug` runs | none |
-| wiping (opt-in) | about 30 to 60 ns per 2 KiB request [est.] | none |
+| wiping (opt-in) | +5 ns (+2.1%) on the 453-byte browser GET, about 11 ns per KiB (measured 0.9.1) | none |
 | blocking deadlines | one `Instant::now` per request and per write, about 20 to 30 ns each [est.] | none |

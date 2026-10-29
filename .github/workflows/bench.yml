@@ -1,0 +1,53 @@
+name: Benchmarks
+
+# The crate's own criterion benches on the platforms the development machine
+# cannot run (aarch64): manual runs only. Shared runners are noisy, so these
+# numbers are indicative, never a regression gate; the gate is the
+# interleaved A/B in docs/PERFORMANCE.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: |
+          {
+            echo "### $(uname -sm) on ${{ matrix.os }}"
+            echo
+            echo '```'
+            rustc -vV
+            if [ -r /proc/cpuinfo ]; then
+              grep -m1 -i -E 'model name|CPU part' /proc/cpuinfo || true
+              nproc
+            else
+              sysctl -n machdep.cpu.brand_string hw.ncpu || true
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: cargo bench
+        run: |
+          cargo bench --bench bench -- --noplot --measurement-time 3 --warm-up-time 1 2>&1 | tee bench.txt
+          {
+            echo
+            echo '```'
+            grep -E '^[a-z_0-9]+/|time:' bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench.txt
