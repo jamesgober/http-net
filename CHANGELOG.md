@@ -4,12 +4,64 @@
 </h1>
 <p>
   All notable changes to <code>http-net</code> will be documented in this file. The format is based on <a href="https://keepachangelog.com/en/1.1.0/">Keep a Changelog</a>,
-  and this project adheres to <a href="https://semver.org/spec/v2.0.0.html/">Semantic Versioning</a>.
+  and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.
 </p>
 
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.9.0] - 2026-10-28
+
+Beta: the API is frozen as the 1.0 candidate; `0.9.x` releases contain
+fixes only. A documentation audit against the build found and fixed four
+defects, two of them `Debug` outputs that printed credentials.
+
+### Added
+
+- `docs/STABILITY-1.0.md`: what 1.0 commits to, which types may grow in
+  1.x, the behaviour guarantees, and the 1.0 audit record.
+- `docs/PARITY.md`: the feature matrix against hyper, httparse, h11,
+  llhttp, picohttpparser, and the `http` crate, every cell checked.
+- An HTTP Garden differential job (`.github/workflows/garden.yml`, manual
+  runs only) with its origin in `garden/` (not part of the package).
+
+### Changed
+
+- `blocking::Upgraded` is `#[non_exhaustive]`, so a 1.x release can add a
+  field; its fields are unchanged. A pattern naming every field needs `..`
+  (`docs/MIGRATION.md`).
+
+### Fixed
+
+- **Security (T-35):** `ResponseHeadRef` and `blocking::Connection`
+  printed credential values in their `Debug` output (`ResponseHeadRef`
+  derived it; `Connection` kept the last request body and serialized
+  response and printed both). `ResponseHeadRef` now redacts
+  `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` like
+  every other type, and `Connection` prints its buffers as lengths only.
+  Both are in `tests/redaction.rs`.
+- `ServerConn::progress` reported `Closed` for a keep-alive request with no
+  body left to read that was answered before `RequestEnd` was polled (for
+  example a `GET` answered at `ServerEvent::Request`). It now reports
+  `Idle`, so a driver that closes on `Closed` keeps the connection.
+- `blocking::Connection` reported a missed request deadline as
+  `WouldBlock` on Unix; it is `TimedOut` on every platform, as documented.
+- The `Display` text of `HttpError::InterimNotAllowed` contained a run of
+  spaces (a missing line continuation).
+- The `Display` text of `HttpError::InvalidHeaderValue` also names the
+  other case it covers: surrounding whitespace in an outgoing value.
+
+### Documentation
+
+- Every factual claim in the README, `docs/`, the changelog, and the
+  rustdoc re-checked against the build and corrected where it was wrong
+  (among them the `Transfer-Encoding` rule, the buffer bound, the sizes of
+  `HttpError` and `RequestHead`, pipelining in the `ClientConn` docs, the
+  `ChunkedDecoder` errors, and the `OwnedRequestHead::from_parts` check,
+  which is structural and not an integrity check).
 
 ---
 
@@ -506,12 +558,13 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/http-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/http-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/http-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/http-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/http-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/http-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/http-net/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/jamesgober/http-net/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/jamesgober/http-net/releases/tag/v0.1.0
+[0.2.0]: https://github.com/jamesgober/http-net/compare/1f3458c...v0.2.0
+[0.1.0]: https://github.com/jamesgober/http-net/commit/1f3458c

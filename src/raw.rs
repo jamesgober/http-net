@@ -5,7 +5,7 @@
 //! copied without re-parsing: [`RequestHead::copy_into`] copies the bytes
 //! and spans into a caller's reused vectors and hands back the interpreted
 //! [`HeadFacts`], and [`OwnedRequestHead::from_parts`] rebuilds a view from
-//! them after checking that nothing was tampered with. The stateless
+//! them after checking that their structure is intact. The stateless
 //! parsers run the connections' own scanner and interpretation over a
 //! caller's slice, with the field records written into a caller's array:
 //! they allocate nothing.
@@ -113,7 +113,8 @@ impl<'a> RawHead<'a> {
         self.target
     }
 
-    /// The protocol version, `HTTP/1.1` or `HTTP/1.0` as received.
+    /// The protocol version as received (`HTTP/1.0`, `HTTP/1.1`, or another
+    /// `HTTP/1.x`, which `version()` reports as `Http11`).
     ///
     /// # Examples
     ///
@@ -358,8 +359,11 @@ impl OwnedRequestHead {
     /// facts say, each field name a token followed by a colon, each value
     /// without control bytes or surrounding whitespace, the lines in order
     /// and back to back, the blank line last), and the host and target
-    /// spans in the facts point where they should. A passport buffer that
-    /// was changed is refused, never read.
+    /// spans in the facts point where they should. A passport whose
+    /// structure was changed is refused, never read. The check is
+    /// structural, not an integrity check: a change that keeps every rule (a
+    /// different target, `Host`, or field value of valid bytes) is accepted,
+    /// so a passport that crosses a trust boundary needs its own MAC.
     ///
     /// The framing facts themselves (body length, keep-alive) are taken as
     /// given: they come from the same trusted copy, and recomputing them
@@ -639,10 +643,12 @@ impl fmt::Debug for ParsedResponse<'_> {
     }
 }
 
-/// Parses one request head from the start of `input`, with exactly the
-/// rules and budgets of [`ServerConn`](crate::ServerConn) (the same scanner
-/// and interpretation code), writing the field records into `fields`.
-/// Allocates nothing.
+/// Parses one request head from the start of `input`, with the rules and
+/// budgets of [`ServerConn`](crate::ServerConn) (the same scanner and
+/// interpretation code), writing the field records into `fields`.
+/// Allocates nothing. Unlike `ServerConn`, it does not check for the HTTP/2
+/// connection preface first; call [`is_h2_preface`](crate::is_h2_preface)
+/// for that.
 ///
 /// It is stateless: given more input after `Partial`, it parses again from
 /// the start. A caller that receives a head in many small pieces and needs
@@ -653,8 +659,11 @@ impl fmt::Debug for ParsedResponse<'_> {
 ///
 /// # Errors
 ///
-/// Every request parse error `ServerConn::poll` can return for a head
-/// (`UnexpectedEof` aside: running out of input is `Partial` here).
+/// Every request parse error `ServerConn::poll` can return for a head,
+/// except `UnexpectedEof` (running out of input is `Partial` here) and
+/// `Http2Preface` (the preface is reported as
+/// [`HttpError::UnsupportedVersion`]; call
+/// [`is_h2_preface`](crate::is_h2_preface) first to tell them apart).
 ///
 /// # Examples
 ///
@@ -703,7 +712,8 @@ pub fn parse_request_head<'a>(
 /// (a `HEAD` request's response has no body; a 2xx to `CONNECT` is a
 /// tunnel). Interim (1xx) heads are returned like any other; check
 /// [`ResponseHead::is_informational`] and parse the next head after `len`.
-/// Allocates nothing.
+/// No [`ClientLeniency`](crate::ClientLeniency) applies, so obsolete line
+/// folding is always [`HttpError::ObsFold`]. Allocates nothing.
 ///
 /// # Errors
 ///

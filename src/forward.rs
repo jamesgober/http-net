@@ -22,9 +22,11 @@ const HOP_BY_HOP: &[&str] = &[
 /// `keep-alive`, `proxy-connection`, `te`, `transfer-encoding`, `upgrade`,
 /// `trailer`, or any name the message's `Connection` field lists (RFC 9110
 /// section 7.6.1). A proxy removes these before forwarding a message.
-/// Names compare ASCII case-insensitively. Pass the message's
+/// Names compare ASCII case-insensitively. For a request, pass
 /// [`RequestHead::connection_options`](crate::RequestHead::connection_options)
-/// as `connection_options`.
+/// as `connection_options`; for a response, pass
+/// [`ResponseHead::header_list("connection")`](crate::ResponseHead::header_list)
+/// (a `ResponseHead` has no `connection_options`).
 ///
 /// # Examples
 ///

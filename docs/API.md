@@ -1,11 +1,12 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.8.0`).** This file is the approved
-> design of the 1.0 surface: each item says the version it ships in. Items
-> marked **exists**, **0.3**, **0.4**, **0.5**, **0.6**, **0.7**, or **0.8** are in this build; items marked
-> with a later version are the plan and are not in the crate yet. The
-> surface may still change in the 0.x series and is frozen at `1.0.0`.
+> and examples. **Status: pre-1.0 (`0.9.0`).** This file describes the 1.0
+> surface: each item says the version it ships in, and every item listed
+> is in this build (the two planned items are under
+> [Planned after 1.0](#planned-after-10)). The API is frozen as the 1.0
+> candidate from 0.9.0; only fixes land before 1.0.0 (see
+> [`docs/STABILITY-1.0.md`](./STABILITY-1.0.md)).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -107,6 +108,7 @@
   - [`blocking::Error`](#blockingerror)
 - [Not provided, on purpose](#not-provided-on-purpose)
 - [Limits and guarantees](#limits-and-guarantees)
+- [Planned after 1.0](#planned-after-10)
 
 ## Overview
 
@@ -140,7 +142,7 @@ messages into a caller-owned `Vec<u8>`.
 | Tier | Who | Items |
 |---|---|---|
 | 1 | application authors: serve a handler, fetch a URL, build a message | `blocking::Server::bind` + `serve`, `blocking::get`, `Response::text`, `Response::new`, `Response::from_error`, `Request::get`, `Request::post`, `reason_phrase`, `blocking::serve`, `blocking::post` |
-| 2 | driver authors (`serve-net`, `fetch-net`, WASP, LexerSketch): own the socket, drive the state machine | `ServerConn`, `ClientConn`, their events, `Progress`, `Limits`, the builders, the views, `HttpDate` and `DateCache`, `blocking::Connection`, `ServerConfig`, `blocking::Client` |
+| 2 | driver authors (`serve-net`, `fetch-net`, WASP, LexerSketch): own the socket, drive the state machine | `ServerConn`, `ClientConn`, their events, `Progress`, `Limits`, the builders, the views, `HttpDate` and `DateCache`, `blocking::Connection`, `blocking::ServerConfig`, `blocking::Client` |
 | 3 | engine-level users: passports, proxies, differential tests, other engines | `MethodSet`, `Method::index`; from 0.5 spans and raw heads, owned heads, stateless parsers, `ChunkedDecoder`, the `Output` trait and borrowed writer, hop-by-hop helpers, HTTP/2 preface detection |
 
 ### Reading the entries
@@ -156,20 +158,28 @@ Each entry gives the signature, what it does, its errors, and an example.
 | 0.4 | new in 0.4.0 |
 | 0.5 | new in 0.5.0 |
 | 0.6 | new in 0.6.0 |
-| after 1.0 | planned; not in this build. Signatures are the approved design and may still be adjusted before they ship. |
+| 0.7 | new in 0.7.0 |
+| 0.8 | new in 0.8.0 |
+| 0.9 | new or changed in 0.9.0 |
+
+Two values (`exists; 0.3`) mean shipped in the first, changed in the
+second.
+
+Signature blocks are fenced `rust,ignore` because they are declarations;
+every example block runs as a doctest (`src/lib.rs`, `ApiDoctests`).
 
 ## Installation
 
 ```toml
 [dependencies]
-http-net = "0.8"
+http-net = "0.9"
 ```
 
 `no_std` (the core needs `alloc` only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.8", default-features = false }
+http-net = { version = "0.9", default-features = false }
 ```
 
 ## Quick start
@@ -274,7 +284,7 @@ guess. Each row is refused in requests and responses alike unless noted.
 | `Content-Length` together with `Transfer-Encoding` | `ConflictingFraming` | CL.TE / TE.CL smuggling; 9112 section 6.1 allows rejecting. |
 | a second `Content-Length`, even an equal one; a list `5, 5`; signs, spaces, hex | `DuplicateContentLength` / `InvalidContentLength` | 9112 section 6.3 item 5: a recipient may reject; accepting invites a hop to pick another value. |
 | `Transfer-Encoding` that is not exactly one final `chunked` (`chunked, chunked`, `chunked;x=1`, `xchunked`, empty) | `InvalidTransferEncoding` | TE.TE obfuscation. Responses too: RFC 9112 would read such a response until close; this crate refuses it. |
-| a transfer coding other than `chunked` (`gzip, chunked`) | `UnsupportedTransferEncoding` (501) | No codings are implemented. |
+| a transfer coding before the final `chunked` (`gzip, chunked`) | `UnsupportedTransferEncoding` (501) | No codings are implemented. |
 | `Transfer-Encoding` in HTTP/1.0 | `TransferEncodingInHttp10` | 9112 section 6.1: framing is faulty. |
 | obsolete line folding; whitespace before the first field | `ObsFold` | 9112 section 5.2 allows rejecting; folding hides fields from some hops. |
 | a bare CR anywhere in the head; a bare LF as a line end | `BareCr` / `BareLf` | 9112 section 2.2 permits accepting a bare LF; refusing it keeps every hop agreeing on line ends. |
@@ -364,14 +374,17 @@ From 0.3, every `Debug` implementation in the crate replaces the values of
 `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` with
 `<redacted N bytes>` (the length only). This covers [`RequestHead`](#requesthead),
 [`ResponseHead`](#responsehead), [`Headers`](#headers), the events that
-carry them, [`Request`](#request), [`Response`](#response), and
-[`blocking::ClientResponse`](#blockingclientresponse), so `{:?}` of a
-request in a log line never prints a session cookie or a bearer token.
+carry them, [`Request`](#request), [`Response`](#response),
+[`ResponseHeadRef`](#output-and-the-borrowed-writer), and
+[`blocking::ClientResponse`](#blockingclientresponse);
+[`blocking::Connection`](#blockingconnection) prints its buffers as lengths
+only. So `{:?}` of a request in a log line never prints a session cookie or
+a bearer token.
 Field names are matched ASCII case-insensitively. The accessors
 (`header`, `headers`, `header_value`) still return the real bytes. The list
-is fixed in 0.3; a caller-extensible list (for custom credential fields
-such as an API key header) is evaluated in 0.5. `Display` of an error never
-includes input bytes at all.
+is fixed; a caller-extensible list (for custom credential fields such as
+an API key header) is not provided. `Display` of an error never includes
+input bytes at all.
 
 ```rust
 use http_net::{ServerConn, ServerEvent};
@@ -408,7 +421,9 @@ assert_eq!(http_net::VERSION.split('.').count(), 3);
 | Feature | Default | Description | Ships |
 |---|---|---|---|
 | `std` | yes | The `blocking` module. Without it the crate is `no_std` + `alloc`, built in CI for `thumbv7em-none-eabihf`. | exists |
-| `http-types` | no | `From`/`TryFrom` between the views and builders and the `http` crate's types; the only optional third-party dependency, never default. | after 1.0 |
+
+An optional `http-types` feature is planned for after 1.0; see
+[Planned after 1.0](#planned-after-10).
 
 ## `HttpError`
 
@@ -421,8 +436,8 @@ impl core::fmt::Display for HttpError;
 impl core::error::Error for HttpError;
 ```
 
-One variant per refusal. `Copy`; 16 bytes (the `InvalidState(&'static str)`
-variant carries its rule). Two kinds:
+One variant per refusal. `Copy`; 24 bytes on 64-bit targets (the
+`InvalidState(&'static str)` variant carries its rule). Two kinds:
 
 - **Peer errors** come from parsing bytes the peer sent. They are final for
   the connection: HTTP/1.1 framing cannot be resynchronised after a
@@ -504,13 +519,13 @@ assert!(HttpError::InvalidTarget.is_peer_error() && HttpError::InvalidTarget.is_
 | `InvalidMethod` | peer / usage | method is not a token (parse, or `Request::new`) | 400 | answer 400 / fix the method | exists |
 | `InvalidTarget` | peer / usage | target bytes outside RFC 3986, bad `%XX`, a form the method does not allow, absolute form without `//authority`, with userinfo, or with an empty host; an authority with an empty host before a port or a bad `%XX` (0.3) | 400 | answer 400 / fix the target | exists; 0.3 |
 | `InvalidVersion` | peer | version not `HTTP/DIGIT.DIGIT` | 400 | answer 400 | exists |
-| `UnsupportedVersion` | peer | major version other than 1 (includes an `HTTP/2.0` request line; the HTTP/2 connection preface at the start of a connection is `Http2Preface` from 0.5) | 505 | answer 505 | exists |
-| `InvalidStatus` | peer / usage | status not three digits in 100..=599 (parse); outside 100..=599, or a 1xx other than 101 (respond) | None | drop the connection / fix the status | exists |
+| `UnsupportedVersion` | peer | major version other than 1 (`HTTP/1.2` to `HTTP/1.9` are read as 1.1; includes an `HTTP/2.0` request line; the HTTP/2 connection preface at the start of a connection is `Http2Preface` from 0.5) | 505 | answer 505 | exists |
+| `InvalidStatus` | peer / usage | a three-character code that is not digits or is outside 100..=599 (parse; another length is `InvalidStartLine`); outside 100..=599, or a 1xx other than 101 (respond); `send_informational` with a code outside 102..=199 | None | drop the connection / fix the status | exists |
 | `StartLineTooLong` | peer | request or status line (including skipped empty lines) over `max_start_line` | 414 | answer 414 | exists |
-| `HeadersTooLarge` | peer | header or trailer section over `max_header_bytes`; client: interim heads over the same budget | 431 | answer 431 | exists |
-| `TooManyHeaders` | peer | more fields than `max_headers` | 431 | answer 431 | exists |
+| `HeadersTooLarge` | peer | header section over `max_header_bytes`, trailer section over `max_trailer_bytes`; client: interim heads over `max_header_bytes` | 431 | answer 431 | exists |
+| `TooManyHeaders` | peer | more fields than `max_headers`, or more trailer fields than `max_trailer_fields`; `parse_request_head` / `parse_response_head`: more fields than the `fields` slice holds | 431 | answer 431 | exists |
 | `FieldLineTooLong` | peer | one field line over `max_field_line` | 431 | answer 431 | 0.4 |
-| `BareCr` | peer / usage | CR not followed by LF anywhere in a head, chunk line, or outgoing field | 400 | answer 400 / remove CR from the value | exists |
+| `BareCr` | peer / usage | CR not followed by LF anywhere in a received head or chunk line; any CR in an outgoing field value | 400 | answer 400 / remove CR from the value | exists |
 | `BareLf` | peer | LF not preceded by CR | 400 | answer 400 | exists |
 | `ObsFold` | peer | field line starting with SP or HTAB (fold, or whitespace before the first field) | 400 | answer 400 | exists |
 | `InvalidHeaderName` | peer / usage | empty or non-token name, or no colon | 400 | answer 400 / fix the name | exists |
@@ -522,14 +537,14 @@ assert!(HttpError::InvalidTarget.is_peer_error() && HttpError::InvalidTarget.is_
 | `DuplicateContentLength` | peer | CL field more than once, even with equal values | 400 | answer 400 | exists |
 | `ConflictingFraming` | peer | CL and TE both present | 400 | answer 400 | exists |
 | `InvalidTransferEncoding` | peer | TE empty, `chunked` repeated, `chunked` with parameters, not ending in `chunked`, an invalid coding token | 400 | answer 400 | exists |
-| `UnsupportedTransferEncoding` | peer | a transfer coding other than `chunked` | 501 | answer 501 | exists |
+| `UnsupportedTransferEncoding` | peer | a transfer coding before the final `chunked` | 501 | answer 501 | exists |
 | `TransferEncodingInHttp10` | peer | TE in an HTTP/1.0 message | 400 | answer 400 | exists |
 | `InvalidChunkSize` | peer | no hex digit, more than 16 digits, overflow, junk after the size | 400 | answer 400 | exists |
 | `InvalidChunkExtension` | peer | extension not `*( BWS ";" BWS name [ BWS "=" BWS (token / quoted-string) ] )`, trailing whitespace, a CR inside it | 400 | answer 400 | exists |
 | `InvalidChunkTerminator` | peer | chunk data not followed by CRLF | 400 | answer 400 | exists |
 | `ChunkLineTooLong` | peer | chunk-size line over `max_start_line` | 400 | answer 400 | exists |
 | `ChunkExtensionsTooLarge` | peer | sum of extension bytes in one message over `max_header_bytes` | 400 | answer 400 | exists |
-| `BodyTooLarge` | peer | declared CL, cumulative chunk sizes, or until-close bytes over `max_body` | 413 | answer 413 | exists |
+| `BodyTooLarge` | peer | declared CL or cumulative chunk sizes over `max_body` (checked before the data is buffered), or until-close bytes past it (refused at the first byte over) | 413 | answer 413 | exists |
 | `UnexpectedEof` | peer | EOF inside a head or a body with a known end | None | close | exists |
 | `UnexpectedData` | peer / usage | client: bytes with no request outstanding; `send_request` with unread input | None | close | exists |
 | `UnexpectedUpgrade` | peer | client: `101` to a request that did not ask, or without `Upgrade` | None | close | exists |
@@ -585,7 +600,7 @@ read. The defaults are LexerSketch Studio's localhost budgets.
 counts every field line plus the blank line that ends the section.
 `max_field_line` bounds one field line, in headers and trailers, CRLF
 included: a longer line is `FieldLineTooLong` (431), refused before the
-rest of it is buffered. **The 8 KiB default is new in 0.4** (OD-21; in 0.3
+rest of it is buffered. **The 8 KiB default is new in 0.4** (in 0.3
 one line could use the whole 16 KiB section). Trailer sections have their
 own budgets, which follow the header budgets until they are set.
 `max_header_bytes` also caps, per message, the total of all chunk
@@ -654,7 +669,7 @@ assert_eq!(http_net::Limits::new().with_pipeline_depth(0).pipeline_depth(), 1);
 ```rust,ignore
 pub struct ServerConn { /* private */ }
 impl Default for ServerConn;
-impl core::fmt::Debug for ServerConn; // state, buffered length, limits; never bytes
+impl core::fmt::Debug for ServerConn; // request and response state, buffered length, limits; never bytes
 ```
 
 The server side of one HTTP/1.1 connection: a sans-IO state machine.
@@ -722,8 +737,9 @@ Advances the parser one step and reports one event. Call it until it
 returns `NeedInput`, `AwaitingResponse`, `Upgraded`, or `Closed`.
 **Errors:** every peer variant of [`HttpError`](#variants); the connection
 is then finished: one error response may be sent with `respond`, then it
-reports `Closed`. **Cost:** about 280 ns to parse and answer a 12-field
-browser GET (measured 0.2.0). **Ships:** exists.
+reports `Closed`. **Cost:** about 234 ns to parse and answer a 12-field
+browser GET (measured 0.6.0, [`PERFORMANCE.md`](./PERFORMANCE.md)).
+**Ships:** exists.
 
 ```rust
 use http_net::{HttpError, ServerConn};
@@ -779,7 +795,8 @@ is written with an empty reason and the space RFC 9112 section 4 requires
   connection closed or upgraded, or a `101` (or 2xx to `CONNECT`) that does
   not answer a complete upgrade request.
 
-**Cost:** about 75 ns for five fields and a 1 KiB body (measured 0.2.0).
+**Cost:** about 74 ns for five fields and a 1 KiB body (measured 0.6.0,
+[`PERFORMANCE.md`](./PERFORMANCE.md)).
 **Ships:** exists; 0.3 (offered-protocol check).
 
 ```rust
@@ -820,8 +837,9 @@ Writes `HTTP/1.1 100 Continue` CRLF CRLF, telling a client that sent
 for an HTTP/1.0 request (RFC 9110 section 15.2 forbids 1xx responses to
 HTTP/1.0 clients), once a body byte has been read or the whole body has
 arrived, once a response has started, or when `100 Continue` was already
-sent for this request; `InvalidState` when no request is waiting for its
-body. **Ships:** exists; 0.4 (`InterimNotAllowed`, which replaced
+sent for this request, and for a request with no body left to read;
+`InvalidState` with no current request (none arrived, or the connection
+failed, closed, or upgraded). **Ships:** exists; 0.4 (`InterimNotAllowed`, which replaced
 `InvalidState` for the HTTP/1.0 and ordering cases).
 
 ```rust
@@ -1062,7 +1080,7 @@ pub fn set_wipe(&mut self, wipe: bool)
 - `shrink_idle()` frees the buffer and field indexes while the connection is
   idle with nothing buffered, so idle keep-alive connections cost only their
   struct; it returns whether memory was released, and the next input
-  allocates again.
+  allocates again. The storage is dropped, not kept for `into_buffer`.
 - `set_wipe(true)` zeroes the bytes of every finished request (head, body,
   framing) before the buffer is reused, zeroes the stale copies compaction
   leaves behind, and zeroes the whole buffer on `reset`, `into_buffer`, and
@@ -1082,10 +1100,25 @@ let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nCookie: sid=secret\r\n\r\n");
 while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
 conn.respond(&Response::new(204), &mut Vec::new())?;
 assert!(matches!(conn.poll()?, ServerEvent::NeedInput)); // the request's bytes are zeroed
-assert!(conn.shrink_idle());
 conn.reset(); // a new socket
 let back = conn.into_buffer(); // back to the pool, zeroed
+assert!(back.capacity() >= 16 * 1024);
 assert!(back.iter().all(|&b| b == 0));
+# Ok::<(), http_net::HttpError>(())
+```
+
+`shrink_idle` releases the storage instead of keeping it:
+
+```rust
+use http_net::{Response, ServerConn, ServerEvent};
+
+let mut conn = ServerConn::new();
+let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
+conn.respond(&Response::new(204), &mut Vec::new())?;
+assert!(matches!(conn.poll()?, ServerEvent::NeedInput));
+assert!(conn.shrink_idle()); // idle with nothing buffered: memory released
+assert_eq!(conn.into_buffer().capacity(), 0);
 # Ok::<(), http_net::HttpError>(())
 ```
 
@@ -1093,8 +1126,8 @@ assert!(back.iter().all(|&b| b == 0));
 
 | Method | Behaviour | Errors | Ships |
 |---|---|---|---|
-| `write_head<O: Output>(&mut self, head: &ResponseHeadRef<'_>, date, out: &mut O) -> Result<BodyPlan, HttpError>` | allocation-free head writer from borrowed fields; see [`write_head`](#serverconnwrite_head-and-respond_into) | as `respond` | 0.5 |
-| `respond_into<O: Output>(&mut self, response, date, out: &mut O)`, `send_body_into`, `end_body_into` | `respond`, `send_body`, `end_body_with_trailers` over any `Output` | as `respond` | 0.5 |
+| `write_head<O: Output + ?Sized>(&mut self, head: &ResponseHeadRef<'_>, date: Option<&HttpDate>, out: &mut O) -> Result<BodyPlan, HttpError>` | allocation-free head writer from borrowed fields; see [`write_head`](#serverconnwrite_head-and-respond_into) | as `respond` | 0.5 |
+| `respond_into<O: Output + ?Sized>(&mut self, response: &Response, date: Option<&HttpDate>, out: &mut O) -> Result<(), HttpError>`, `send_body_into<O: Output + ?Sized>(&mut self, data: &[u8], out: &mut O) -> Result<(), HttpError>`, `end_body_into<O: Output + ?Sized>(&mut self, trailers: &[(&str, &[u8])], out: &mut O) -> Result<(), HttpError>` | `respond`, `send_body`, `end_body_with_trailers` over any `Output` | as `respond`, `send_body`, and `end_body_with_trailers` respectively | 0.5 |
 | `respond_head_only(&mut self, response, out) -> Result<BodyPlan, HttpError>` | writes only the head of a full-body response, so the driver can send head and body with one vectored write; see [`respond_head_only`](#serverconnrespond_head_only) | as `respond` | 0.6 |
 
 ## `ServerEvent`
@@ -1105,12 +1138,12 @@ assert!(back.iter().all(|&b| b == 0));
 pub enum ServerEvent<'a> {
     Request(RequestHead<'a>),
     Body(&'a [u8]),
+    Trailers(Headers<'a>), // only with set_report_trailers(true)
     RequestEnd,
     NeedInput,
     AwaitingResponse,
     Upgraded,
     Closed,
-    Trailers(Headers<'a>), // only with set_report_trailers(true)
 }
 ```
 
@@ -1170,7 +1203,8 @@ impl core::fmt::Debug for RequestHead<'_>; // credential values redacted (0.3)
 A parsed request head borrowed from the connection's buffer. Every accessor
 is a slice of the bytes that arrived; nothing is copied. Valid until the
 next `&mut` call on the connection; read it again with
-[`ServerConn::request`](#serverconnrequest). Three references, 24 bytes.
+[`ServerConn::request`](#serverconnrequest). Three references (two slices
+and a pointer), 40 bytes on a 64-bit target.
 
 ```rust
 use http_net::{Method, ServerConn, ServerEvent, TargetForm, Version};
@@ -1347,10 +1381,12 @@ assert_eq!(req.headers().len(), 2);
 #[derive(Clone)]
 pub struct HeaderValues<'a, 'n> { /* private */ }
 impl<'a> Iterator for HeaderValues<'a, '_> { type Item = &'a [u8]; }
+impl core::fmt::Debug for HeaderValues<'_, '_>; // credential values redacted
 
 #[derive(Clone)]
 pub struct ListElements<'a, 'n> { /* private */ }
 impl<'a> Iterator for ListElements<'a, '_> { type Item = &'a [u8]; }
+impl core::fmt::Debug for ListElements<'_, '_>; // credential values redacted
 ```
 
 `HeaderValues` yields the value of every field with one name, in arrival
@@ -1358,14 +1394,16 @@ order (`header_all`). The values borrow the head (`'a`), not the name
 (`'n`), so a lookup with a temporary name keeps its values. **Ships:** 0.3.
 
 `ListElements` yields the elements of a `#list` field across every line
-with one name (`header_list`, `upgrade_protocols`, later
+with one name (`header_list`, `upgrade_protocols`,
 `connection_options`): trimmed of whitespace, empty elements skipped, and a
 comma inside a quoted string (with backslash escapes) does not end an
 element. **Ships:** 0.4.
 
 The same quote-aware walk now splits the framing fields the crate reads
-itself (`Connection`, `Transfer-Encoding`, `Expect`, `Upgrade`), as the
-shared grammar crate `parse-net` will. In 0.3 a comma inside quotes split
+itself (`Connection`, `Transfer-Encoding`, `Expect`, `Upgrade`). It stays
+local: `parse-net`'s list parser validates as it splits and treats `(...)`
+as a comment, so moving to it would change which requests are accepted. In
+0.3 a comma inside quotes split
 an element; no message 0.3 accepted reads differently (the only list that
 could hold quotes, `Transfer-Encoding: chunked;x="a,b"`, is refused either
 way for its parameters).
@@ -1403,6 +1441,7 @@ impl<'a> RequestHead<'a> { pub fn raw(&self) -> RawHead<'a>; }
 impl<'a> ResponseHead<'a> { pub fn raw(&self) -> RawHead<'a>; }
 #[derive(Clone, Copy)]
 pub struct RawHead<'a> { /* private */ }
+impl core::fmt::Debug for RawHead<'_>; // lengths and spans only, never the bytes
 impl<'a> RawHead<'a> {
     pub fn bytes(&self) -> &'a [u8];
     pub fn start_line(&self) -> Span;
@@ -1422,6 +1461,7 @@ pub struct HeadFacts { /* private */ }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OwnedRequestHead { /* private */ }
+impl core::fmt::Debug for OwnedRequestHead; // credential values redacted
 impl OwnedRequestHead {
     pub fn view(&self) -> RequestHead<'_>;
     pub fn from_parts(bytes: Vec<u8>, fields: Vec<FieldSpan>, facts: HeadFacts) -> Result<Self, HttpError>;
@@ -1433,9 +1473,11 @@ impl OwnedRequestHead {
 |---|---|---|
 | `Span`, `FieldSpan` | `u32` offsets relative to `RawHead::bytes()`; `get` returns an empty slice for an out-of-range span and never panics; a field's value span is OWS-trimmed | 0.5 |
 | `raw`, `RawHead` | the head bytes and spans behind a view; the bytes can be moved and the spans stay valid | 0.5 |
-| `copy_into`, `HeadFacts` | copies the head (one copy) and spans into caller-owned reused vectors, cleared first, and returns the interpreted facts, so a passport rebuilds a view without re-parsing (decision OD-12); no allocation once the vectors have grown | 0.5 |
-| `to_owned`, `OwnedRequestHead`, `view`, `from_parts`, `into_parts` | an owned copy; `from_parts` re-validates every span and the line structure and refuses a tampered passport buffer with `InvalidState`; `into_parts` hands the vectors back for reuse | 0.5 |
-| `KnownField`, `known` | constant-time lookup of frequent fields through an index filled while parsing; kept only if it costs at most 2% on the head benchmark | after 1.0 |
+| `copy_into`, `HeadFacts` | copies the head (one copy) and spans into caller-owned reused vectors, cleared first, and returns the interpreted facts, so a passport rebuilds a view without re-parsing; no allocation once the vectors have grown | 0.5 |
+| `to_owned`, `OwnedRequestHead`, `view`, `from_parts`, `into_parts` | an owned copy; `from_parts` re-validates every span and the line structure and refuses a passport whose structure was changed with `InvalidState`; `into_parts` hands the vectors back for reuse | 0.5 |
+
+A constant-time lookup of frequent fields (`KnownField`, `known`) is
+planned for after 1.0; see [Planned after 1.0](#planned-after-10).
 
 `RawHead::bytes()` runs from the first byte the connection kept for this
 head to the end of the blank line. A request may be preceded by empty
@@ -1479,7 +1521,7 @@ assert!(bytes.capacity() >= 4096 && fields.capacity() >= 64);
 # Ok::<(), http_net::HttpError>(())
 ```
 
-A changed buffer is refused, never read:
+A passport whose structure was changed is refused, never read:
 
 ```rust
 use http_net::{HttpError, OwnedRequestHead, ServerConn, ServerEvent};
@@ -1499,14 +1541,19 @@ assert!(matches!(
 
 `from_parts` checks structure, not meaning: it does not recompute the
 framing facts (body length, keep-alive), which come from the same copy.
+The check is structural, not an integrity check: a change that keeps every
+rule (a different target, `Host`, or field value of valid bytes) is
+accepted, so a passport that crosses a trust boundary needs its own MAC.
 A head built by hand from bytes the parser never saw should go through
 [`parse_request_head`](#stateless-head-parsers) instead.
 
 ## Stateless head parsers
 
-Tier 3. One complete head from a caller slice, with the connection's exact
+Tier 3. One complete head from a caller slice, with the connection's
 rules (the same scanner and checks, not a copy of them), into a caller
-array of field spans. No state, no allocation, no buffer: for proxies,
+array of field spans. The one difference: a connection checks for the
+HTTP/2 preface first, and these parsers do not (call
+[`is_h2_preface`](#is_h2_preface) first to tell it apart). No state, no allocation, no buffer: for proxies,
 differential tests, and engines that frame messages themselves.
 
 ```rust,ignore
@@ -1519,12 +1566,16 @@ pub fn parse_response_head<'a>(input: &'a [u8], limits: &Limits, asked: Asked, f
 #[derive(Debug)]
 pub enum Parsed<T> { Complete { head: T, len: usize }, Partial }
 
+#[derive(Clone, Copy)]
 pub struct ParsedRequest<'a> { /* private */ }
+impl core::fmt::Debug for ParsedRequest<'_>; // credential values redacted
 impl ParsedRequest<'_> {
     pub fn view(&self) -> RequestHead<'_>;
     pub fn facts(&self) -> HeadFacts;
 }
+#[derive(Clone, Copy)]
 pub struct ParsedResponse<'a> { /* private */ }
+impl core::fmt::Debug for ParsedResponse<'_>; // credential values redacted
 impl ParsedResponse<'_> { pub fn view(&self) -> ResponseHead<'_>; }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -1533,8 +1584,8 @@ pub struct Asked { pub head: bool, pub connect: bool }
 
 | Item | Behaviour | Errors | Ships |
 |---|---|---|---|
-| `parse_request_head` | `Complete` with the view and the head's length (`input[len..]` is the body or the next head) once the blank line is in; `Partial` while it is not, where a connection would ask for more input | the connection's head errors; `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5 |
-| `parse_response_head` | as above for a response; `asked` says what the request was, which decides the framing (`HEAD` and a `2xx` to `CONNECT` have no body); interim (`1xx`) heads are returned like any other | the connection's head errors | 0.5 |
+| `parse_request_head` | `Complete` with the view and the head's length (`input[len..]` is the body or the next head) once the blank line is in; `Partial` while it is not, where a connection would ask for more input | the connection's head errors, except `UnexpectedEof` (that is `Partial` here) and `Http2Preface` (reported as `UnsupportedVersion`); `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5 |
+| `parse_response_head` | as above for a response; `asked` says what the request was, which decides the framing (`HEAD` and a `2xx` to `CONNECT` have no body); interim (`1xx`) heads are returned like any other; no [`ClientLeniency`](#clientconnset_leniency-and-clientleniency) applies, so obsolete line folding is always `ObsFold` | the connection's head errors (`UnexpectedEof` aside); `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5 |
 | `Parsed`, `ParsedRequest`, `ParsedResponse` | the outcome and the parsed heads; `view()` gives the same accessors a connection's head has | none | 0.5 |
 | `Asked` | the request facts a response parser needs; `Asked::default()` is a plain request | none | 0.5 |
 
@@ -1596,7 +1647,7 @@ pub enum Method { Get, Head, Post, Put, Delete, Connect, Options, Trace, Patch, 
 
 The RFC 9110 methods plus `PATCH` (RFC 5789); anything else is `Other`, with
 the text in `RequestHead::method_str`. A variant is added only when an RFC
-registers the method (OD-10).
+registers the method.
 
 | Method | Returns | Notes | Ships |
 |---|---|---|---|
@@ -1631,7 +1682,7 @@ impl MethodSet {
     pub const fn contains(&self, method: Method) -> bool;
     pub const fn union(self, other: MethodSet) -> MethodSet;
     pub const fn is_empty(&self) -> bool;
-    pub fn iter(&self) -> impl Iterator<Item = Method>;
+    pub fn iter(&self) -> impl Iterator<Item = Method> + use<>; // does not borrow the set
     pub fn write_allow(&self, out: &mut Vec<u8>);
 }
 ```
@@ -1639,8 +1690,9 @@ impl MethodSet {
 A bit set of methods, one AND per membership check: for routers and for the
 `Allow` field of a `405`. `Other` cannot be represented precisely, so
 `contains(Method::Other)` means "some extension method is allowed".
-`write_allow` writes the registered members in `index` order separated by
-`", "` (`Other` is skipped, it has no name). **Ships:** 0.3.
+`write_allow` appends the registered members to `out` (it does not clear
+it) in `index` order separated by `", "` (`Other` is skipped, it has no
+name). **Ships:** 0.3.
 
 ```rust
 use http_net::{Method, MethodSet, Response};
@@ -1684,7 +1736,7 @@ pub enum BodyFraming { None, Length(u64), Chunked, UntilClose }
 ```
 
 How a body is delimited. `UntilClose` occurs only for responses.
-`Content-Length: 0` reports `None` (OD-22: `framing()` answers "is there a
+`Content-Length: 0` reports `None` (`framing()` answers "is there a
 body", `content_length()` answers "what was declared"). **Ships:** exists.
 
 ## `TargetForm`
@@ -1709,7 +1761,7 @@ assert_eq!(req.target_form(), TargetForm::Asterisk);
 
 ## Status codes
 
-Status codes stay plain `u16` (OD-9), with names from the
+Status codes stay plain `u16`, with names from the
 [`status`](#status-constants) module.
 
 ### `reason_phrase`
@@ -1809,9 +1861,11 @@ impl HttpDate {
     pub fn as_str(&self) -> &str;
 }
 impl Display for HttpDate;
+impl core::fmt::Debug for HttpDate; // the formatted date
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DateCache { /* last second, formatted value */ }
+impl Default for DateCache; // as new()
 impl DateCache {
     pub const fn new() -> DateCache;
     pub fn update(&mut self, unix_seconds: u64) -> &HttpDate; // reformats only when the second changed
@@ -1846,9 +1900,10 @@ impl core::fmt::Debug for Response; // set-cookie (and any credential field) red
 ```
 
 An outgoing response. Builder methods validate as they go and remember the
-first problem; it is returned when the response is written. Framing fields
-(`content-length`, `transfer-encoding`, `connection`, `upgrade`) are refused
-with `ReservedHeader`: the connection writes them.
+first problem; it is returned when the response is written. The framing
+and hop-by-hop fields (`content-length`, `transfer-encoding`, `connection`,
+`upgrade`, `trailer`, `keep-alive`, `proxy-connection`, and on a response
+`te`) are refused with `ReservedHeader`: the connection writes them.
 
 | Method | Notes | Ships |
 |---|---|---|
@@ -1913,7 +1968,9 @@ A `101 Switching Protocols` handing the connection to `protocol`. Add
 protocol-specific fields (such as `sec-websocket-accept`) with `header`.
 **Errors** (when written): `InvalidHeaderValue` if `protocol` is not a
 token (a `name/version` product token is accepted); `UpgradeNotOffered` if
-it is `h2c` or the request did not offer it (0.3). **Ships:** exists; 0.3.
+it is `h2c` or the request did not offer it (0.3); `InvalidState` when the
+request is not a complete upgrade request (`RequestHead::is_upgrade` false,
+or its body not yet read). **Ships:** exists; 0.3.
 
 ```rust
 let r = http_net::Response::switching_protocols("websocket")
@@ -1953,9 +2010,9 @@ says HTTP/1.1.
 | `new(method: &str, target: &str) -> Request` | method must be a token; the target must be in a form the method allows | exists |
 | `get(target)`, `post(target)` | shorthands | exists |
 | `head(target)`, `put(target)`, `delete(target)`, `options(target)` | shorthands | 0.3 |
-| `header(self, name, value) -> Request` | as for `Response`; `host` validated and allowed once | exists |
+| `header(self, name, value) -> Request` | as for `Response`, except that `te` is allowed; `host` validated (`InvalidHost` when malformed) and allowed once | exists |
 | `body`, `chunked`, `content_length`, `close` | as for `Response`; an empty full body omits `content-length` except on POST, PUT, PATCH | exists |
-| `upgrade(self, protocol: &str) -> Request` | writes `connection: upgrade` and `upgrade: <protocol>`; `h2c` refused from 0.3 | exists; 0.3 |
+| `upgrade(self, protocol: &str) -> Request` | writes `connection: upgrade` and `upgrade: <protocol>`; `h2c` refused from 0.3; a protocol that is not a token or `name/version` is `InvalidHeaderValue` | exists; 0.3 |
 | `method(&self) -> &str`, `target(&self) -> &str` | | exists |
 | `body_bytes`, `header_value` | as for `Response` | exists |
 | `expect_continue(self) -> Request` | adds `expect: 100-continue` and makes the connection wait for `100` before the body; needs a streamed body (`content_length` or `chunked`) | 0.4 |
@@ -2069,11 +2126,12 @@ assert!(matches!(conn.poll()?, ClientEvent::Closed));
 ```rust,ignore
 pub struct ClientConn { /* private */ }
 impl Default for ClientConn;
-impl core::fmt::Debug for ClientConn; // state, buffered length, limits; never bytes
+impl core::fmt::Debug for ClientConn; // connection and request state, buffered length, limits; never bytes
 ```
 
 The client side of one HTTP/1.1 connection: one outstanding request at a
-time; `Send + Sync`.
+time by default, up to `Limits::pipeline_depth` with
+[pipelining](#pipelining); `Send + Sync`.
 
 | Method | Signature | Notes | Ships |
 |---|---|---|---|
@@ -2107,10 +2165,13 @@ are `UnexpectedData` (never queued as the next response).
 Writes `request` into `out` and waits for its response. A full body is
 sent with `content-length` (omitted for an empty body unless the method is
 POST, PUT, or PATCH); a streamed body continues with `send_body` and
-`end_body`. **Errors:** the builder's first error; `MissingHost` without a
-`host` field; `InvalidState` while a request is outstanding or after the
-connection closed or upgraded; `UnexpectedData` if unsolicited bytes are
-buffered. **Ships:** exists.
+`end_body`. With pipelining, a request may be sent while others are
+outstanding (see [Pipelining](#pipelining)). **Errors:** the builder's
+first error; `MissingHost` without a `host` field; `InvalidState` when a
+request is outstanding and this one cannot be pipelined (depth 1, depth
+full, or not idempotent with a full body), when the connection is closed or
+upgraded, or when an `expect_continue` request has a full body;
+`UnexpectedData` if unsolicited bytes are buffered. **Ships:** exists.
 
 ```rust
 use http_net::{ClientConn, ClientEvent, HttpError, Request};
@@ -2149,7 +2210,9 @@ pub fn progress(&self) -> Progress
 - `end_body_with_trailers` ends a chunked request body with trailers (the
   same forbidden list as on the server; `TrailerNotAllowed` for a body that
   is not chunked).
-- `is_reusable()`: another request can be sent now.
+- `is_reusable()`: nothing is outstanding and both sides keep the
+  connection alive; with pipelining, `can_send()` says whether another
+  request can be sent now.
 - `progress()`: the phase, for response deadlines.
 
 **Ships:** 0.4.
@@ -2252,7 +2315,7 @@ allocated. A line end is held back until its next byte arrives (only that
 byte says whether the line is folded), so the result does not depend on how
 the input is split. Whitespace before the first field, bare LF, bare CR,
 `Content-Length` with `Transfer-Encoding`, and whitespace before a colon are
-never tolerated (OD-7). A folded line counts as one field line against the
+never tolerated. A folded line counts as one field line against the
 budgets. **Ships:** 0.5.
 
 ```rust
@@ -2328,6 +2391,7 @@ impl Output for Vec<u8>;
 impl<O: Output + ?Sized> Output for &mut O;
 pub struct ResponseHeadRef<'a> { pub status: u16, pub fields: &'a [(&'a str, &'a [u8])],
     pub body: OutgoingBody, pub close: bool, pub upgrade: Option<&'a str> }
+impl core::fmt::Debug for ResponseHeadRef<'_>; // credential values redacted
 impl<'a> ResponseHeadRef<'a> {
     pub const fn new(status: u16, fields: &'a [(&'a str, &'a [u8])], body: OutgoingBody) -> Self;
 }
@@ -2341,7 +2405,7 @@ pub fn is_h2_preface(input: &[u8]) -> Option<bool>;
 | Item | Behaviour | Ships |
 |---|---|---|
 | `ChunkedDecoder`, `ChunkStep` | standalone chunked decoding with explicit byte accounting, for proxy streaming and fetch-net | 0.5 |
-| `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` | where serialized bytes go (`Vec<u8>` or a caller type such as a zeroizing buffer), and a borrowed response description; `put` cannot fail (OD-2) | 0.5 |
+| `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` | where serialized bytes go (`Vec<u8>` or a caller type such as a zeroizing buffer), and a borrowed response description; `put` cannot fail | 0.5 |
 | `is_hop_by_hop` | `connection`, `keep-alive`, `proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`, and any name listed in `Connection` | 0.5 |
 | `is_h2_preface` | `Some(true)` for the 24-byte HTTP/2 preface, `Some(false)` when the input cannot be it, `None` when too short to tell | 0.5 |
 
@@ -2350,7 +2414,10 @@ pub fn is_h2_preface(input: &[u8]) -> Option<bool>;
 Whether a field name is hop-by-hop for a message: the fixed set
 (`connection`, `keep-alive`, `proxy-connection`, `te`, `transfer-encoding`,
 `upgrade`, `trailer`) or any name the message's `Connection` lists (RFC
-9110 section 7.6.1), ASCII case-insensitively. **Ships:** 0.5.
+9110 section 7.6.1), ASCII case-insensitively. For a request pass
+`RequestHead::connection_options()`; for a response pass
+`ResponseHead::header_list("connection")` (a `ResponseHead` has no
+`connection_options`). **Ships:** 0.5.
 
 ```rust
 use http_net::{ServerConn, ServerEvent, is_hop_by_hop};
@@ -2407,8 +2474,11 @@ decoder included.
 
 `eof` says no more input will come: a body still open then fails with
 `UnexpectedEof`. Errors are the connection's (`InvalidChunkSize`,
-`ExtensionsTooLarge`, `BodyTooLarge`, `TrailersTooLarge`,
-`InvalidHeaderName`, and so on). `total()` counts the data bytes delivered;
+`InvalidChunkExtension`, `InvalidChunkTerminator`, `ChunkLineTooLong`,
+`ChunkExtensionsTooLarge`, `BareLf`, `BodyTooLarge`; for the trailer
+section `HeadersTooLarge` past `max_trailer_bytes` and `TooManyHeaders`
+past `max_trailer_fields`; and the field errors such as
+`InvalidHeaderName`). `total()` counts the data bytes delivered;
 `is_done()` is true once `Done` has been reported.
 
 ```rust
@@ -2445,8 +2515,7 @@ assert_eq!(&wire[pos..], b"GET / HTTP/1.1\r\n");
 ### `Output` and the borrowed writer
 
 `Output` is where serialized bytes go: a `Vec<u8>`, or a caller type such as
-a zeroizing buffer, a slab, or a byte counter. `put` cannot fail (decision
-OD-2): a sink with a fixed capacity records the overflow itself and reports
+a zeroizing buffer, a slab, or a byte counter. `put` cannot fail: a sink with a fixed capacity records the overflow itself and reports
 it after the call. `reserve` is a hint and may be ignored. `&mut O` is an
 `Output` for any `O: Output`, so a sink can be passed down without being
 moved.
@@ -2575,7 +2644,7 @@ pub struct Server { /* private */ }
 |---|---|---|
 | `bind(addr: impl ToSocketAddrs) -> io::Result<Server>` | use `127.0.0.1:0` for an ephemeral port | exists |
 | `with_config(self, config: ServerConfig) -> Server` | | exists |
-| `on_upgrade(self, hook: impl Fn(Upgraded) + Send + Sync + 'static) -> Server` | receives sockets after a 101; without a hook they are closed | exists |
+| `on_upgrade(self, hook: impl Fn(Upgraded) + Send + Sync + 'static) -> Server` | receives sockets after a 101 (or a 2xx to `CONNECT`); without a hook they are closed | exists |
 | `local_addr(&self) -> SocketAddr` | | exists |
 | `shutdown_handle(&self) -> ShutdownHandle` | | exists |
 | `serve<H>(self, handler: H) -> io::Result<()>` | `H: Fn(&RequestHead<'_>, &[u8]) -> Response + Send + Sync + 'static` | exists |
@@ -2596,11 +2665,11 @@ since no body follows. A request with an expectation other than
 `100-continue` is answered `417 Expectation Failed` and closed, before its
 body is read and without `100 Continue` (0.4). Every response gets a
 `date` field from [`now_date`](#blockingnow_date) unless the handler set
-one. Writing one response may take at most `response_deadline` in total
+one, except the `503` sent to a connection over the connection cap. Writing one response may take at most `response_deadline` in total
 (0.4), and a connection that reaches `max_requests_per_connection` closes
 after that response (0.4). Closing connections are drained (lingering
 close) for at most 1 s and 256 KiB so the last response is not lost to a
-reset. **Errors:** only if accepting fails persistently (1,000
+reset. **Errors:** only if accepting fails persistently (more than 1,000
 consecutive errors); transient accept errors are retried after 10 ms.
 
 ### `blocking::serve`
@@ -2614,6 +2683,8 @@ Binds `addr` and serves `handler` with the default `ServerConfig` until
 the process ends: the one-call Tier-1 server. For a shutdown handle, a
 configuration, or an upgrade hook, use `Server`. **Errors:** the bind
 error, or as `Server::serve`. **Ships:** 0.4.
+
+Not run: it serves until the process ends.
 
 ```rust,no_run
 use http_net::{blocking, Response};
@@ -2665,9 +2736,12 @@ assert_eq!(config.max_requests_per_connection(), Some(1000));
 
 ### `blocking::ShutdownHandle`
 
-`shutdown(&self)`: stop accepting, let each connection finish its current
-exchange, wait for them, and return from `serve`. A connection idle in a
-read finishes when its read timeout expires. **Ships:** exists.
+`shutdown(&self)`: stop accepting and return from `serve` once every open
+connection has ended. The stop is checked between exchanges, so an exchange
+in progress finishes. An idle keep-alive connection ends when its read
+timeout passes, or after one more request if the client sends one first;
+with no read timeout, `serve` does not return while a client holds an idle
+connection. **Ships:** exists.
 
 ### `blocking::Connection`
 
@@ -2694,6 +2768,8 @@ head and its complete body. **Ships:** exists.
 ### `blocking::Upgraded`
 
 ```rust,ignore
+#[non_exhaustive]
+#[derive(Debug)]
 pub struct Upgraded {
     pub stream: TcpStream,
     pub leftover: Vec<u8>,
@@ -2702,7 +2778,9 @@ pub struct Upgraded {
 ```
 
 The socket after a 101, the bytes of the new protocol already read, and the
-request target. **Ships:** exists.
+request target. Handed to the upgrade hook, never built by the caller, so it
+is `#[non_exhaustive]`: a later field is not a breaking change. **Ships:**
+exists; `#[non_exhaustive]` since 0.9.0.
 
 ### `blocking::get`
 
@@ -2711,7 +2789,7 @@ pub fn get(url: &str) -> Result<ClientResponse, Error>
 ```
 
 `Client::new().get(url)`. **Errors:** `InvalidUrl` for anything but
-`http://host[:port][/path][?query]`; `Io` for connection failures and
+`http://host[:port][/path[?query]]` (a `#fragment` is dropped); `Io` for connection failures and
 timeouts; `Http` for a response this crate refuses. **Ships:** exists.
 
 ### `blocking::post`
@@ -2723,6 +2801,8 @@ pub fn post(url: &str, content_type: &str, body: &[u8]) -> Result<ClientResponse
 A Tier-1 POST of `body` with `content-type: <content_type>` through the
 default `Client`. **Errors:** as `get`, plus the builder's errors for an
 invalid content type. **Ships:** 0.4.
+
+Not run: it needs a server on port 8080.
 
 ```rust,no_run
 let resp = http_net::blocking::post("http://127.0.0.1:8080/notes", "text/plain", b"hello")?;
@@ -2739,7 +2819,9 @@ assert_eq!(resp.status(), 201);
 | `with_timeout(Duration)` | connect, read, and write timeout (zero is raised to 1 ms) | exists |
 | `get(&self, url: &str) -> Result<ClientResponse, Error>` | one connection per request with `connection: close` | exists |
 | `with_deadline(Option<Duration>)` | one total deadline for connect, write, and read of an exchange (`Error::Io` of kind `TimedOut`); `None` by default | 0.4 |
-| `request(&self, url: &str, request: Request) -> Result<ClientResponse, Error>` | any `Request` to an `http://` URL: the URL gives the target and `host`, the request gives method, fields, and a full body; refuses a request that already has `host` (`Http(InvalidHost)`), a streamed body, or an upgrade (`InvalidState`) | 0.4 |
+| `request(&self, url: &str, request: Request) -> Result<ClientResponse, Error>` | any `Request` to an `http://` URL: the URL gives the target and `host`, the request gives method, fields, and a full body; refuses a request that already has `host` (`Http(InvalidHost)`), a streamed body, or an upgrade (`InvalidState`); a `Request::expect_continue` request with its full body fails with `Http(InvalidState)` | 0.4 |
+
+Not run: it needs a server on port 8080.
 
 ```rust,no_run
 use std::time::Duration;
@@ -2752,7 +2834,7 @@ let resp = client.request("http://127.0.0.1:8080/items/7", put)?;
 # Ok::<(), http_net::blocking::Error>(())
 ```
 
-The blocking client stays minimal (OD-17): pooling, redirects, TLS, and
+The blocking client stays minimal: pooling, redirects, TLS, and
 cookies belong to `fetch-net`.
 
 ### `blocking::ClientResponse`
@@ -2775,13 +2857,13 @@ Implements `Display`, `std::error::Error` (with `source`), and `From` for
 
 | Not provided | Why | Instead |
 |---|---|---|
-| A header map type (hash map) | attacker-keyed hashing and an allocation per request; field counts are small (100 max) | ordered views and `header_all` |
+| A header map type (hash map) | attacker-keyed hashing and an allocation per request; field counts are small (100 by default) | ordered views and `header_all` |
 | Header name case conversion on output | the caller writes names in the case it wants; incoming names are preserved | none needed |
 | Skipping invalid header lines | silently skipping a line is a desync vector | refusal |
 | Lenient request parsing of any kind | the server is the hop that must not desynchronise | none |
 | Automatic decompression; transfer codings other than `chunked` | out of scope | a separate compression crate |
-| A status code newtype | `u16` with constants is enough (OD-9) | the `status` module |
-| An async runtime or async adapter | no crate in this family takes one; drivers call the sans-IO core (OD-11) | `serve-net`, `net-io` |
+| A status code newtype | `u16` with constants is enough | the `status` module |
+| An async runtime or async adapter | no crate in this family takes one; drivers call the sans-IO core | `serve-net`, `net-io` |
 | TLS | out of scope | `tls-net` |
 
 ## Limits and guarantees
@@ -2798,7 +2880,9 @@ Implements `Display`, `std::error::Error` (with `source`), and `From` for
   `unreachable!` in library code, property tests on arbitrary input both
   from the first byte and behind valid heads, and cargo-fuzz targets for
   both connections, the chunk-line grammar, the builders, and two
-  differential oracles (0.3).
+  differential oracles (0.3), plus the stateless parsers
+  (`stateless_parse`) and the `ChunkedDecoder` (`chunked_decoder`) against
+  the connections (0.5).
 - The parse result does not depend on how the input is split (property
   tested, including after a valid head).
 - On every request head it accepts, `http-net` agrees with `httparse` on the
@@ -2808,3 +2892,13 @@ Implements `Display`, `std::error::Error` (with `source`), and `From` for
   that feeds it whole and split at every byte (`tests/smuggling.rs`,
   `tests/rfc_cases.rs`, `tests/adversarial.rs`).
 - No credential value appears in any `Debug` output (0.3).
+
+## Planned after 1.0
+
+These items are not in this build. They are listed so the design is on
+record; their signatures may still change before they ship.
+
+| Item | What it would do |
+|---|---|
+| feature `http-types` (off by default) | `From`/`TryFrom` between the views and builders and the `http` crate's types; the only optional third-party dependency, never default |
+| `KnownField`, `known` | constant-time lookup of frequent fields through an index filled while parsing; kept only if it costs at most 2% on the head benchmark |

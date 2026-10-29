@@ -1,0 +1,74 @@
+# Extra seeds for the http-net Garden job, run after the TROPHIES.md payloads.
+# One payload per line, escaped as a Garden REPL payload argument (\r, \n,
+# \t, \xNN). A literal tab separates pieces that are sent as separate writes.
+#
+# Baselines
+GET / HTTP/1.1\r\nHost: a\r\n\r\n
+GET / HTTP/1.0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n
+GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n
+GET /a HTTP/1.1\r\nHost: a\r\n\r\n	GET /b HTTP/1.1\r\nHost: a\r\n\r\n
+#
+# Framing: Content-Length and Transfer-Encoding
+POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 5\r\n\r\nhello
+POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello
+POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551616\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0005\r\n\r\nhello
+POST / HTTP/1.1\r\nHost: a\r\nContent-Length:\t5\t\r\n\r\nhello
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: CHUNKED\r\n\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n
+POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0000000000000000000005\r\nhello\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5 \r\nhello\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;a=b;c="d\\"e"\r\nhello\r\n0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nTrailer: x\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nContent-Length: 50\r\n\r\n
+POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\n0\n\n
+#
+# Start line
+GET  / HTTP/1.1\r\nHost: a\r\n\r\n
+GET / HTTP/1.1 \r\nHost: a\r\n\r\n
+GET\t/\tHTTP/1.1\r\nHost: a\r\n\r\n
+get / HTTP/1.1\r\nHost: a\r\n\r\n
+GET / http/1.1\r\nHost: a\r\n\r\n
+GET / HTTP/1.2\r\nHost: a\r\n\r\n
+GET / HTTP/2.0\r\nHost: a\r\n\r\n
+GET / HTTP/01.1\r\nHost: a\r\n\r\n
+GET /\x7f HTTP/1.1\r\nHost: a\r\n\r\n
+GET /\xff HTTP/1.1\r\nHost: a\r\n\r\n
+GET http://b/c HTTP/1.1\r\nHost: a\r\n\r\n
+GET * HTTP/1.1\r\nHost: a\r\n\r\n
+OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n
+CONNECT a:80 HTTP/1.1\r\nHost: a:80\r\n\r\n
+\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n
+\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n
+#
+# Fields
+GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n
+GET / HTTP/1.1\r\nHost: a, b\r\n\r\n
+GET / HTTP/1.1\r\nHost: a b\r\n\r\n
+GET / HTTP/1.1\r\nHost:\r\n\r\n
+GET / HTTP/1.1\r\nHost : a\r\n\r\n
+GET / HTTP/1.1\r\n Host: a\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX: a\r\n b\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX: \x80\xff\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX: \x01\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX:\x7f\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX  : a\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX\x00Y: a\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nX: a\nY: b\r\n\r\n
+GET / HTTP/1.1\nHost: a\n\n
+GET / HTTP/1.1\r\nHost: a\r\n\n
+#
+# Connection management
+GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\nGET /after-close HTTP/1.1\r\nHost: a\r\n\r\n
+GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET /second HTTP/1.0\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nConnection: close, keep-alive\r\n\r\nGET /second HTTP/1.1\r\nHost: a\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n
+GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi
+GET / HTTP/1.1\r\nHost: a\r\nExpect: something-else\r\n\r\n

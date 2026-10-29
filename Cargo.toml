@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.8.0"
+version = "0.9.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -32,8 +32,9 @@ documentation = "https://docs.rs/http-net"
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
 
-# The fuzz crate and local tooling are not part of the published package.
-exclude = ["fuzz/", "dev/", ".github/", "scripts/"]
+# The fuzz crate, the HTTP Garden origin, and local tooling are not part of
+# the published package.
+exclude = ["fuzz/", "garden/", "dev/", ".github/", "scripts/"]
 
 [package.metadata.docs.rs]
 all-features = true

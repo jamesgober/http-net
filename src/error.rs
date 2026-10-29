@@ -44,20 +44,30 @@ pub enum HttpError {
     InvalidTarget,
     /// The protocol version is not of the form `HTTP/DIGIT.DIGIT`.
     InvalidVersion,
-    /// The version is well formed but not HTTP/1.0 or HTTP/1.1. Answer 505.
+    /// The version is well formed but its major version is not 1
+    /// (`HTTP/1.2` to `HTTP/1.9` are accepted and read as HTTP/1.1). Answer
+    /// 505.
     UnsupportedVersion,
     /// The connection starts with the HTTP/2 connection preface
     /// (`PRI * HTTP/2.0`, RFC 9113 section 3.4): a client speaking HTTP/2
     /// with prior knowledge. Route the connection to an HTTP/2 engine if
     /// the listener allows prior knowledge; otherwise answer 505 and close.
     Http2Preface,
-    /// A status code outside `100..=599`, or not three digits.
+    /// A received three-character status code that is not digits or is
+    /// outside `100..=599` (a code of another length is
+    /// [`InvalidStartLine`](HttpError::InvalidStartLine)); or a code the call
+    /// cannot send: outside `100..=599`, a 1xx other than 101 as a final
+    /// response, or a non-1xx (or 100 or 101) as an informational response.
     InvalidStatus,
     /// The request line (or status line) exceeds
     /// [`Limits::max_start_line`](crate::Limits::max_start_line). Answer 414.
     StartLineTooLong,
     /// The header section exceeds
-    /// [`Limits::max_header_bytes`](crate::Limits::max_header_bytes). Answer 431.
+    /// [`Limits::max_header_bytes`](crate::Limits::max_header_bytes), or a
+    /// trailer section exceeds
+    /// [`Limits::max_trailer_bytes`](crate::Limits::max_trailer_bytes); on the
+    /// client also interim heads that together exceed `max_header_bytes`.
+    /// Answer 431.
     HeadersTooLarge,
     /// More header fields than
     /// [`Limits::max_headers`](crate::Limits::max_headers), or more trailer
@@ -67,8 +77,10 @@ pub enum HttpError {
     /// One field line is longer than
     /// [`Limits::max_field_line`](crate::Limits::max_field_line). Answer 431.
     FieldLineTooLong,
-    /// A carriage return that is not followed by a line feed. Refused because
-    /// recipients disagree on what it means, which is a smuggling vector.
+    /// A carriage return that is not followed by a line feed in a received
+    /// message, or any carriage return in an outgoing field value. Refused
+    /// because recipients disagree on what it means, which is a smuggling
+    /// vector.
     BareCr,
     /// A line feed not preceded by a carriage return. RFC 9112 permits
     /// accepting it; this crate refuses it so that every hop agrees on where
@@ -83,7 +95,10 @@ pub enum HttpError {
     /// Whitespace between a field name and its colon (RFC 9112 section 5.1
     /// requires rejecting it).
     WhitespaceBeforeColon,
-    /// A field value contains a control character other than horizontal tab.
+    /// A field value contains a control character other than horizontal tab
+    /// (a carriage return is [`BareCr`](HttpError::BareCr)); an outgoing
+    /// value has leading or trailing whitespace; or an upgrade protocol is
+    /// not a token.
     InvalidHeaderValue,
     /// An HTTP/1.1 request without a `Host` field.
     MissingHost,
@@ -103,12 +118,16 @@ pub enum HttpError {
     /// `Transfer-Encoding` is empty, repeats `chunked`, or does not end in
     /// `chunked`.
     InvalidTransferEncoding,
-    /// A transfer coding other than `chunked` (for example `gzip`). Answer 501.
+    /// A transfer coding before the final `chunked` (for example
+    /// `gzip, chunked`). Answer 501. A `Transfer-Encoding` that does not end
+    /// in `chunked` is [`InvalidTransferEncoding`](HttpError::InvalidTransferEncoding).
     UnsupportedTransferEncoding,
     /// `Transfer-Encoding` in an HTTP/1.0 message, whose framing is then
     /// faulty by RFC 9112 section 6.1.
     TransferEncodingInHttp10,
-    /// A chunk-size line is not hexadecimal, or overflows 64 bits.
+    /// A chunk-size line is not hexadecimal, has more than 16 hex digits
+    /// (even when the value fits, as in `00000000000000001`), or overflows
+    /// 64 bits.
     InvalidChunkSize,
     /// A chunk extension does not follow the `;name[=value]` grammar.
     InvalidChunkExtension,
@@ -122,8 +141,10 @@ pub enum HttpError {
     /// line is short, but without a total a peer could make a small body
     /// cost an unbounded amount of input (the CVE-2024-22019 pattern).
     ChunkExtensionsTooLarge,
-    /// The body exceeds [`Limits::max_body`](crate::Limits::max_body), detected
-    /// from the declared length before any of it is buffered. Answer 413.
+    /// The body exceeds [`Limits::max_body`](crate::Limits::max_body): a
+    /// `Content-Length` or chunk size is checked before its data is buffered;
+    /// a read-until-close body is refused at the first byte past the budget.
+    /// Answer 413.
     BodyTooLarge,
     /// The peer closed the connection in the middle of a message.
     UnexpectedEof,
@@ -142,7 +163,8 @@ pub enum HttpError {
     /// `trailer`, `keep-alive`, `proxy-connection`, and `te` on a response);
     /// use the builder methods instead.
     ReservedHeader,
-    /// A body was given for a status that cannot carry one (1xx, 204, 304).
+    /// A body was given for a status that cannot carry one (1xx, 204, 304,
+    /// or a 2xx to `CONNECT`).
     BodyNotAllowed,
     /// A streamed body's length differs from the `content_length` declared
     /// for it.
@@ -319,7 +341,9 @@ impl fmt::Display for HttpError {
             Self::ObsFold => "field line starts with whitespace (obsolete line folding)",
             Self::InvalidHeaderName => "invalid field name or missing colon",
             Self::WhitespaceBeforeColon => "whitespace between field name and colon",
-            Self::InvalidHeaderValue => "control character in field value",
+            Self::InvalidHeaderValue => {
+                "control character in field value, or surrounding whitespace in an outgoing value"
+            }
             Self::MissingHost => "HTTP/1.1 request without a Host field",
             Self::InvalidHost => "duplicate or malformed Host field",
             Self::InvalidContentLength => "Content-Length is not a single decimal number",
@@ -346,7 +370,8 @@ impl fmt::Display for HttpError {
             Self::BodyNotAllowed => "this status code cannot carry a body",
             Self::BodyLengthMismatch => "streamed body length differs from the declared length",
             Self::InterimNotAllowed => {
-                "interim response not allowed now (HTTP/1.0 peer, after the final response,                  or 100 Continue after the body began)"
+                "interim response not allowed now (HTTP/1.0 peer, after the final response, \
+                 or 100 Continue after the body began)"
             }
             Self::TrailerNotAllowed => {
                 "field not allowed in trailers, or trailers on a body that is not chunked"
@@ -448,6 +473,9 @@ mod tests {
                 text.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
                 "{e:?}: {text}"
             );
+            // A missing line continuation leaves a run of indentation.
+            assert!(!text.contains("  "), "{e:?}: {text}");
+            assert_eq!(text.trim(), text, "{e:?}");
         }
     }
 

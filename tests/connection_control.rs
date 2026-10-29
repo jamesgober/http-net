@@ -157,6 +157,55 @@ fn test_server_progress_follows_each_phase() {
     assert_eq!(conn.progress(), Progress::Upgraded);
 }
 
+/// FR-50: a request with no body answered at `ServerEvent::Request`, before
+/// `RequestEnd` is polled, leaves a keep-alive connection `Idle`, not
+/// `Closed` (fixed in 0.9.0: a driver that closes on `Closed` dropped a
+/// healthy connection). A `close` answer still reports `Closed`.
+#[test]
+fn test_server_progress_answered_at_request_event_stays_idle() {
+    let mut out = Vec::new();
+    for (request, response, expected) in [
+        (
+            &b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            Response::new(204),
+            Progress::Idle,
+        ),
+        (
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"[..],
+            Response::new(200),
+            Progress::Idle,
+        ),
+        (
+            &b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            Response::new(204).close(),
+            Progress::Closed,
+        ),
+        (
+            &b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"[..],
+            Response::new(204),
+            Progress::Closed,
+        ),
+    ] {
+        let mut conn = ServerConn::new();
+        let _ = conn.feed(request);
+        assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+        conn.respond(&response, &mut out).unwrap();
+        assert_eq!(
+            conn.progress(),
+            expected,
+            "{}",
+            String::from_utf8_lossy(request)
+        );
+        assert!(matches!(conn.poll().unwrap(), ServerEvent::RequestEnd));
+        assert_eq!(conn.progress(), expected);
+        if expected == Progress::Idle {
+            assert!(matches!(conn.poll().unwrap(), ServerEvent::NeedInput));
+            let _ = conn.feed(b"GET /next HTTP/1.1\r\nHost: a\r\n\r\n");
+            assert!(matches!(conn.poll().unwrap(), ServerEvent::Request(_)));
+        }
+    }
+}
+
 /// FR-50: the client's progress at every step.
 #[test]
 fn test_client_progress_follows_each_phase() {

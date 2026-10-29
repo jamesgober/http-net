@@ -62,13 +62,13 @@ whether the attack test exists in this build.
 | T-32 | quadratic parsing on byte-at-a-time input | resumable scanner; compaction only when full | a 16 KiB head fed one byte at a time (`tests/prop_roundtrip.rs`); the linearity guard (`tests/linearity.rs`: 8 times the bytes cost under 16 times the time) and its bench group | none | tested |
 | T-33 | integer overflow | checked arithmetic for CL, chunk sizes, running totals | `tests/adversarial.rs`; fuzzing | none | tested |
 | T-34 | panics | clippy denies (`unwrap`, `expect`, `unreachable!`, printing), bounded indexing, fuzzing | never-panic property tests; eight fuzz targets in CI; the 0.7 campaign (24 CPU-hours per target, no finding) | none | tested |
-| T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie` everywhere | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers) | only when formatting | tested |
-| T-36 | credentials left in reused memory | `set_wipe`: zero finished requests, compaction leftovers, and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run) | about 30 to 60 ns per 2 KiB [est.] | tested |
+| T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie` everywhere | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers, `ResponseHeadRef`, and `blocking::Connection`, whose buffers print as lengths only) | only when formatting | tested |
+| T-36 | credentials left in reused memory | `set_wipe`: zero finished requests, compaction leftovers, and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run); the wipe on drop is not tested, since observing it would mean reading the freed block | about 30 to 60 ns per 2 KiB [est.] | tested |
 | T-37 | error text reflecting attacker bytes | `Display` is static text; `from_error` uses only it | `error.rs` units over every variant; `tests/adversarial.rs` (`from_error` for every variant; refused bytes never in the answer) | none | tested |
 | T-38 | HTTP/0.9 messages | a version is required in both start lines | `tests/rfc_cases.rs` (request and response, whole and byte by byte) | none | tested |
 | T-39 | status out of range | refused (`InvalidStatus`) | `tests/rfc_cases.rs` | none | tested |
-| T-40 | lingering-close abuse | drain bounded to 1 s and 256 KiB; the refusal path never waits | `tests/localhost.rs` (a peer that trickles; a peer that writes 8 MiB unpaced; the only slot freed for the next client) | at most 1 s of a thread per close | tested |
-| T-41 | busy accept loop on persistent errors | 10 ms back-off after every failed accept; give up after 1,000 in a row; a success resets the count | `blocking.rs` unit test of the back-off policy the accept loop uses | none | tested |
+| T-40 | lingering-close abuse | drain bounded to 1 s and 256 KiB; the refusal path never waits | `tests/localhost.rs` (a peer that trickles; a peer that writes 8 MiB unpaced; the only slot freed for the next client); no test tells the 256 KiB cap from the 1 s cap: the 8 MiB test passes under either | at most 1 s of a thread per close | tested |
+| T-41 | busy accept loop on persistent errors | 10 ms back-off after every failed accept; give up after more than 1,000 in a row; a success resets the count | `blocking.rs` unit test of the back-off policy the accept loop uses | none | tested |
 | T-42 | prior-knowledge HTTP/2 to an HTTP/1.1 listener | 505 and close (`Http2Preface` in 0.5) | `tests/rfc_cases.rs` | 24 compares at connection start | tested |
 
 ## Hardening record (0.7)
@@ -118,7 +118,7 @@ malformed-request check, which records no message; none was a server
 error. Other builds shared the machine during the run.
 
 **HTTP Garden.** Not run in 0.7: it needs Docker, which the development
-machine does not have (`dev/PLAN.md` D-58). It is planned as a manually
+machine does not have ([`dev/PLAN.md`](https://github.com/jamesgober/http-net/blob/main/dev/PLAN.md) D-58). It is planned as a manually
 triggered CI job.
 
 ## Where http-net is stricter than the RFCs
@@ -134,7 +134,10 @@ triggered CI job.
 | chunk size over 16 hex digits | must parse | refused | keeps the overflow check exact | none legitimate |
 | space after a chunk size without an extension | not in the grammar | refused | other parsers accept it only with a lenient flag | none |
 | response `Transfer-Encoding` not ending in `chunked` | read the body until the connection closes | refused | a coding other than `chunked` is not supported, and guessing the body's end invites a desync | a server that sends one gets no response through |
-| status line without the space after the code (client) | senders must send it | accepted | harmless to framing; real servers omit it | none |
+
+One choice goes the other way: the client accepts a status line without
+the space after the code (`HTTP/1.1 200`), which senders must send. It is
+harmless to framing, and real servers omit it.
 
 ## Where http-net is stricter than httparse
 

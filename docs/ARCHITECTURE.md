@@ -41,11 +41,17 @@ see [`SECURITY.md`](SECURITY.md).
 | `message.rs` | the `Request` and `Response` builders, outgoing trailer validation |
 | `server.rs` | `ServerConn`, `ServerEvent`, `Progress` |
 | `client.rs` | `ClientConn`, `ClientEvent`, the pipelining queue |
+| `raw.rs` | Tier 3: `RawHead`, `HeadFacts`, copying a head out (`copy_into`), `OwnedRequestHead`, and the stateless parsers `parse_request_head` and `parse_response_head` |
+| `chunked.rs` | Tier 3: `ChunkedDecoder` and `ChunkStep`, a standalone chunked decoder over the connection's own decoder |
+| `write.rs` | Tier 3: the `Output` trait, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan`, and the `ServerConn` methods that write into any `Output` |
+| `forward.rs` | Tier 3: `is_hop_by_hop`, the hop-by-hop rule `Request::forward_from` also uses |
+| `preface.rs` | Tier 3: `is_h2_preface`, detection of the HTTP/2 connection preface |
 | `blocking.rs` | (feature `std`) a bounded thread-per-connection server, a per-connection driver, a minimal client |
 
-The Tier-3 surface of 0.5 adds stateless head parsers, a standalone
-chunked decoder, an `Output` trait with an allocation-free head writer,
-hop-by-hop forwarding helpers, and HTTP/2 preface detection, each in its
+The Tier-3 surface of 0.5 adds stateless head parsers (`raw.rs`), a
+standalone chunked decoder (`chunked.rs`), an `Output` trait with an
+allocation-free head writer (`write.rs`), hop-by-hop forwarding helpers
+(`forward.rs`), and HTTP/2 preface detection (`preface.rs`), each in its
 own module and sharing code with the connections rather than copying it.
 
 ## Data flow (server side)
@@ -198,7 +204,9 @@ recipient could otherwise read a message differently from another hop:
 - **Field index:** one `Vec` of 16-byte records per connection, reused; at
   most `max_headers` entries (and as many for trailers when they are
   reported).
-- **Offsets:** `u32`, safe because `Limits` caps every budget at 16 MiB.
+- **Offsets:** `u32`, because the head and trailer budgets are each capped
+  at 16 MiB, so `buffer_capacity()` stays far below `u32::MAX`; body bytes
+  are counted in `u64` and never indexed.
 - **Output:** caller-owned.
 - **Steady state:** a counting-allocator test serves 10,000 keep-alive
   requests (and 10,000 pipelined responses on the client) on one connection
@@ -208,7 +216,8 @@ recipient could otherwise read a message differently from another hop:
 
 The generic RFC 9110 field grammar comes from the first-party crate
 `parse-net` (0.7, by published version, `default-features = false`;
-dev/PLAN.md D-59 and D-60). Every call site reaches it through `scan.rs`,
+decisions D-59 and D-60 in
+[`dev/PLAN.md`](https://github.com/jamesgober/http-net/blob/main/dev/PLAN.md)). Every call site reaches it through `scan.rs`,
 which wraps or re-exports:
 
 | Item | parse-net function |

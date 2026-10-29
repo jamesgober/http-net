@@ -8,8 +8,15 @@
 //! response, with the same validation and framing rules.
 
 use alloc::vec::Vec;
+use core::fmt;
 
-use crate::{date::HttpDate, error::HttpError, message::Response, server::ServerConn};
+use crate::{
+    date::HttpDate,
+    error::HttpError,
+    message::Response,
+    redact::{FieldName, FieldValue},
+    server::ServerConn,
+};
 
 /// Where serialized bytes go.
 ///
@@ -160,7 +167,7 @@ pub enum BodyPlan {
 /// };
 /// assert_eq!(head, ResponseHeadRef::new(200, fields, OutgoingBody::Full(5)));
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResponseHeadRef<'a> {
     /// The status code (`100..=599`; among the 1xx codes only `101`).
     pub status: u16,
@@ -172,6 +179,37 @@ pub struct ResponseHeadRef<'a> {
     pub close: bool,
     /// The protocol a `101` switches to.
     pub upgrade: Option<&'a str>,
+}
+
+/// Credential values (`authorization`, `proxy-authorization`, `cookie`,
+/// `set-cookie`) print as `<redacted N bytes>`, as in every other `Debug`
+/// of the crate.
+impl fmt::Debug for ResponseHeadRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Fields<'a>(&'a [(&'a str, &'a [u8])]);
+        impl fmt::Debug for Fields<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list()
+                    .entries(self.0.iter().map(|&(name, value)| {
+                        (
+                            FieldName(name.as_bytes()),
+                            FieldValue {
+                                name: name.as_bytes(),
+                                value,
+                            },
+                        )
+                    }))
+                    .finish()
+            }
+        }
+        f.debug_struct("ResponseHeadRef")
+            .field("status", &self.status)
+            .field("fields", &Fields(self.fields))
+            .field("body", &self.body)
+            .field("close", &self.close)
+            .field("upgrade", &self.upgrade)
+            .finish()
+    }
 }
 
 impl<'a> ResponseHeadRef<'a> {

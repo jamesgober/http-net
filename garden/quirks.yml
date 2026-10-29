@@ -1,0 +1,5 @@
+# Fallback quirks for the http-net origin, used when probing fails. An empty
+# entry means none: HTTP/1.1 requests need Host, no HTTP/0.9, no HTTP/2, no
+# added, removed, or joined fields. The job replaces it with the output of
+# tools/probe_quirks.py --servers http_net when that succeeds.
+http_net:

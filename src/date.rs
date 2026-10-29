@@ -4,7 +4,7 @@
 //! the time as Unix seconds. The blocking adapter wraps the system clock in
 //! `blocking::now_date`. The formatting grammar is RFC 9110 section 5.6.7:
 //! the civil calendar (days to year, month, day, and weekday) is
-//! `parse-net`'s, the 29-byte layout and the cache stay here (dev/PLAN.md,
+//! `parse-net`'s, the 29-byte layout and the cache stay here (decision
 //! D-59). parse-net's own `HttpDate::format` writes the same bytes but is not
 //! a `const fn`, and `HttpDate::from_unix_seconds` and `DateCache::new` are.
 

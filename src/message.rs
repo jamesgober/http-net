@@ -296,7 +296,11 @@ impl Response {
     /// compared ASCII case-insensitively; a name without a version matches
     /// an offer of that name with any version. Otherwise, and always for
     /// `h2c` (RFC 9113 section 3.1), writing it fails with
-    /// [`HttpError::UpgradeNotOffered`].
+    /// [`HttpError::UpgradeNotOffered`]. Writing it fails with
+    /// [`HttpError::InvalidState`] when the request is not a complete
+    /// upgrade request ([`RequestHead::is_upgrade`](crate::RequestHead::is_upgrade)
+    /// false, or its body not yet read), and with
+    /// [`HttpError::InvalidHeaderValue`] when `protocol` is not a token.
     ///
     /// # Examples
     ///
@@ -323,7 +327,9 @@ impl Response {
 
     /// Adds a header field. The name must be a token and the value may not
     /// contain control characters other than tab, nor leading or trailing
-    /// whitespace. Framing headers are refused with
+    /// whitespace. The framing and hop-by-hop fields (`content-length`,
+    /// `transfer-encoding`, `connection`, `upgrade`, `trailer`, `keep-alive`,
+    /// `proxy-connection`, and `te`) are refused with
     /// [`HttpError::ReservedHeader`]; the first problem is reported when the
     /// response is written.
     ///
@@ -743,8 +749,9 @@ impl Request {
         }
     }
 
-    /// Adds a header field, validated as for [`Response::header`]. A second
-    /// `host` is refused with [`HttpError::InvalidHost`].
+    /// Adds a header field, validated as for [`Response::header`], except
+    /// that `te` is allowed on a request. A second `host`, or a `host` value
+    /// that is not `host[:port]`, is refused with [`HttpError::InvalidHost`].
     ///
     /// # Examples
     ///
@@ -865,7 +872,8 @@ impl Request {
     /// hands the connection over; see
     /// [`ClientEvent::Upgraded`](crate::ClientEvent::Upgraded).
     ///
-    /// `protocol` is a token or a `name/version` product token. `h2c` is
+    /// `protocol` is a token or a `name/version` product token; anything
+    /// else is refused with [`HttpError::InvalidHeaderValue`]. `h2c` is
     /// refused with [`HttpError::UpgradeNotOffered`]: RFC 9113 section 3.1
     /// deprecates the HTTP/2 upgrade.
     ///

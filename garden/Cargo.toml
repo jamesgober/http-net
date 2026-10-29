@@ -1,0 +1,21 @@
+[package]
+name         = "http-net-garden"
+version      = "0.0.0"
+edition      = "2024"
+rust-version = "1.85"
+publish      = false
+license      = "Apache-2.0 OR MIT"
+authors      = ["James Gober <me@jamesgober.com>"]
+description  = "HTTP Garden origin server for http-net (not published)."
+
+# Standalone: not a member of any workspace above it.
+[workspace]
+
+[dependencies]
+# Same repository, built only inside the Garden job (see README.md). The root
+# crate does not depend on this one.
+http-net = { path = ".." }
+
+[[bin]]
+name = "http-net-garden"
+path = "src/main.rs"
