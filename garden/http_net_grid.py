@@ -312,7 +312,8 @@ def write_summary(path: Path, meta: dict[str, Any], cases: list[dict[str, Any]],
         f"Garden ref `{meta['garden_ref']}`, http-net ref `{meta['http_net_ref']}`.",
         f"Origins: {', '.join(meta['origins'])}. Transducers: {', '.join(meta['transducers']) or 'none'}.",
         f"Cases run: {meta['counts']['seeds']} seeds direct, {meta['counts']['transduced']} transduced, "
-        f"{meta['counts']['mutations']} mutations.",
+        f"{meta['counts']['mutations']} mutations ({meta['counts']['mutations_skipped']} more skipped: "
+        "the Garden's mutator could not build them).",
         "",
         f"http_net disagrees with at least one origin in **{len(flagged)}** case(s): "
         f"**{len(vs_ref)}** where it also differs from {reference}, {len(others)} where it agrees with {reference}.",
@@ -395,7 +396,7 @@ def main() -> None:
 
     runner = Runner(origins)
     cases: list[dict[str, Any]] = []
-    counts = {"seeds": 0, "transduced": 0, "mutations": 0}
+    counts = {"seeds": 0, "transduced": 0, "mutations": 0, "mutations_skipped": 0}
 
     for i, seed in enumerate(seeds):
         counts["seeds"] += 1
@@ -422,9 +423,14 @@ def main() -> None:
     random.seed(args.rng_seed)
     for k in range(args.mutations if SUBJECT not in runner.down else 0):
         base = random.choice(seeds)
+        # The mutator parses its own output with the Garden's reference
+        # parser, which can fail on a mutant (an oversized chunk length
+        # overflows its regex). No server has seen the mutant yet, so the
+        # failure is the harness's, not a finding: count it and move on.
         try:
             mutated = mutations.mutate(base)
-        except (IndexError, AssertionError):
+        except Exception:  # pylint: disable=broad-exception-caught
+            counts["mutations_skipped"] += 1
             continue
         counts["mutations"] += 1
         case = run_case(runner, f"mut-{k:04}", "mutation", mutated, mutated, record_all=False)
