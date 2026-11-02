@@ -146,7 +146,7 @@ full.
  Idle --send_request--> Head
  Head --1xx (not 101), under budget--> Head    [Informational if reported]
  Head --100 while waiting for continue--> Head  [Continue]
- Head --101 asked, with Upgrade--> Upgraded
+ Head --101 asked, naming only offered protocols--> Upgraded
  Head --2xx to CONNECT--> Upgraded
  Head --final response--> Body --done--> Complete
  Complete --reusable, requests queued--> Head (next queued request)

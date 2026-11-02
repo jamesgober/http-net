@@ -146,9 +146,10 @@ pub enum Progress {
     Head,
     /// The head is complete and body bytes are still to come.
     Body,
-    /// Server: the request is complete (or has no body left to read) and its
-    /// response is not finished. Client: the request was sent and nothing of
-    /// the response has arrived.
+    /// Server: the request is complete (or has no body left to read), or it
+    /// was refused with a parse error, and its response is not finished.
+    /// Client: the request was sent and nothing of the response has arrived,
+    /// or a pipelined request is next.
     AwaitingResponse,
     /// A streamed body is being written: the response on a server, the
     /// request on a client.
@@ -405,8 +406,8 @@ impl ServerConn {
     /// Any [`HttpError`] parse error. The connection is then finished: send
     /// one error response (see [`HttpError::status`]) with
     /// [`respond`](Self::respond), flush, and close. It is written as an
-    /// answer to a `GET`, or, when the failure came after a `HEAD` request
-    /// line, to a `HEAD`, without content.
+    /// answer to a `GET`, or, once a `HEAD` request line has been read, to a
+    /// `HEAD`, without content.
     ///
     /// # Examples
     ///
@@ -562,8 +563,8 @@ impl ServerConn {
         )
     }
 
-    /// The current request's head, from its arrival until the next request
-    /// begins (still available after an upgrade).
+    /// The current request's head, from its arrival until the `poll` after
+    /// its response is finished (still available after an upgrade).
     ///
     /// # Examples
     ///
@@ -811,7 +812,8 @@ impl ServerConn {
     /// way to shed load or to cap requests per connection. If the current
     /// response has already been written, the connection ends after it.
     /// `true` cannot keep open a connection the protocol requires to close
-    /// (the client asked, or body bytes were left unread).
+    /// (the client asked, or body bytes were left unread). A `101` or a 2xx
+    /// to `CONNECT` hands the connection over regardless.
     ///
     /// # Examples
     ///
@@ -1053,8 +1055,8 @@ impl ServerConn {
     /// compaction are zeroed, and the whole buffer is zeroed on
     /// [`reset`](Self::reset), [`into_buffer`](Self::into_buffer), and drop,
     /// so credentials do not linger in memory between requests. Costs a
-    /// `memset` of each request's bytes (about 30 to 60 ns for 2 KiB, an
-    /// estimate). Off by default.
+    /// `memset` of each request's bytes (about 11 ns per KiB, measured). Off
+    /// by default.
     ///
     /// # Examples
     ///
@@ -1120,10 +1122,9 @@ impl ServerConn {
             ));
         }
         let (method, version) = if failed {
-            // A failure in the head leaves `RequestInfo::EMPTY` (a GET); one
-            // in the body keeps the request line's facts, and an answer to
-            // `HEAD` carries no content (RFC 9110 section 9.3.2).
-            let method = if self.info.method == Method::Head {
+            // An answer to `HEAD` carries no content (RFC 9110 section
+            // 9.3.2); anything else, or no request line yet, is a `GET`.
+            let method = if self.request_line_is_head() {
                 Method::Head
             } else {
                 Method::Get
@@ -1215,6 +1216,18 @@ impl ServerConn {
             self.state = ReqState::Closed;
         }
         Ok(plan)
+    }
+
+    /// Whether the request being read or answered has a `HEAD` request
+    /// line, including one whose head was not accepted (a failed head leaves
+    /// `RequestInfo::EMPTY`, but the scanner still has its start line).
+    pub(crate) fn request_line_is_head(&self) -> bool {
+        self.info.method == Method::Head
+            || self
+                .scanner
+                .start_line()
+                .get(self.buf.from(self.buf.pin()))
+                .starts_with(b"HEAD ")
     }
 
     /// Body bytes of a streamed response, into any output.

@@ -227,6 +227,9 @@ repeated. Fixes ship as 0.9.x patches; what stays open is in
 - [x] Performance against every release since 0.6.0: no regression (interleaved, nine rounds); the unmet write targets decomposed (about 62 ns of the response-write benches is reading the request; `write_head` costs about 12 ns per borrowed field); two write-path ideas measured level and dropped (D-72).
 - [x] Competitors measured again on 0.9.0 (`http-net-bench`): the 0.6 ratios hold (D-72); aarch64 benchmark workflow added.
 - [x] Deferred and estimated items revisited: the 0.5 wipe idea measured (+2.1%, D-72 and the defence-ideas log); the T-40 caps told apart by a test; the T-36 cost measured; the module layout settled (D-71); `PLAN.md` buffer bound corrected.
+- [x] Documentation audit repeated on 0.9.1: three code defects fixed in 0.9.2 (`outstanding()` after a failed response, the reuse queries at `ResponseEnd`, `HEAD` errors in the head), 18 documentation corrections, and the review's properties committed as `tests/prop_split.rs` (D-75).
+- [x] aarch64 measured on CI runners (`docs/PERFORMANCE.md`).
+- [x] Consumers run again against the 0.9.2 code: `ls-studio` 42 of 42; serve-net's suite passes (its `tests/loopback.rs` run serially: run in parallel on a loaded machine, a random few fail to start a server, on published 0.9.1 as well).
 - [ ] Still open (not code, or not this repository): the third consumer (D-62); H6, picohttpparser, and llhttp in `http-net-bench`; a quiet-machine H1 run; the support window and report channel (James).
 
 Exit criteria:

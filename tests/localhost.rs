@@ -1144,9 +1144,10 @@ fn test_connection_request_deadline_is_timed_out_on_every_platform() {
 }
 
 /// RFC 9110 section 9.3.2 through the blocking server: a `HEAD` that fails
-/// in its body gets an answer with no content, whether the failure is a
-/// parse error (`400` from `Response::from_error`) or the request deadline
-/// (the adapter's own `408`). Fixed in 0.9.1.
+/// gets an answer with no content, whether the failure is a parse error
+/// (`400` from `Response::from_error`) or the request deadline (the
+/// adapter's own `408`). Fixed in 0.9.1 for a failure in the body, and in
+/// 0.9.2 for one later in the head.
 #[test]
 fn test_head_failing_in_its_body_is_answered_without_content() {
     let server = Server::bind("127.0.0.1:0")
@@ -1162,6 +1163,11 @@ fn test_head_failing_in_its_body_is_answered_without_content() {
             b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab",
             b"HTTP/1.1 408 ",
         ),
+        (
+            b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: x\r\n\r\n",
+            b"HTTP/1.1 400 ",
+        ),
+        (b"HEAD / HTTP/1.1\r\nHost: a\r\n", b"HTTP/1.1 408 "),
     ] {
         let mut stream = connect(running.addr);
         stream.write_all(wire).unwrap();

@@ -78,7 +78,10 @@ pub enum HttpError {
     /// [`Limits::max_field_line`](crate::Limits::max_field_line). Answer 431.
     FieldLineTooLong,
     /// A carriage return that is not followed by a line feed in a received
-    /// message, or any carriage return in an outgoing field value. Refused
+    /// head or trailer section, or any carriage return in an outgoing field
+    /// value (in a chunk line it is
+    /// [`InvalidChunkSize`](Self::InvalidChunkSize) or
+    /// [`InvalidChunkExtension`](Self::InvalidChunkExtension)). Refused
     /// because recipients disagree on what it means, which is a smuggling
     /// vector.
     BareCr,
@@ -151,8 +154,9 @@ pub enum HttpError {
     /// Bytes arrived when no message was expected: a response with no
     /// request outstanding, or data after the connection finished.
     UnexpectedData,
-    /// A `101 Switching Protocols` (or a 2xx to `CONNECT`) arrived for a
-    /// request that did not ask to switch.
+    /// A `101 Switching Protocols` to a request that did not ask to switch,
+    /// one with no `Upgrade`, or one naming a protocol the request did not
+    /// offer.
     UnexpectedUpgrade,
     /// The client received more interim (1xx) responses to one request
     /// than [`Limits::max_interim`](crate::Limits::max_interim): a server

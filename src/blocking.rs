@@ -1163,11 +1163,7 @@ impl Connection {
         self.out.extend_from_slice(now_date().as_bytes());
         self.out.extend_from_slice(b"\r\n\r\n");
         // An answer to HEAD carries no content (RFC 9110 section 9.3.2).
-        if !self
-            .conn
-            .request()
-            .is_some_and(|r| r.method() == Method::Head)
-        {
+        if !self.conn.request_line_is_head() {
             self.out.extend_from_slice(BODY);
         }
         self.flush_out()
@@ -1788,8 +1784,9 @@ impl Client {
     /// Sets a total deadline for one exchange: connecting, writing the
     /// request, and reading the whole response. The per-operation timeout
     /// of [`with_timeout`](Self::with_timeout) cannot stop a server that
-    /// sends one byte just inside it; this deadline can. `None` (the
-    /// default) disables it.
+    /// sends one byte just inside it; this deadline can. Name resolution is
+    /// not bounded: `std` offers no timeout for it. `None` (the default)
+    /// disables the deadline.
     ///
     /// # Examples
     ///

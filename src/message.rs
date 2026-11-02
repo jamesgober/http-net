@@ -407,7 +407,8 @@ impl Response {
         self
     }
 
-    /// Closes the connection after this response.
+    /// Closes the connection after this response, unless it is a `101` or a
+    /// 2xx to `CONNECT`, which hand the connection over.
     ///
     /// # Examples
     ///
