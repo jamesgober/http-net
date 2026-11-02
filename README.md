@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible core (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no third-party dependencies (one first-party: <code>parse-net</code>, the shared field grammar).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (<code>0.9.0</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in). The API is frozen as the 1.0 candidate from 0.9.0; only fixes land before <code>1.0.0</code> (see <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0 (<code>0.9.1</code>).</strong> The 1.0 feature set is in place: the core, the extended protocol features (trailers, interim responses, <code>Expect: 100-continue</code> both ways, driver controls), client pipelining, connection reuse and pooling, and the allocation-free Tier-3 surface. The 1.0 surface is designed (<a href="./docs/API.md"><code>docs/API.md</code></a> marks the version each item ships in). The API is frozen as the 1.0 candidate from 0.9.0; only fixes land before <code>1.0.0</code> (see <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>, <a href="./docs/MIGRATION.md"><code>docs/MIGRATION.md</code></a>, and <a href="https://github.com/jamesgober/http-net/blob/main/dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -61,7 +61,7 @@ What it guarantees, and how each guarantee is checked:
 | The parse does not depend on how input is split. | Property tests compare whole, split, and byte-at-a-time feeding. |
 | Serialize and parse round-trip. | Property tests: requests from `ClientConn` parsed by `ServerConn`, responses the other way, with full, chunked, and fixed-length streamed bodies; absolute-form targets; keep-alive intent. |
 | Slow or stuck peers cannot pin the server. | Socket tests: a head or body trickled inside the read timeout is cut off by the request timeout with `408`; a refused client that keeps sending cannot stall the accept loop; lingering close ends after 1 s however the peer behaves. |
-| Credentials never reach logs through `Debug`. | `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` values print as `<redacted N bytes>` in every `Debug` output of the crate; `tests/redaction.rs` checks every type that prints fields, in every case spelling of the names. |
+| Credentials never reach logs through `Debug`. | `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` values print as `<redacted N bytes>` in every `Debug` output of the crate, and body and tunnel bytes print as their length; `tests/redaction.rs` checks every type that prints fields, in every case spelling of the names. |
 | Steady-state parsing allocates nothing. | A counting allocator (`tests/alloc.rs`): 10,000 keep-alive requests on one `ServerConn`, and 10,000 responses (also pipelined) on one `ClientConn`, allocate nothing after warm-up; the stateless parsers and the `ChunkedDecoder` allocate nothing at all, and the `Output` writer allocates nothing into a reused buffer; 10 MiB hostile streams never grow a connection past its buffer capacity. |
 | It agrees with other parsers where it accepts. | A differential test against `httparse` (`tests/prop_httparse.rs`): on every request head both accept, the length, method, target, version, and fields match; every head only `httparse` accepts is one of the documented stricter refusals. An RFC 9112 / 9110 conformance table (`tests/conformance.rs`) checks one statement per row. |
 | It survives fuzzing. | Eight cargo-fuzz targets (`fuzz/`): both connections under fuzzer-chosen splits, limits, and options (client fold leniency included), the chunk-line grammar, the builders, the stateless parsers and the `ChunkedDecoder` against the connections, and differential oracles against the reference parser and `httparse`, each run for 60 seconds in CI on every push and pull request to `main` and `dev`. |
@@ -203,7 +203,7 @@ cargo run --release --example soak -- 90s 4  # mixed workload for a set time, cl
 
 ## Performance
 
-Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen 9 9950X3D, Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.5.0 build so machine load falls on both. Method, Windows numbers, and every decision behind them: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). 0.7.0 and 0.8.0 were measured against their predecessors with no measurable difference ([`docs/release/v0.8.0.md`](./docs/release/v0.8.0.md)), so these 0.6.0 numbers stand.
+Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen 9 9950X3D, Rust stable, release profile), from `cargo bench` pinned to one core, run alternately with a 0.5.0 build so machine load falls on both. Method, Windows numbers, and every decision behind them: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). 0.7.0 and 0.8.0 were measured against their predecessors with no measurable difference ([`docs/release/v0.8.0.md`](./docs/release/v0.8.0.md)), and 0.9.1 against every release from 0.6.0 with no regression, so these 0.6.0 numbers stand.
 
 | Benchmark | 0.6.0 | vs 0.5.0 |
 |---|---:|---:|
@@ -211,7 +211,7 @@ Criterion medians for 0.6.0 in WSL Ubuntu on a Windows x86_64 machine (AMD Ryzen
 | 100,000 pipelined GETs in 16 KiB reads | ~8.8 ms (11.4 M requests/s) | -13% |
 | 1 MiB body, `Content-Length`, 16 KiB reads | ~13.5 µs | -4% |
 | 1 MiB body, chunked in 4 KiB chunks | ~17.0 µs | -3% |
-| response with five fields and a 1 KiB body, serialized | ~74 ns | -17% |
+| response with five fields and a 1 KiB body, serialized (after reading the one-field request it answers, about 62 ns of it) | ~74 ns | -17% |
 | client parsing a 1 KiB response | ~100 ns | -11% |
 
 Against other libraries, on identical bytes ([`http-net-bench`](https://github.com/jamesgober/http-net-bench)): a full server exchange takes ~250 ns against hyper's ~1.4 µs (3.4 to 5.5x faster), 100,000 pipelined requests 7.3 ms against hyper's 23.6 ms, and a client exchange 95 ns against hyper's 1.24 µs. Parsing a head alone is level with httparse (~177 ns against ~172 ns with httparse's SIMD) while also validating the `Host` value, the target, every value byte, and the framing rules, with no `unsafe` code.

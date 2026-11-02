@@ -2,6 +2,7 @@
 //!
 //! - `request_head`: one browser-like GET (12 fields, ~500 bytes) parsed
 //!   and answered on a reused connection.
+//! - `wipe`: the same with `set_wipe(true)`.
 //! - `pipelined_100k`: 100,000 small requests in 16 KiB reads.
 //! - `body_1mib`: a 1 MiB body, `Content-Length` and chunked (4 KiB
 //!   chunks), fed in 16 KiB reads.
@@ -69,6 +70,17 @@ fn bench_request_head(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(BROWSER_GET.len() as u64));
     let response = Response::new(204);
     let mut conn = ServerConn::new();
+    group.bench_function("browser_get", |b| {
+        b.iter(|| serve_all(&mut conn, black_box(BROWSER_GET), 16 * 1024, &response))
+    });
+    group.finish();
+    // The same exchange with consumed input wiped (`set_wipe`), in its own
+    // group so the `request_head` filter of `scripts/bench_ab.sh` does not
+    // run it.
+    let mut group = c.benchmark_group("wipe");
+    group.throughput(Throughput::Bytes(BROWSER_GET.len() as u64));
+    let mut conn = ServerConn::new();
+    conn.set_wipe(true);
     group.bench_function("browser_get", |b| {
         b.iter(|| serve_all(&mut conn, black_box(BROWSER_GET), 16 * 1024, &response))
     });

@@ -135,3 +135,24 @@ fn test_every_single_byte_mutation_agrees() {
         "accepted {accepted}, refused {refused}"
     );
 }
+
+/// Chunk sizes at the top of the 16-digit range, whose sum with the body so
+/// far overflowed the reference's arithmetic (found by the `reference_diff`
+/// fuzz target in the 0.9.x pass; the crate already refused them). Both
+/// sides refuse them as over the body budget.
+#[test]
+fn test_huge_chunk_sizes_agree() {
+    for size in [
+        "ffffffffffffffff",
+        "fffffffffffffff",
+        "8000000000000000",
+        "100001",
+    ] {
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n{size}\r\n\r\n"
+        );
+        let input = input.as_bytes();
+        assert_eq!(reference(input), None, "{size}");
+        assert_eq!(reference(input), crate_first(input), "{size}");
+    }
+}

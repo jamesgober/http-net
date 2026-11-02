@@ -328,3 +328,92 @@ fn test_blocking_connection_debug_never_prints_its_buffers() {
         assert!(shown.contains("out_len"), "{shown}");
     }
 }
+
+/// Body bytes print as their length, never as bytes: a body can carry
+/// credentials no field redaction sees (fixed in 0.9.1 for the body events,
+/// `blocking::Incoming`, and the leftover bytes of `blocking::Upgraded`).
+#[test]
+fn test_body_events_debug_print_lengths_only() {
+    let mut server = ServerConn::new();
+    let _ =
+        server.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 16\r\n\r\npassword=s3cr3t!");
+    assert!(matches!(server.poll(), Ok(ServerEvent::Request(_))));
+    let event = server.poll().unwrap();
+    assert!(matches!(event, ServerEvent::Body(_)));
+    for shown in both(&event) {
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("112, 97"),
+            "{shown}"
+        );
+        assert!(shown.contains("16 bytes"), "{shown}");
+    }
+
+    let mut client = ClientConn::new();
+    client
+        .send_request(&Request::get("/").header("host", "a"), &mut Vec::new())
+        .unwrap();
+    let _ = client.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\ntoken=s3cr3t!");
+    assert!(matches!(client.poll(), Ok(ClientEvent::Response(_))));
+    let event = client.poll().unwrap();
+    assert!(matches!(event, ClientEvent::Body(_)));
+    for shown in both(&event) {
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("116, 111"),
+            "{shown}"
+        );
+        assert!(shown.contains("13 bytes"), "{shown}");
+    }
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
+    use std::io::Write;
+
+    use http_net::{Limits, blocking::Connection};
+
+    fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    let (mut client, server) = pair();
+    client
+        .write_all(b"POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: 16\r\n\r\npassword=s3cr3t!")
+        .unwrap();
+    let mut conn = Connection::new(server, Limits::new());
+    let incoming = conn.next_request().unwrap().unwrap();
+    for shown in both(&incoming) {
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("112, 97"),
+            "{shown}"
+        );
+        assert!(shown.contains("16 bytes"), "{shown}");
+    }
+
+    // A plain-HTTP tunnel: the tunnelled request, credentials and all, is
+    // already buffered when the 200 is sent.
+    let (mut client, server) = pair();
+    client
+        .write_all(
+            b"CONNECT origin:80 HTTP/1.1\r\nHost: origin:80\r\n\r\n\
+              GET / HTTP/1.1\r\nHost: origin\r\nAuthorization: Basic s3cr3t\r\n\r\n",
+        )
+        .unwrap();
+    // Give the tunnelled bytes time to arrive with the CONNECT, so they are
+    // the leftover.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut conn = Connection::new(server, Limits::new());
+    assert!(conn.next_request().unwrap().is_some());
+    conn.respond(&Response::new(200)).unwrap();
+    let upgraded = conn.into_upgraded().unwrap();
+    for shown in both(&upgraded) {
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("71, 69, 84"),
+            "{shown}"
+        );
+        assert!(shown.contains("bytes"), "{shown}");
+    }
+}

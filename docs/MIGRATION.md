@@ -5,6 +5,51 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.9.0 to 0.9.1
+
+Fixes only; no signature changes. Three behaviours can be noticed.
+
+### An error answer to `HEAD` has no content
+
+**What changed.** When a `HEAD` request fails in its body (a bad chunk,
+the peer closing mid-body), the one error response `respond` writes is an
+answer to `HEAD`: the head of `Response::from_error`, without the error
+text. The blocking adapter's `408` to a `HEAD` likewise has no content.
+A failure in the head (no request line known yet) is answered as before.
+
+**Why.** RFC 9110 section 9.3.2: a response to `HEAD` carries no content.
+A front end that reused the connection would have read the text as the
+next response.
+
+**What to do.** Nothing.
+
+### The pipelining client stops after a response that closes
+
+**What changed.** Once the head of the response being read says the
+connection ends with it (`Connection: close`, HTTP/1.0 without
+keep-alive, a body read until close), `ClientConn::can_send` is false and
+`send_request` refuses another request with `InvalidState` instead of
+writing it.
+
+**Why.** RFC 9112 section 9.6: the client must stop sending on that
+connection. The request written before was never answered.
+
+**What to do.** Send the next request on a new connection, as for any
+`Closed`; `outstanding()` still counts what was sent before the response
+arrived.
+
+### Body bytes print as lengths in `Debug`
+
+**What changed.** `ServerEvent::Body`, `ClientEvent::Body`,
+`blocking::Incoming`, and the `leftover` of `blocking::Upgraded` print
+`N bytes` instead of the bytes.
+
+**Why.** A body or a tunnelled request can carry credentials no field
+redaction sees (T-35).
+
+**What to do.** Log the bytes yourself if you need them; the fields and
+accessors are unchanged.
+
 ## 0.8 to 0.9
 
 0.9 freezes the API as the 1.0 candidate. One change can be noticed.

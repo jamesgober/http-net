@@ -46,7 +46,6 @@ use crate::{
 /// assert!(out.ends_with(b"\r\n\r\nhi"));
 /// ```
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum ServerEvent<'a> {
     /// A request head arrived. Its body (if any) follows as
     /// [`Body`](ServerEvent::Body) events, then
@@ -82,6 +81,26 @@ pub enum ServerEvent<'a> {
     Upgraded,
     /// The connection is finished: flush any output, then close the socket.
     Closed,
+}
+
+/// Body bytes print as their length: a body can carry credentials that no
+/// field redaction sees (a form login, a token).
+impl core::fmt::Debug for ServerEvent<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Request(head) => f.debug_tuple("Request").field(head).finish(),
+            Self::Body(bytes) => f
+                .debug_tuple("Body")
+                .field(&format_args!("{} bytes", bytes.len()))
+                .finish(),
+            Self::Trailers(fields) => f.debug_tuple("Trailers").field(fields).finish(),
+            Self::RequestEnd => f.write_str("RequestEnd"),
+            Self::NeedInput => f.write_str("NeedInput"),
+            Self::AwaitingResponse => f.write_str("AwaitingResponse"),
+            Self::Upgraded => f.write_str("Upgraded"),
+            Self::Closed => f.write_str("Closed"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,6 +365,9 @@ impl ServerConn {
     }
 
     /// Records that `n` bytes were written into [`read_buf`](Self::read_buf).
+    /// An `n` larger than the slice `read_buf` returned is clamped to its
+    /// length: committing bytes that were not written would hand stale
+    /// buffer contents to the parser.
     ///
     /// # Examples
     ///
@@ -382,7 +404,9 @@ impl ServerConn {
     ///
     /// Any [`HttpError`] parse error. The connection is then finished: send
     /// one error response (see [`HttpError::status`]) with
-    /// [`respond`](Self::respond), flush, and close.
+    /// [`respond`](Self::respond), flush, and close. It is written as an
+    /// answer to a `GET`, or, when the failure came after a `HEAD` request
+    /// line, to a `HEAD`, without content.
     ///
     /// # Examples
     ///
@@ -1096,7 +1120,15 @@ impl ServerConn {
             ));
         }
         let (method, version) = if failed {
-            (Method::Get, Version::Http11)
+            // A failure in the head leaves `RequestInfo::EMPTY` (a GET); one
+            // in the body keeps the request line's facts, and an answer to
+            // `HEAD` carries no content (RFC 9110 section 9.3.2).
+            let method = if self.info.method == Method::Head {
+                Method::Head
+            } else {
+                Method::Get
+            };
+            (method, Version::Http11)
         } else {
             (self.info.method, self.info.version)
         };

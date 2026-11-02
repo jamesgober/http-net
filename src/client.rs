@@ -47,7 +47,6 @@ const REFUSED: HttpError = HttpError::InvalidState(
 /// assert_eq!(body, b"abc");
 /// ```
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum ClientEvent<'a> {
     /// The final response head arrived. Its body follows as
     /// [`Body`](ClientEvent::Body) events, then
@@ -88,6 +87,28 @@ pub enum ClientEvent<'a> {
     Upgraded,
     /// The connection cannot carry another request: close the socket.
     Closed,
+}
+
+/// Body bytes print as their length: a body can carry credentials that no
+/// field redaction sees (a token in a JSON answer).
+impl core::fmt::Debug for ClientEvent<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Response(head) => f.debug_tuple("Response").field(head).finish(),
+            Self::Informational(head) => f.debug_tuple("Informational").field(head).finish(),
+            Self::Continue => f.write_str("Continue"),
+            Self::Body(bytes) => f
+                .debug_tuple("Body")
+                .field(&format_args!("{} bytes", bytes.len()))
+                .finish(),
+            Self::Trailers(fields) => f.debug_tuple("Trailers").field(fields).finish(),
+            Self::ResponseEnd => f.write_str("ResponseEnd"),
+            Self::NeedInput => f.write_str("NeedInput"),
+            Self::Idle => f.write_str("Idle"),
+            Self::Upgraded => f.write_str("Upgraded"),
+            Self::Closed => f.write_str("Closed"),
+        }
+    }
 }
 
 /// Opt-in tolerances for responses a strict client would refuse. All are
@@ -514,6 +535,9 @@ impl ClientConn {
     }
 
     /// Records that `n` bytes were written into [`read_buf`](Self::read_buf).
+    /// An `n` larger than the slice `read_buf` returned is clamped to its
+    /// length: committing bytes that were not written would hand stale
+    /// buffer contents to the parser.
     ///
     /// # Examples
     ///
@@ -741,10 +765,13 @@ impl ClientConn {
     /// request now. With no request outstanding: the connection is open
     /// and nothing unsolicited is buffered. With requests outstanding
     /// (pipelining): fewer than [`Limits::pipeline_depth`] are outstanding,
-    /// all of them are idempotent with their bodies fully sent, and none
-    /// asked to close, upgrade, `CONNECT`, or expect `100 Continue`. The new
-    /// request must also be idempotent with a full body (RFC 9112 section
-    /// 9.3.2: a client should not pipeline non-idempotent requests).
+    /// all of them are idempotent with their bodies fully sent, none asked
+    /// to close, upgrade, `CONNECT`, or expect `100 Continue`, and the
+    /// response being read, once its head has arrived, keeps the connection
+    /// open (RFC 9112 section 9.6: after `close`, or a response that ends
+    /// with the connection, the client sends nothing more). The new request
+    /// must also be idempotent with a full body (RFC 9112 section 9.3.2: a
+    /// client should not pipeline non-idempotent requests).
     ///
     /// # Examples
     ///
@@ -772,6 +799,7 @@ impl ClientConn {
                     && !self.waiting_continue
                     && !self.body_refused
                     && !self.buf.is_eof()
+                    && (matches!(self.state, State::Head | State::Interim) || self.info.keep_alive)
             }
         }
     }

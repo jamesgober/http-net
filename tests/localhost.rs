@@ -1142,3 +1142,40 @@ fn test_connection_request_deadline_is_timed_out_on_every_platform() {
     );
     client.join().unwrap();
 }
+
+/// RFC 9110 section 9.3.2 through the blocking server: a `HEAD` that fails
+/// in its body gets an answer with no content, whether the failure is a
+/// parse error (`400` from `Response::from_error`) or the request deadline
+/// (the adapter's own `408`). Fixed in 0.9.1.
+#[test]
+fn test_head_failing_in_its_body_is_answered_without_content() {
+    let server = Server::bind("127.0.0.1:0")
+        .unwrap()
+        .with_config(ServerConfig::new().with_request_timeout(Some(Duration::from_millis(300))));
+    let running = start(server, echo);
+    for (wire, status) in [
+        (
+            &b"HEAD / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"[..],
+            &b"HTTP/1.1 400 "[..],
+        ),
+        (
+            b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab",
+            b"HTTP/1.1 408 ",
+        ),
+    ] {
+        let mut stream = connect(running.addr);
+        stream.write_all(wire).unwrap();
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply);
+        assert!(
+            reply.starts_with(status),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(
+            reply.ends_with(b"\r\n\r\n"),
+            "content after the head: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+}

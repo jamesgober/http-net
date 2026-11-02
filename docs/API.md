@@ -1,7 +1,7 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.9.0`).** This file describes the 1.0
+> and examples. **Status: pre-1.0 (`0.9.1`).** This file describes the 1.0
 > surface: each item says the version it ships in, and every item listed
 > is in this build (the two planned items are under
 > [Planned after 1.0](#planned-after-10)). The API is frozen as the 1.0
@@ -379,7 +379,10 @@ carry them, [`Request`](#request), [`Response`](#response),
 [`blocking::ClientResponse`](#blockingclientresponse);
 [`blocking::Connection`](#blockingconnection) prints its buffers as lengths
 only. So `{:?}` of a request in a log line never prints a session cookie or
-a bearer token.
+a bearer token. Body bytes print as their length too, since a body can
+carry credentials no field list sees: `ServerEvent::Body`,
+`ClientEvent::Body`, `blocking::Incoming`, and the leftover bytes of
+`blocking::Upgraded` (0.9.1; before, those printed the bytes).
 Field names are matched ASCII case-insensitively. The accessors
 (`header`, `headers`, `header_value`) still return the real bytes. The list
 is fixed; a caller-extensible list (for custom credential fields such as
@@ -737,7 +740,9 @@ Advances the parser one step and reports one event. Call it until it
 returns `NeedInput`, `AwaitingResponse`, `Upgraded`, or `Closed`.
 **Errors:** every peer variant of [`HttpError`](#variants); the connection
 is then finished: one error response may be sent with `respond`, then it
-reports `Closed`. **Cost:** about 234 ns to parse and answer a 12-field
+reports `Closed`. The error response is written as an answer to a `GET`,
+or to a `HEAD` (no content) when the failure came after a `HEAD` request
+line (0.9.1). **Cost:** about 234 ns to parse and answer a 12-field
 browser GET (measured 0.6.0, [`PERFORMANCE.md`](./PERFORMANCE.md)).
 **Ships:** exists.
 
@@ -1134,7 +1139,6 @@ assert_eq!(conn.into_buffer().capacity(), 0);
 
 ```rust,ignore
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum ServerEvent<'a> {
     Request(RequestHead<'a>),
     Body(&'a [u8]),
@@ -2062,7 +2066,11 @@ any name the head's `Connection` lists) in their original order.
 `ClientConn::send_body`) and the connection writes the framing field
 itself. An absolute-form target stays absolute (origin servers accept it,
 RFC 9112 section 3.2.2); rebuild with `Request::new` for origin form. Add
-`via` and forwarding fields with `header`. **Errors** (at `send_request`):
+`via` and forwarding fields with `header`. Every name `Connection` lists
+is dropped, end-to-end names such as `authorization` or `x-forwarded-for`
+included, so a client can strip fields a proxy relies on: check
+`connection_options()` first if the next hop must see one (listing `host`
+drops it, and the request fails closed at send). **Errors** (at `send_request`):
 `InvalidState` for an upgrade request (tunnel it instead); the builders'
 errors, such as `MissingHost` for an HTTP/1.0 head without `Host`.
 **Ships:** 0.5.
@@ -2255,7 +2263,10 @@ are matched to them in order, from a fixed array (no allocation after
 construction). Only idempotent requests with a full body are pipelined, and
 nothing goes behind a request that streams its body, asks to close,
 upgrades, uses `CONNECT`, or expects `100 Continue` (RFC 9112 section 9.3.2:
-a client should not pipeline non-idempotent requests). `can_send()` says
+a client should not pipeline non-idempotent requests), nor behind a
+response whose head says the connection ends with it (`Connection: close`,
+HTTP/1.0 without keep-alive, a body read until close; RFC 9112 section
+9.6; enforced from 0.9.1). `can_send()` says
 whether `send_request` would accept another request now; `outstanding()`
 counts requests whose response has not completed. If the server closes the
 connection mid-pipeline, `outstanding()` reports how many requests got no
@@ -2348,7 +2359,6 @@ assert_eq!(resp.header("x-long"), Some(&b"one,   two"[..]));
 
 ```rust,ignore
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum ClientEvent<'a> {
     Response(ResponseHead<'a>),
     Informational(ResponseHead<'a>), // only with set_report_informational(true)
@@ -2671,6 +2681,8 @@ after that response (0.4). Closing connections are drained (lingering
 close) for at most 1 s and 256 KiB so the last response is not lost to a
 reset. **Errors:** only if accepting fails persistently (more than 1,000
 consecutive errors); transient accept errors are retried after 10 ms.
+Before the error is returned, live connections finish their current
+exchange, as after a shutdown (0.9.1).
 
 ### `blocking::serve`
 
@@ -2769,7 +2781,6 @@ head and its complete body. **Ships:** exists.
 
 ```rust,ignore
 #[non_exhaustive]
-#[derive(Debug)]
 pub struct Upgraded {
     pub stream: TcpStream,
     pub leftover: Vec<u8>,

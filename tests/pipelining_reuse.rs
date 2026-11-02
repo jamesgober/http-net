@@ -432,3 +432,48 @@ fn test_wipe_covers_stale_copies_left_by_compaction() {
     );
     assert!(!contains(&run(true), b"STALE-COPY-SECRET"));
 }
+
+/// RFC 9112 section 9.6: once the response being read says the connection
+/// ends with it (`Connection: close`, HTTP/1.0 without keep-alive, a body
+/// read until close), the client sends no further request on it (fixed in
+/// 0.9.1: `can_send` looked only at the requests).
+#[test]
+fn test_no_pipelining_after_a_response_that_closes() {
+    for response in [
+        &b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nab"[..],
+        b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nab",
+        b"HTTP/1.1 200 OK\r\n\r\nab",
+    ] {
+        let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+        let mut out = Vec::new();
+        conn.send_request(&get("/1"), &mut out).unwrap();
+        // Before the head arrives, pipelining is allowed.
+        assert!(conn.can_send());
+        let _ = conn.feed(response);
+        assert!(matches!(conn.poll(), Ok(ClientEvent::Response(r)) if !r.keep_alive()));
+        assert!(matches!(conn.poll(), Ok(ClientEvent::Body(_))));
+        assert!(!conn.can_send(), "{response:?}");
+        let before = out.len();
+        assert!(matches!(
+            conn.send_request(&get("/2"), &mut out),
+            Err(HttpError::InvalidState(_))
+        ));
+        assert_eq!(out.len(), before, "nothing written");
+        assert_eq!(conn.outstanding(), 1);
+    }
+    // The same once the response is complete, before the poll that closes.
+    let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+    conn.send_request(&get("/1"), &mut Vec::new()).unwrap();
+    let _ = conn.feed(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+    assert!(matches!(conn.poll(), Ok(ClientEvent::Response(_))));
+    assert!(matches!(conn.poll(), Ok(ClientEvent::ResponseEnd)));
+    assert!(!conn.can_send());
+    assert!(matches!(conn.poll(), Ok(ClientEvent::Closed)));
+    // A keep-alive response keeps the pipeline open.
+    let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+    conn.send_request(&get("/1"), &mut Vec::new()).unwrap();
+    let _ = conn.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab");
+    assert!(matches!(conn.poll(), Ok(ClientEvent::Response(_))));
+    assert!(matches!(conn.poll(), Ok(ClientEvent::Body(_))));
+    assert!(conn.can_send());
+}

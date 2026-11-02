@@ -1122,3 +1122,66 @@ fn test_unregistered_status_keeps_the_space_before_an_empty_reason() {
         String::from_utf8_lossy(&out)
     );
 }
+
+/// Feeds `input` (then EOF) until the first error and answers it with
+/// `Response::from_error`, as every driver does. Returns the error and the
+/// bytes written.
+fn error_answer(input: &[u8]) -> (HttpError, Vec<u8>) {
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(input);
+    conn.feed_eof();
+    loop {
+        match conn.poll() {
+            Ok(ServerEvent::Closed) => panic!("no error for {input:?}"),
+            Ok(_) => {}
+            Err(e) => {
+                let mut out = Vec::new();
+                conn.respond(&Response::from_error(&e), &mut out).unwrap();
+                return (e, out);
+            }
+        }
+    }
+}
+
+/// RFC 9110 section 9.3.2: a response to `HEAD` carries no content, also
+/// when the request fails in its body (fixed in 0.9.1: such a failure was
+/// answered as a `GET`, with the error text as content). A failure in the
+/// head is still answered with content: there is no method to honour.
+#[test]
+fn test_error_answer_to_head_has_no_content() {
+    for (input, error) in [
+        (
+            &b"HEAD / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"[..],
+            HttpError::InvalidChunkSize,
+        ),
+        (
+            b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab",
+            HttpError::UnexpectedEof,
+        ),
+    ] {
+        let (e, out) = error_answer(input);
+        assert_eq!(e, error);
+        assert!(out.starts_with(b"HTTP/1.1 400 "), "{out:?}");
+        assert!(
+            out.ends_with(b"\r\n\r\n"),
+            "content after the head: {out:?}"
+        );
+        // A client that sent the HEAD reads the answer and nothing is left.
+        let mut client = ClientConn::new();
+        client
+            .send_request(&Request::head("/").header("host", "a"), &mut Vec::new())
+            .unwrap();
+        let _ = client.feed(&out);
+        assert!(matches!(client.poll(), Ok(ClientEvent::Response(_))));
+        assert!(matches!(client.poll(), Ok(ClientEvent::ResponseEnd)));
+        assert!(client.remaining_input().is_empty());
+    }
+    // The same failure on a GET keeps its content.
+    let (_, out) =
+        error_answer(b"GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n");
+    assert!(out.ends_with(b"invalid chunk size"), "{out:?}");
+    // A failure in the head knows no method.
+    let (e, out) = error_answer(b"HEAD / HTTP/1.1\r\n\r\n");
+    assert_eq!(e, HttpError::MissingHost);
+    assert!(!out.ends_with(b"\r\n\r\n"), "{out:?}");
+}

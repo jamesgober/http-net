@@ -697,6 +697,14 @@ impl Request {
     /// forwarding fields with [`header`](Self::header); requests are
     /// re-serialized, never passed through as raw bytes.
     ///
+    /// Every name the client lists in `Connection` is dropped, as RFC 9110
+    /// section 7.6.1 requires, including end-to-end names such as
+    /// `authorization` or `x-forwarded-for`: a client can strip fields a
+    /// proxy relies on this way. Check
+    /// [`connection_options`](crate::RequestHead::connection_options)
+    /// first if the next hop must see one of them. Listing `host` drops it
+    /// too, and the request then fails closed at send (no `Host`).
+    ///
     /// # Errors
     ///
     /// Recorded and returned by
