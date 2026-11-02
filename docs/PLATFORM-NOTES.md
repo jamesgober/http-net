@@ -58,8 +58,9 @@ the maximum segment lifetime, holding the port pair:
 A client that opens and closes connections in a tight loop can exhaust its
 ephemeral ports in well under a minute on Windows, after which `connect`
 fails or stalls. This is a property of the client machine, not of the
-server. Keep connections alive (`blocking::Client` and `ClientConn` reuse
-them), and when load-testing, pace new connections; the soak test
+server. Keep connections alive (`ClientConn` reuses them;
+`blocking::Client` opens one per request, so it is the wrong tool for a
+tight loop), and when load-testing, pace new connections; the soak test
 (`examples/soak.rs`) runs most of its traffic on long keep-alive
 connections for this reason.
 

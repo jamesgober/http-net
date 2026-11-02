@@ -1144,9 +1144,10 @@ fn error_answer(input: &[u8]) -> (HttpError, Vec<u8>) {
 }
 
 /// RFC 9110 section 9.3.2: a response to `HEAD` carries no content, also
-/// when the request fails in its body (fixed in 0.9.1: such a failure was
-/// answered as a `GET`, with the error text as content). A failure in the
-/// head is still answered with content: there is no method to honour.
+/// when the request fails, in its body (fixed in 0.9.1: such a failure was
+/// answered as a `GET`, with the error text as content) or later in its head
+/// (fixed in 0.9.2). Only a request line that was never read has no method
+/// to honour.
 #[test]
 fn test_error_answer_to_head_has_no_content() {
     for (input, error) in [
@@ -1157,6 +1158,15 @@ fn test_error_answer_to_head_has_no_content() {
         (
             b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nab",
             HttpError::UnexpectedEof,
+        ),
+        (
+            b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: x\r\n\r\n",
+            HttpError::InvalidContentLength,
+        ),
+        (b"HEAD / HTTP/1.1\r\n\r\n", HttpError::MissingHost),
+        (
+            b"HEAD / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n",
+            HttpError::ObsFold,
         ),
     ] {
         let (e, out) = error_answer(input);
@@ -1180,8 +1190,10 @@ fn test_error_answer_to_head_has_no_content() {
     let (_, out) =
         error_answer(b"GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n");
     assert!(out.ends_with(b"invalid chunk size"), "{out:?}");
-    // A failure in the head knows no method.
-    let (e, out) = error_answer(b"HEAD / HTTP/1.1\r\n\r\n");
-    assert_eq!(e, HttpError::MissingHost);
+    // A request line over its budget was never read, so it has no method.
+    let mut long = b"HEAD /".to_vec();
+    long.resize(Limits::new().max_start_line() + 64, b'a');
+    let (e, out) = error_answer(&long);
+    assert_eq!(e, HttpError::StartLineTooLong);
     assert!(!out.ends_with(b"\r\n\r\n"), "{out:?}");
 }

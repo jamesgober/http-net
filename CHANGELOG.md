@@ -13,6 +13,54 @@
 
 ---
 
+## [0.9.2] - 2026-11-02
+
+Fixes from the documentation audit of 0.9.1, which checked every factual
+claim against the build. No API change (`cargo semver-checks` against
+0.9.1: no change).
+
+### Fixed
+
+- `ClientConn::outstanding()` left out the request whose response failed
+  (a parse error, the peer closing mid-response), so a driver retrying
+  from the count dropped one idempotent request.
+- At `ResponseEnd`, `is_reusable()` could say yes while `send_request`
+  refused anything but a pipelined idempotent request, and `progress()`
+  said `Idle` with a pipelined request outstanding. When the connection
+  stays open and nothing else is outstanding, `send_request` now accepts
+  any request without a further `poll`; with a request outstanding,
+  `is_reusable()` is false and `progress()` is `AwaitingResponse`.
+- The 0.9.1 `HEAD` fix covered a failure in the body only. Once a `HEAD`
+  request line has been read, every error answer has no content,
+  including a failure later in the head and the blocking adapter's `408`
+  to a head that never finished (RFC 9110 section 9.3.2).
+
+### Documentation
+
+- `docs/STABILITY-1.0.md` scoped the semver promise to items "marked
+  exists", which `docs/API.md` defines as items from 0.2.0. It now covers
+  every public item in `docs/API.md` apart from those planned after 1.0.
+- 18 corrections in all (`dev/PLAN.md` D-75), among them: framing refusals
+  do not apply to a response with no body; `UnexpectedUpgrade` also covers
+  a `101` naming a protocol not offered; `BareCr` is not raised in a chunk
+  line; `blocking::Client` opens one connection per request; `close` and
+  `set_keep_alive(false)` do nothing on a tunnel; the client deadline does
+  not bound name resolution; the migration notes list every noticeable
+  change.
+- `docs/PERFORMANCE.md`: aarch64 numbers from the manual benchmark
+  workflow.
+
+### Testing
+
+- `tests/prop_split.rs`: the review's split-invariance properties
+  (the lenient client, tiny budgets with reporting on, the pipelining
+  client, the stateless parser against the connection) and every budget
+  at its limit and one over, at every split.
+- Regression tests for each fix (`tests/pipelining_reuse.rs`,
+  `tests/rfc_cases.rs`, `tests/localhost.rs`).
+
+---
+
 ## [0.9.1] - 2026-11-02
 
 Fixes from the 0.9.x polish pass: a second, independent security review
@@ -59,9 +107,10 @@ change (`cargo semver-checks` against 0.9.0: no change).
 
 ### Testing
 
-- Regression tests for each fix (`tests/rfc_cases.rs`,
-  `tests/pipelining_reuse.rs`, `tests/redaction.rs`,
-  `tests/localhost.rs`) and a unit test for the lingering-close byte cap.
+- Regression tests for each fix except the wait in `serve`, which needs a
+  failing listener (`tests/rfc_cases.rs`, `tests/pipelining_reuse.rs`,
+  `tests/redaction.rs`, `tests/localhost.rs`), and a unit test for the
+  lingering-close byte cap.
 - The reference parser behind the `reference_diff` fuzz target and
   `tests/prop_reference.rs` overflowed on a chunk size near `u64::MAX`
   (found by the fuzz rerun; the crate itself refuses such a size). Fixed,
@@ -620,7 +669,8 @@ Initial scaffold and repository bootstrap. No domain logic yet; this release est
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/jamesgober/http-net/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/jamesgober/http-net/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jamesgober/http-net/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/http-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/http-net/compare/v0.7.0...v0.8.0

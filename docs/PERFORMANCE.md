@@ -206,7 +206,21 @@ against the 0.6 run, so only the ratios are reported; they are those of
 **aarch64.** `.github/workflows/bench.yml` runs `cargo bench` on GitHub's
 Linux arm64 and macOS runners on demand. Shared runners are noisy, so
 those numbers are indicative only; the regression gate stays the
-interleaved A/B on one machine.
+interleaved A/B on one machine. One run of 0.9.1, medians, with the x86_64
+runner for scale:
+
+| Bench | Linux arm64 | macOS arm64 | Linux x86_64 |
+|---|---:|---:|---:|
+| browser GET, parsed and answered | 417 ns | 511 ns | 577 ns |
+| 100,000 pipelined GETs | 15.3 ms | 15.8 ms | 18.0 ms |
+| 1 MiB body, `Content-Length` | 40.5 µs | 53.5 µs | 48.1 µs |
+| 1 MiB body, chunked | 44.5 µs | 62.8 µs | 50.1 µs |
+| response with five fields and 1 KiB | 143 ns | 150 ns | 167 ns |
+| `write_head`, the same fields | 221 ns | 292 ns | 267 ns |
+| client parsing a 1 KiB response | 166 ns | 205 ns | 205 ns |
+
+The SWAR scanners behave the same on aarch64: no bench stands out against
+the x86_64 runner.
 
 ## Where the time goes
 

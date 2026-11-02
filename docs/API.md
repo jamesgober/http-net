@@ -1,7 +1,7 @@
 # http-net - API Reference
 
 > Every public item of `http-net`: what it does, its parameters, its errors,
-> and examples. **Status: pre-1.0 (`0.9.1`).** This file describes the 1.0
+> and examples. **Status: pre-1.0 (`0.9.2`).** This file describes the 1.0
 > surface: each item says the version it ships in, and every item listed
 > is in this build (the two planned items are under
 > [Planned after 1.0](#planned-after-10)). The API is frozen as the 1.0
@@ -278,6 +278,10 @@ receive chunked encoding: the server falls back to closing the connection.
 
 Anything recipients have been known to disagree about is an error, never a
 guess. Each row is refused in requests and responses alike unless noted.
+A response with no body (`HEAD`, 1xx, 204, 304, 2xx to `CONNECT`) ends at its
+blank line whatever its framing fields say (RFC 9112 section 6.3), so the
+`Transfer-Encoding` rows do not apply to it; `Content-Length` is still
+validated.
 
 | Refused | Error | Why (RFC 9112 / 9110) |
 |---|---|---|
@@ -366,7 +370,8 @@ HTTP/1.1, `Response::switching_protocols("h2c")` and
 `Request::upgrade("h2c")` are refused with `UpgradeNotOffered`.
 
 On the client side, [`Request::upgrade`](#requestupgrade) asks to switch,
-and a `101` reply carrying `Upgrade` yields `Response` then `Upgraded`.
+and a `101` naming only protocols the request offered yields `Response`
+then `Upgraded`.
 
 ### Credentials in `Debug` output
 
@@ -528,7 +533,7 @@ assert!(HttpError::InvalidTarget.is_peer_error() && HttpError::InvalidTarget.is_
 | `HeadersTooLarge` | peer | header section over `max_header_bytes`, trailer section over `max_trailer_bytes`; client: interim heads over `max_header_bytes` | 431 | answer 431 | exists |
 | `TooManyHeaders` | peer | more fields than `max_headers`, or more trailer fields than `max_trailer_fields`; `parse_request_head` / `parse_response_head`: more fields than the `fields` slice holds | 431 | answer 431 | exists |
 | `FieldLineTooLong` | peer | one field line over `max_field_line` | 431 | answer 431 | 0.4 |
-| `BareCr` | peer / usage | CR not followed by LF anywhere in a received head or chunk line; any CR in an outgoing field value | 400 | answer 400 / remove CR from the value | exists |
+| `BareCr` | peer / usage | CR not followed by LF in a received head or trailer section (in a chunk line it is `InvalidChunkSize` or `InvalidChunkExtension`); any CR in an outgoing field value | 400 | answer 400 / remove CR from the value | exists |
 | `BareLf` | peer | LF not preceded by CR | 400 | answer 400 | exists |
 | `ObsFold` | peer | field line starting with SP or HTAB (fold, or whitespace before the first field) | 400 | answer 400 | exists |
 | `InvalidHeaderName` | peer / usage | empty or non-token name, or no colon | 400 | answer 400 / fix the name | exists |
@@ -550,7 +555,7 @@ assert!(HttpError::InvalidTarget.is_peer_error() && HttpError::InvalidTarget.is_
 | `BodyTooLarge` | peer | declared CL or cumulative chunk sizes over `max_body` (checked before the data is buffered), or until-close bytes past it (refused at the first byte over) | 413 | answer 413 | exists |
 | `UnexpectedEof` | peer | EOF inside a head or a body with a known end | None | close | exists |
 | `UnexpectedData` | peer / usage | client: bytes with no request outstanding; `send_request` with unread input | None | close | exists |
-| `UnexpectedUpgrade` | peer | client: `101` to a request that did not ask, or without `Upgrade` | None | close | exists |
+| `UnexpectedUpgrade` | peer | client: `101` to a request that did not ask, without `Upgrade`, or naming a protocol the request did not offer | None | close | exists |
 | `TooManyInterim` | peer | client: more interim responses than `max_interim` for one request | None | close | 0.4 |
 | `Http2Preface` | peer | the connection starts with the HTTP/2 preface `PRI * HTTP/2.0` | 505 | route to `h2-net` if the listener allows prior knowledge, else answer 505 and close | 0.5 |
 | `ReservedHeader` | usage | outgoing message sets `content-length`, `transfer-encoding`, `connection`, or `upgrade` (from 0.4 also `trailer`, `te` on responses, `keep-alive`, `proxy-connection`) | None | use the builder method | exists; 0.4 |
@@ -741,8 +746,8 @@ returns `NeedInput`, `AwaitingResponse`, `Upgraded`, or `Closed`.
 **Errors:** every peer variant of [`HttpError`](#variants); the connection
 is then finished: one error response may be sent with `respond`, then it
 reports `Closed`. The error response is written as an answer to a `GET`,
-or to a `HEAD` (no content) when the failure came after a `HEAD` request
-line (0.9.1). **Cost:** about 234 ns to parse and answer a 12-field
+or, once a `HEAD` request line has been read, to a `HEAD`, with no content
+(0.9.1 for a failure in the body, 0.9.2 for one in the head). **Cost:** about 234 ns to parse and answer a 12-field
 browser GET (measured 0.6.0, [`PERFORMANCE.md`](./PERFORMANCE.md)).
 **Ships:** exists.
 
@@ -760,8 +765,8 @@ assert_eq!(conn.poll().unwrap_err(), HttpError::ObsFold);
 pub fn request(&self) -> Option<RequestHead<'_>>
 ```
 
-The current request's head, from its arrival until the next request begins
-(still available after an upgrade). **Ships:** exists.
+The current request's head, from its arrival until the `poll` after its
+response is finished (still available after an upgrade). **Ships:** exists.
 
 ```rust
 use http_net::{ServerConn, ServerEvent};
@@ -1003,7 +1008,8 @@ pub fn set_report_trailers(&mut self, report: bool)
 - `set_keep_alive(false)` makes the current response (or the next, if it
   has not started) carry `connection: close` and ends the connection after
   it: the gentlest load-shedding step. `true` cannot keep open a
-  connection the protocol requires to close. `keep_alive()` says whether
+  connection the protocol requires to close. A `101` or a 2xx to `CONNECT`
+  hands the connection over regardless. `keep_alive()` says whether
   the connection can stay open after the current exchange, as far as is
   known now.
 - `requests_served()` counts completed responses (full bodies when written,
@@ -1090,8 +1096,8 @@ pub fn set_wipe(&mut self, wipe: bool)
   framing) before the buffer is reused, zeroes the stale copies compaction
   leaves behind, and zeroes the whole buffer on `reset`, `into_buffer`, and
   drop, so credentials do not linger between requests (threat T-36). It
-  costs a `memset` of each request's bytes, about 30 to 60 ns per 2 KiB (an
-  estimate), and no allocation.
+  costs a `memset` of each request's bytes, about 11 ns per KiB (measured,
+  `docs/PERFORMANCE.md`), and no allocation.
 
 **Ships:** 0.5.
 
@@ -1181,7 +1187,7 @@ response deadlines. Returned by `ServerConn::progress` and
 | `Idle` | between requests, no byte of the next one seen (idle keep-alive time) | no request outstanding |
 | `Head` | some bytes of a request head seen | some bytes of a response head seen |
 | `Body` | head done, body bytes outstanding | response body in progress |
-| `AwaitingResponse` | request complete (or nothing left to read), response not finished | request sent, nothing of the response yet |
+| `AwaitingResponse` | request complete (or nothing left to read), or a parse error, while the response is not finished | request sent, nothing of the response yet, or the next pipelined response due |
 | `WritingBody` | a streamed response is being written | a streamed request body is being written |
 | `Upgraded` | the connection belongs to another protocol | as for the server |
 | `Closed` | finished, or will be once the last response is written | finished |
@@ -1919,7 +1925,7 @@ and hop-by-hop fields (`content-length`, `transfer-encoding`, `connection`,
 | `body(self, body: impl Into<Cow<'static, [u8]>>) -> Response` | full body sent with `content-length`; static data borrowed, `Vec` moved | exists |
 | `chunked(self) -> Response` | stream with `send_body` / `end_body` (close-delimited to HTTP/1.0) | exists |
 | `content_length(self, len: u64) -> Response` | stream exactly `len` bytes | exists |
-| `close(self) -> Response` | `connection: close`; end the connection after this response | exists |
+| `close(self) -> Response` | `connection: close`; end the connection after this response (not a `101` or a 2xx to `CONNECT`, which hand it over) | exists |
 | `status(&self) -> u16`, `closes(&self) -> bool` | | exists |
 | `body_bytes(&self) -> Option<&[u8]>` | `None` for a streamed body | exists |
 | `header_value(&self, name: &str) -> Option<&[u8]>` | first added field with that name | exists |
@@ -2163,8 +2169,9 @@ change framing). Interim responses (100, 103) are skipped unless
 `set_report_informational(true)`; they count against `max_interim`
 (`TooManyInterim`) and together against `max_header_bytes`
 (`HeadersTooLarge`), so a server cannot keep the client parsing interim
-responses forever. A `101` that the
-request did not ask for, or one without `Upgrade`, is `UnexpectedUpgrade`.
+responses forever. A `101` that the request did not ask for, one without
+`Upgrade`, or one naming a protocol the request did not offer is
+`UnexpectedUpgrade`.
 Bytes that arrive after a complete response, with no request outstanding,
 are `UnexpectedData` (never queued as the next response).
 
@@ -2219,8 +2226,9 @@ pub fn progress(&self) -> Progress
   same forbidden list as on the server; `TrailerNotAllowed` for a body that
   is not chunked).
 - `is_reusable()`: nothing is outstanding and both sides keep the
-  connection alive; with pipelining, `can_send()` says whether another
-  request can be sent now.
+  connection alive, from `ResponseEnd` on: the connection need not be polled
+  to `Idle` before the next `send_request` (0.9.2). With pipelining,
+  `can_send()` says whether another request can be sent now.
 - `progress()`: the phase, for response deadlines.
 
 **Ships:** 0.4.
@@ -2269,8 +2277,9 @@ HTTP/1.0 without keep-alive, a body read until close; RFC 9112 section
 9.6; enforced from 0.9.1). `can_send()` says
 whether `send_request` would accept another request now; `outstanding()`
 counts requests whose response has not completed. If the server closes the
-connection mid-pipeline, `outstanding()` reports how many requests got no
-response, to retry on a new connection. **Ships:** 0.5.
+connection mid-pipeline, or a response fails partway, `outstanding()`
+reports how many requests got no complete response, to retry on a new
+connection (the failed response counted from 0.9.2). **Ships:** 0.5.
 
 ```rust
 use http_net::{ClientConn, ClientEvent, Limits, Request};
@@ -2325,8 +2334,8 @@ buffer, so offsets do not move, views stay borrowed, and nothing is
 allocated. A line end is held back until its next byte arrives (only that
 byte says whether the line is folded), so the result does not depend on how
 the input is split. Whitespace before the first field, bare LF, bare CR,
-`Content-Length` with `Transfer-Encoding`, and whitespace before a colon are
-never tolerated. A folded line counts as one field line against the
+`Content-Length` with `Transfer-Encoding` on a response that has a body, and
+whitespace before a colon are never tolerated. A folded line counts as one field line against the
 budgets. **Ships:** 0.5.
 
 ```rust
@@ -2351,7 +2360,7 @@ assert_eq!(resp.header("x-long"), Some(&b"one,   two"[..]));
 
 | Method | Behaviour | Ships |
 |---|---|---|
-| `set_leniency(&mut self, leniency: ClientLeniency)` | opt-in tolerance: `obs_fold_in_responses` replaces each fold's CR LF with SP SP in place (RFC 9112 section 5.2 user-agent rule); bare LF, bare CR, CL with TE, and whitespace before a colon are never tolerated | 0.5 |
+| `set_leniency(&mut self, leniency: ClientLeniency)` | opt-in tolerance: `obs_fold_in_responses` replaces each fold's CR LF with SP SP in place (RFC 9112 section 5.2 user-agent rule); bare LF, bare CR, CL with TE on a response that has a body, and whitespace before a colon are never tolerated | 0.5 |
 | `outstanding(&self) -> usize`, `can_send(&self) -> bool` | pipelining state (depth from `Limits::pipeline_depth`, idempotent requests only) | 0.5 |
 | `reset`, `with_buffer`, `into_buffer`, `shrink_idle` | as on `ServerConn` | 0.5 |
 
@@ -2829,7 +2838,7 @@ assert_eq!(resp.status(), 201);
 | `with_limits(Limits)` | | exists |
 | `with_timeout(Duration)` | connect, read, and write timeout (zero is raised to 1 ms) | exists |
 | `get(&self, url: &str) -> Result<ClientResponse, Error>` | one connection per request with `connection: close` | exists |
-| `with_deadline(Option<Duration>)` | one total deadline for connect, write, and read of an exchange (`Error::Io` of kind `TimedOut`); `None` by default | 0.4 |
+| `with_deadline(Option<Duration>)` | one total deadline for connect, write, and read of an exchange (`Error::Io` of kind `TimedOut`); `None` by default. Name resolution is not bounded: `std` offers no timeout for it | 0.4 |
 | `request(&self, url: &str, request: Request) -> Result<ClientResponse, Error>` | any `Request` to an `http://` URL: the URL gives the target and `host`, the request gives method, fields, and a full body; refuses a request that already has `host` (`Http(InvalidHost)`), a streamed body, or an upgrade (`InvalidState`); a `Request::expect_continue` request with its full body fails with `Http(InvalidState)` | 0.4 |
 
 Not run: it needs a server on port 8080.
@@ -2898,7 +2907,8 @@ Implements `Display`, `std::error::Error` (with `source`), and `From` for
   tested, including after a valid head).
 - On every request head it accepts, `http-net` agrees with `httparse` on the
   head length, method, path, version, and field list (differential test,
-  0.3); everywhere they differ, `http-net` refused and `httparse` accepted.
+  0.3); everywhere they differ, `http-net` refused and `httparse` accepted,
+  apart from `HTTP/1.2` to `HTTP/1.9`, which `http-net` reads as 1.1.
 - Every refusal in [What is refused](#what-is-refused-and-why) has a test
   that feeds it whole and split at every byte (`tests/smuggling.rs`,
   `tests/rfc_cases.rs`, `tests/adversarial.rs`).

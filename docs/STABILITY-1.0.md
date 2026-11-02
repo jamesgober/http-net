@@ -1,15 +1,15 @@
 # http-net - Stability (1.0)
 
 > What http-net 1.0.0 commits to, what a 1.x release may change, what only a
-> 2.0 may change, and the audit that 1.0.0 is released on. **Draft (0.9.1):**
+> 2.0 may change, and the audit that 1.0.0 is released on. **Draft (0.9.2):**
 > the API is frozen as the 1.0 candidate; the audit record at the end is
 > filled in as each part is done, and 1.0.0 ships only when every part is
 > recorded and James approves the release.
 
 ## What 1.0 means here
 
-From 1.0.0, every public item in [`docs/API.md`](API.md) marked "exists" is
-under semantic versioning:
+From 1.0.0, every public item in [`docs/API.md`](API.md), apart from those
+under "Planned after 1.0", is under semantic versioning:
 
 - **Patch (`1.0.x`):** fixes only. No API change. A fix may refuse a message
   that was accepted before when accepting it is a security defect (a message
@@ -35,9 +35,9 @@ The complete list, with signatures, errors, and examples, is
 | Area | Items |
 |---|---|
 | Connections | `ServerConn`, `ServerEvent`, `Progress`; `ClientConn`, `ClientEvent`, `ClientLeniency` |
-| Views | `RequestHead`, `ResponseHead`, `Headers`, `HeaderValues`, `ListElements`, `Version`, `BodyFraming`, `TargetForm` |
+| Views | `RequestHead`, `ResponseHead`, `Headers`, `HeaderValues`, `ListElements`, `Version`, `BodyFraming`, `TargetForm`, `OwnedRequestHead` |
 | Builders | `Request`, `Response` |
-| Allocation-free tier | `RawHead`, `Span`, `FieldSpan`, `HeadFacts`, `OwnedRequestHead`, `parse_request_head`, `parse_response_head`, `Asked`, `Parsed`, `ParsedRequest`, `ParsedResponse`, `ChunkedDecoder`, `ChunkStep`, `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` |
+| Allocation-free tier | `RawHead`, `Span`, `FieldSpan`, `HeadFacts`, `parse_request_head`, `parse_response_head`, `Asked`, `Parsed`, `ParsedRequest`, `ParsedResponse`, `ChunkedDecoder`, `ChunkStep`, `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` |
 | Vocabulary | `Method`, `MethodSet`, `status` (constants, `StatusClass`, `reason_phrase`, `status_class`, `status_allows_body`), `HttpDate`, `DateCache`, `is_hop_by_hop`, `is_h2_preface`, `VERSION` |
 | Configuration and errors | `Limits` (every setting and its default), `HttpError` (every variant, `is_peer_error`, `is_usage_error`, `status`) |
 | `blocking` (feature `std`) | `Server`, `ServerConfig`, `ShutdownHandle`, `Incoming`, `Connection`, `Upgraded`, `Client`, `ClientResponse`, `Error`, `get`, `post`, `serve`, `now_date` |
@@ -67,8 +67,8 @@ Which types may grow in 1.x is decided at the freeze (`dev/PLAN.md` D-63):
 - **No `unsafe` code** (`#![forbid(unsafe_code)]`) in the crate, for all of
   1.x.
 - **Allocation.** The core allocates nothing per request after warm-up on a
-  keep-alive connection, and the allocation-free tier allocates nothing
-  ever; both are proved by counting-allocator tests (`tests/alloc.rs`).
+  keep-alive connection, and the allocation-free tier allocates nothing of
+  its own: a caller's reused buffer grows only until it fits. Both are proved by counting-allocator tests (`tests/alloc.rs`).
 - **Output bytes.** The bytes the crate writes for a given response or
   request are stable within a minor series; a minor release may change
   them only in ways RFC 9112 makes equivalent (field order of the crate's
@@ -119,9 +119,11 @@ gate and CI green on every platform and the MSRV), and James approves.
 
 - Frozen at 0.9.0 (D-63). One change at the freeze: `blocking::Upgraded`
   became `#[non_exhaustive]`.
-- Every public item has rustdoc with a runnable example, and an entry in
-  `docs/API.md`.
-- `cargo semver-checks` 0.9.0 to 0.9.1: no change (196 checks).
+- Every public item has rustdoc with an example, compiled, and run where
+  it needs no server, and an entry in `docs/API.md`.
+- `cargo semver-checks` to 0.9.1 and to 0.9.2: no change (196 checks).
+  Run it with a toolchain whose rustdoc format it reads (Rust 1.95 for
+  cargo-semver-checks 0.47).
 - **Status:** freeze done; two-week clock running from the 0.9.0 release.
 
 ### Documentation
@@ -132,7 +134,12 @@ gate and CI green on every platform and the MSRV), and James approves.
   `progress()` value, a platform-dependent timeout kind, a `Display` text),
   fixed in 0.9.0 with regression tests, and corrected the documentation
   everywhere else (`dev/PLAN.md` D-69).
-- **Status:** done for 0.9.0; repeated before 1.0.
+- Repeated on 0.9.1, with the same method (D-75): three code defects
+  (`outstanding()` after a failed response, the reuse queries at
+  `ResponseEnd`, and `HEAD` errors in the head), fixed in 0.9.2 with
+  tests, and 18 documentation corrections.
+- **Status:** done for 0.9.2. Any code change before 1.0 repeats it for
+  what changed.
 
 ### Tests
 
@@ -140,9 +147,12 @@ gate and CI green on every platform and the MSRV), and James approves.
   parser, httparse on requests and responses), counting-allocator, and
   socket tests; every threat T-1 to T-42 has an attack test
   (`docs/SECURITY.md`).
-- 0.9.1 adds a regression test for each fix of the 0.9.x review and a
-  unit test that tells the lingering-close byte cap from its time cap.
-- **Status:** green at 0.9.1 (372 tests and 346 doctests).
+- The 0.9.x reviews add a regression test for each fix except the wait
+  in `serve` after persistent accept errors, which needs a failing
+  listener; a unit test that tells the lingering-close byte cap from its
+  time cap; and `tests/prop_split.rs` (split invariance where the default
+  drivers do not reach, and every budget exact at every split).
+- **Status:** green at 0.9.2 (386 tests and 346 doctests).
 
 ### Benchmarks
 
@@ -190,7 +200,9 @@ gate and CI green on every platform and the MSRV), and James approves.
 ### Consumers
 
 - serve-net and LexerSketch Studio run end to end against 0.8 with no
-  change (D-62). The WASP gateway skeleton and the first fetch-net do not
+  change (D-62), and again against the 0.9.2 code: `ls-studio`'s 42 tests
+  and serve-net's whole suite pass with no source change (the crate moved
+  to 0.9 on its own). The WASP gateway skeleton and the first fetch-net do not
   exist yet. The specification also asks for LexerSketch Studio's publish
   step to use the API end to end before 1.0.
 - **Status:** open.
@@ -219,9 +231,6 @@ Everything else in the audit above is done.
 - H6 (plaintext over sockets, through serve-net) and the report-only C
   harnesses (picohttpparser, llhttp) in `http-net-bench`; the
   specification lists them, none is run yet.
-- The aarch64 numbers from `.github/workflows/bench.yml` (manual; needs
-  the workflow on the default branch).
-- The documentation check against the build, repeated on the 1.0 tree.
 
 **Targets not met, with the decision on record** (`docs/PERFORMANCE.md`):
 the latency targets for the browser GET, pipelined requests, the 1 MiB

@@ -477,3 +477,105 @@ fn test_no_pipelining_after_a_response_that_closes() {
     assert!(matches!(conn.poll(), Ok(ClientEvent::Body(_))));
     assert!(conn.can_send());
 }
+
+/// `outstanding()` after a failure counts the request whose response failed
+/// (fixed in 0.9.2: it was left out, so a driver retrying from the count
+/// dropped one idempotent request). A clean close counts only the requests
+/// after the last complete response.
+#[test]
+fn test_outstanding_counts_the_response_that_failed() {
+    let three = |wire: &[u8], eof: bool| {
+        let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+        for i in 0..3 {
+            conn.send_request(&get(&format!("/{i}")), &mut Vec::new())
+                .unwrap();
+        }
+        let _ = conn.feed(wire);
+        if eof {
+            conn.feed_eof();
+        }
+        let error = loop {
+            match conn.poll() {
+                Ok(ClientEvent::Closed) => break None,
+                Ok(ClientEvent::NeedInput) => panic!("waiting"),
+                Ok(_) => {}
+                Err(e) => break Some(e),
+            }
+        };
+        (error, conn.outstanding())
+    };
+    // EOF before any response: all three are unanswered.
+    assert_eq!(three(b"", true), (Some(HttpError::UnexpectedEof), 3));
+    // A bad head: the same.
+    assert_eq!(
+        three(b"junk\r\n\r\n", false),
+        (Some(HttpError::InvalidStartLine), 3)
+    );
+    // One answered, EOF in the middle of the next body.
+    let mut wire = response("first");
+    wire.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsec");
+    assert_eq!(three(&wire, true), (Some(HttpError::UnexpectedEof), 2));
+    // One request alone.
+    let mut conn = ClientConn::new();
+    conn.send_request(&get("/"), &mut Vec::new()).unwrap();
+    conn.feed_eof();
+    assert_eq!(conn.poll().err(), Some(HttpError::UnexpectedEof));
+    assert_eq!(conn.outstanding(), 1);
+    // `reset` forgets it.
+    conn.reset();
+    assert_eq!(conn.outstanding(), 0);
+}
+
+/// At `ResponseEnd`, before the next `poll`, every query agrees with what
+/// `send_request` does (fixed in 0.9.2: `is_reusable` said yes while
+/// `send_request` refused anything but a pipelined idempotent request, and
+/// `progress` said `Idle` with a pipelined request outstanding).
+#[test]
+fn test_reuse_queries_agree_with_send_request_at_response_end() {
+    for depth in [1, 4] {
+        for first in [
+            get("/"),
+            Request::post("/").header("host", "a").body(&b"x"[..]),
+        ] {
+            for next in [
+                get("/"),
+                Request::post("/").header("host", "a").body(&b"x"[..]),
+            ] {
+                let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(depth));
+                conn.send_request(&first, &mut Vec::new()).unwrap();
+                let _ = conn.feed(&response("ok"));
+                while !matches!(conn.poll(), Ok(ClientEvent::ResponseEnd)) {}
+                assert!(conn.is_reusable());
+                assert!(conn.can_send());
+                assert_eq!(conn.outstanding(), 0);
+                assert_eq!(conn.progress(), Progress::Idle);
+                conn.send_request(&next, &mut Vec::new()).unwrap();
+                assert_eq!(conn.outstanding(), 1);
+                let _ = conn.feed(&response("again"));
+                let (bodies, _) = read_responses(&mut conn, b"", &[]);
+                assert_eq!(bodies, ["again"]);
+            }
+        }
+    }
+    // With a pipelined request still outstanding, the connection is not idle.
+    let mut conn = ClientConn::with_limits(Limits::new().with_pipeline_depth(4));
+    conn.send_request(&get("/1"), &mut Vec::new()).unwrap();
+    conn.send_request(&get("/2"), &mut Vec::new()).unwrap();
+    let _ = conn.feed(&response("ok"));
+    while !matches!(conn.poll(), Ok(ClientEvent::ResponseEnd)) {}
+    assert!(!conn.is_reusable());
+    assert_eq!(conn.outstanding(), 1);
+    assert_eq!(conn.progress(), Progress::AwaitingResponse);
+    // Unsolicited bytes after the response stay refused.
+    let mut conn = ClientConn::new();
+    conn.send_request(&get("/"), &mut Vec::new()).unwrap();
+    let mut wire = response("ok");
+    wire.extend_from_slice(b"x");
+    let _ = conn.feed(&wire);
+    while !matches!(conn.poll(), Ok(ClientEvent::ResponseEnd)) {}
+    assert!(!conn.is_reusable() && !conn.can_send());
+    assert_eq!(
+        conn.send_request(&get("/"), &mut Vec::new()),
+        Err(HttpError::UnexpectedData)
+    );
+}

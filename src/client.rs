@@ -122,9 +122,11 @@ impl core::fmt::Debug for ClientEvent<'_> {
 ///   borrowed, and nothing is allocated. Whitespace before the first field
 ///   is still refused.
 ///
-/// Bare LF, bare CR, `Content-Length` with `Transfer-Encoding`, and
-/// whitespace before a colon are never tolerated: they are how messages
-/// get framed differently by different hops.
+/// Bare LF, bare CR, `Content-Length` with `Transfer-Encoding` on a
+/// response that has a body, and whitespace before a colon are never
+/// tolerated: they are how messages get framed differently by different
+/// hops. A response with no body (`HEAD`, 1xx, 204, 304, 2xx to `CONNECT`)
+/// ends at its blank line whatever its framing fields say.
 ///
 /// # Examples
 ///
@@ -343,6 +345,9 @@ pub struct ClientConn {
     queue: [Queued; MAX_PIPELINE_DEPTH as usize],
     queue_start: usize,
     queued: usize,
+    /// The connection failed while a response was being read, so that
+    /// request stays unanswered: `outstanding()` still counts it.
+    response_failed: bool,
     leniency: ClientLeniency,
     /// Where the obs-fold rewrite stopped in the current response head.
     unfold: Unfold,
@@ -490,6 +495,7 @@ impl ClientConn {
             queue: [NO_QUEUED; MAX_PIPELINE_DEPTH as usize],
             queue_start: 0,
             queued: 0,
+            response_failed: false,
             leniency: ClientLeniency::new(),
             unfold: Unfold::new(),
         }
@@ -612,6 +618,9 @@ impl ClientConn {
     pub fn send_request(&mut self, request: &Request, out: &mut Vec<u8>) -> Result<(), HttpError> {
         if let Some(e) = request.error() {
             return Err(e);
+        }
+        if self.settled() {
+            self.state = State::Idle;
         }
         match self.state {
             State::Idle => {}
@@ -757,7 +766,8 @@ impl ClientConn {
         match self.state {
             State::Idle => 0,
             State::Head | State::Interim | State::Body => 1 + self.queued,
-            State::Complete | State::Closed | State::Upgraded => self.queued,
+            State::Complete | State::Upgraded => self.queued,
+            State::Closed => self.queued + usize::from(self.response_failed),
         }
     }
 
@@ -787,6 +797,7 @@ impl ClientConn {
     #[must_use]
     pub fn can_send(&self) -> bool {
         match self.state {
+            State::Complete if self.settled() => self.buf.unread().is_empty() && !self.buf.is_eof(),
             State::Idle => self.buf.unread().is_empty() && !self.buf.is_eof(),
             State::Closed | State::Upgraded => false,
             State::Head | State::Interim | State::Body | State::Complete => {
@@ -839,6 +850,7 @@ impl ClientConn {
         self.idempotent = true;
         self.queue_start = 0;
         self.queued = 0;
+        self.response_failed = false;
     }
 
     /// Gives the input buffer's storage back, for a pool.
@@ -1157,6 +1169,13 @@ impl ClientConn {
         self.keep_alive && self.info.keep_alive && self.req == ReqWrite::Sent && !self.body_refused
     }
 
+    /// The response ended, the connection stays open, and nothing else is
+    /// outstanding: only the `poll` that reports `Idle` is left, so the
+    /// connection already answers and sends as if it had run.
+    fn settled(&self) -> bool {
+        self.state == State::Complete && self.queued == 0 && self.reusable()
+    }
+
     fn poll_body(&mut self) -> Result<ClientEvent<'_>, HttpError> {
         let mut framing_bytes = 0;
         let step = self.decoder.step(
@@ -1187,6 +1206,7 @@ impl ClientConn {
     }
 
     fn fail(&mut self, e: HttpError) -> HttpError {
+        self.response_failed = matches!(self.state, State::Head | State::Interim | State::Body);
         self.state = State::Closed;
         e
     }
@@ -1199,8 +1219,10 @@ impl ClientConn {
         )
     }
 
-    /// The current response's head, from its arrival until the next request
-    /// is sent (still available after an upgrade).
+    /// The current response's head, from its arrival until the connection
+    /// moves on from it: the next `poll` after `ResponseEnd` or the next
+    /// [`send_request`](Self::send_request) (still available after an
+    /// upgrade).
     ///
     /// # Examples
     ///
@@ -1384,7 +1406,7 @@ impl ClientConn {
     pub fn is_reusable(&self) -> bool {
         match self.state {
             State::Idle => self.buf.unread().is_empty() && !self.buf.is_eof(),
-            State::Complete => self.reusable() && self.buf.unread().is_empty(),
+            State::Complete => self.settled() && self.buf.unread().is_empty(),
             _ => false,
         }
     }
@@ -1419,7 +1441,8 @@ impl ClientConn {
             State::Head if self.buf.from(self.buf.pin()).is_empty() => Progress::AwaitingResponse,
             State::Head | State::Interim => Progress::Head,
             State::Body => Progress::Body,
-            State::Complete if self.reusable() => Progress::Idle,
+            State::Complete if self.settled() => Progress::Idle,
+            State::Complete if self.reusable() => Progress::AwaitingResponse,
             State::Complete | State::Closed => Progress::Closed,
             State::Upgraded => Progress::Upgraded,
         }

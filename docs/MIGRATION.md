@@ -5,17 +5,60 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
-## 0.9.0 to 0.9.1
+## 0.9.1 to 0.9.2
 
 Fixes only; no signature changes. Three behaviours can be noticed.
+
+### An error answer to `HEAD` has no content, in the head too
+
+**What changed.** Once a `HEAD` request line has been read, any error
+response is an answer to `HEAD`, also when the failure comes later in the
+head (an invalid `Content-Length`, no `Host`). The blocking adapter's
+`408` to a `HEAD` whose head never finished has no content either. A
+request line over its budget was never read, and is answered as before.
+
+**Why.** RFC 9110 section 9.3.2; 0.9.1 covered a failure in the body only.
+
+**What to do.** Nothing.
+
+### `outstanding()` counts the response that failed
+
+**What changed.** When a response fails partway (a parse error, the peer
+closing mid-response), `ClientConn::outstanding()` counts that request as
+well as those queued behind it. A clean close is unchanged.
+
+**Why.** The documented use is to retry that many requests on a new
+connection; one was being dropped.
+
+**What to do.** Nothing if you retry from the count. If you added one to
+work around this, stop.
+
+### The connection is reusable at `ResponseEnd`
+
+**What changed.** When a response ends, the connection stays open, and
+nothing else is outstanding, `send_request` accepts any request without a
+further `poll`, and `can_send()` says so. With a pipelined request still
+outstanding, `is_reusable()` is false and `progress()` is
+`AwaitingResponse` (it was `Idle`).
+
+**Why.** `is_reusable()` said yes while `send_request` refused anything
+but a pipelined idempotent request, and `Idle` stopped a driver's response
+deadline with a request outstanding.
+
+**What to do.** Nothing. A driver that polls to `Idle` first still works.
+
+## 0.9.0 to 0.9.1
+
+Fixes only; no signature changes. Four behaviours can be noticed.
 
 ### An error answer to `HEAD` has no content
 
 **What changed.** When a `HEAD` request fails in its body (a bad chunk,
 the peer closing mid-body), the one error response `respond` writes is an
 answer to `HEAD`: the head of `Response::from_error`, without the error
-text. The blocking adapter's `408` to a `HEAD` likewise has no content.
-A failure in the head (no request line known yet) is answered as before.
+text. The blocking adapter's `408` to a `HEAD` likewise has no content
+once its head is complete. A failure in the head is answered as before
+(until 0.9.2).
 
 **Why.** RFC 9110 section 9.3.2: a response to `HEAD` carries no content.
 A front end that reused the connection would have read the text as the
@@ -50,9 +93,24 @@ redaction sees (T-35).
 **What to do.** Log the bytes yourself if you need them; the fields and
 accessors are unchanged.
 
+### `blocking::Server::serve` waits on persistent accept errors
+
+**What changed.** After more than 1,000 accept errors in a row, `serve`
+stops live connections and waits for them before it returns the error, as
+it does on shutdown. It returned at once before.
+
+**Why.** Connection threads kept running after `serve` had returned.
+
+**What to do.** Nothing, unless you relied on `serve` returning before
+those connections finished.
+
 ## 0.8 to 0.9
 
-0.9 freezes the API as the 1.0 candidate. One change can be noticed.
+0.9 freezes the API as the 1.0 candidate. One change needs a code change;
+the fixes in the changelog's 0.9.0 **Fixed** section can also be noticed:
+`Debug` of `ResponseHeadRef` and `blocking::Connection`, `progress()`
+reporting `Idle` where it reported `Closed`, a missed request deadline
+being `TimedOut` on Unix, and two `Display` texts.
 
 ### `blocking::Upgraded` is `#[non_exhaustive]`
 

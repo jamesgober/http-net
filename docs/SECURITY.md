@@ -179,9 +179,11 @@ and byte by byte, every budget at its minimum and maximum `Limits`,
 the `u32` offsets and the `u64` totals at their extremes, the state
 invariants I-S1 to I-S5, client framing of `HEAD`, 204, 304, 1xx, and
 `CONNECT`, outgoing injection through every builder, redaction in every
-`Debug`, and the bounds of the blocking adapter, and added five
+`Debug`, and the bounds of the blocking adapter. It ran five
 split-invariance properties for paths without one (200,000 cases each,
-all green). It found three defects, fixed in 0.9.1 with regression tests:
+all green), which stay in the suite as `tests/prop_split.rs` at 4,096
+cases per run with the budget checks. It found three defects, fixed in
+0.9.1 with regression tests:
 
 - An error answer to a `HEAD` that failed in its body (a bad chunk, EOF
   mid-body) was written as a `GET` answer, with the error text as content
@@ -205,6 +207,21 @@ carry content the caller gives it (framing stays explicit, and
 `status_allows_body` describes framing, which RFC 9112 section 6.3 gives a
 205); `commit(n)` clamps an over-long `n` (now documented); a lowercase
 `head` is not `HEAD` (methods are case-sensitive).
+
+The documentation audit that followed, on 0.9.1, found three more, fixed
+in 0.9.2 with tests; none is a smuggling, desync, panic, or memory defect
+(D-75):
+
+- `HEAD` errors in the head: the 0.9.1 fix covered a failure in the body
+  only, so a `HEAD` refused later in its head (an invalid
+  `Content-Length`, no `Host`) still got the error text as content, and
+  so did a `408` to a `HEAD` whose head never finished. The answer now
+  follows the request line as soon as it has been read.
+- `ClientConn::outstanding()` left out the request whose response failed,
+  so a driver retrying from the count dropped one idempotent request.
+- At `ResponseEnd`, `is_reusable()`, `can_send()`, and `progress()` could
+  disagree with `send_request`, which refused what they allowed until the
+  next `poll`.
 
 ## Where http-net is stricter than the RFCs
 
