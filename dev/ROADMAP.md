@@ -214,7 +214,7 @@ Exit criteria:
 - [x] HTTP Garden as a manually triggered CI job (D-68); the first run (after the 0.9.0 merge, 679 cases) found no defect (D-70).
 - [x] The 0.8 and 0.9 defence ideas evaluated (both rejected, D-64, D-65).
 
-### 0.9.x polish pass (0.9.1, 2026-10-29)
+### 0.9.x polish pass (0.9.1, 2026-11-02)
 
 Before 1.0, every accepted gap, deferred item, known issue, and missed
 target was revisited, performance measured again, and the security review

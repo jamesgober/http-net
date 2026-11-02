@@ -13,7 +13,7 @@
 
 ---
 
-## [0.9.1] - 2026-10-29
+## [0.9.1] - 2026-11-02
 
 Fixes from the 0.9.x polish pass: a second, independent security review
 of the frozen code, a performance pass against every release since 0.6
