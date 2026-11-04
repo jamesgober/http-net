@@ -180,7 +180,7 @@ Exit criteria:
 ## v0.6.0 - Optimisation (DONE, 2026-10-22)
 - [x] `ServerConn::respond_head_only` (head-only write for vectored sends).
 - [x] The hot-spot plan, each item measured: a precomputed status-line table and one-pass fast paths for the common field and chunk lines kept; 16-byte SWAR steps, the combined whole-line pass, and length-first matching measured slower and dropped (`dev/PLAN.md` D-45 to D-53); the `Date` cache shipped in 0.4.
-- [x] Comparison repository [`http-net-bench`](https://github.com/jamesgober/http-net-bench) (H1 to H5 against httparse and hyper in memory; picohttpparser, llhttp, and H6 not run yet); `docs/PERFORMANCE.md`.
+- [x] Comparison repository [`http-net-bench`](https://github.com/jamesgober/http-net-bench) (H1 to H5 against httparse and hyper in memory; picohttpparser, llhttp, and H6 added in the 0.9.x pass); `docs/PERFORMANCE.md`.
 
 Exit criteria:
 - [x] Performance targets met on Linux x86_64, or the SIMD decision (OD-8) taken with the measured gap: SWAR kept, at parity with httparse (D-54).
@@ -230,7 +230,9 @@ repeated. Fixes ship as 0.9.x patches; what stays open is in
 - [x] Documentation audit repeated on 0.9.1: three code defects fixed in 0.9.2 (`outstanding()` after a failed response, the reuse queries at `ResponseEnd`, `HEAD` errors in the head), 18 documentation corrections, and the review's properties committed as `tests/prop_split.rs` (D-75).
 - [x] aarch64 measured on CI runners (`docs/PERFORMANCE.md`).
 - [x] Consumers run again against the 0.9.2 code: `ls-studio` 42 of 42; serve-net's suite passes (its `tests/loopback.rs` run serially: run in parallel on a loaded machine, a random few fail to start a server, on published 0.9.1 as well).
-- [ ] Still open (not code, or not this repository): the third consumer (D-62); H6, picohttpparser, and llhttp in `http-net-bench`; a quiet-machine H1 run; the support window and report channel (James).
+- [x] HTTP Garden run a third time, on the 0.9.2 code: the same 156 differences, no case changed (D-70).
+- [x] Quiet-machine competitor run in `http-net-bench` (2026-11-04), with picohttpparser, llhttp, and H6 over sockets through serve-net added: H1 13% behind httparse's scalar build (was 16%) and 8 to 12% behind picohttpparser, 4% ahead of llhttp on pipelined requests, serve-net level with hyper on one connection and 13% behind at 16 (D-76, `docs/PERFORMANCE.md`).
+- [ ] Still open (not code, or not this repository): the third consumer (D-62); the support window and report channel (James).
 
 Exit criteria:
 - [ ] Two consecutive weeks without an API change, counted from 0.9.0 (D-66).

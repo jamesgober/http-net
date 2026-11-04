@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- `docs/PERFORMANCE.md`: the competitor comparison measured again on a
+  quiet machine, with picohttpparser, llhttp, and H6 over sockets added
+  (D-76).
+- `docs/SECURITY.md`: the HTTP Garden on the 0.9.2 code, the same result
+  as its earlier runs.
+
 ---
 
 ## [0.9.2] - 2026-11-02

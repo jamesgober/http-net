@@ -167,7 +167,10 @@ many (one in the run above).
 The Garden ran again on the 0.9.1 code (2026-10-29, the same Garden
 commit, seeds, and mutation seed): the same 679 cases, the same 156
 differences, no case whose result changed, and still no quirk recorded
-for http-net.
+for http-net. A third run on the 0.9.2 code (2026-11-03, run 41614602286,
+the same Garden commit and seeds) gave the same 156 differences again,
+with no case changed: the 0.9.2 change to error answers for `HEAD` moves
+no Garden case.
 
 ## Review record (0.9.1)
 

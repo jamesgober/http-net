@@ -105,27 +105,61 @@ CL and TE conflict, TE in HTTP/1.0, body budget, keep-alive, `Host` count
 and value, upgrade, `Expect`, target escapes), because it is only a parser.
 hyper is driven in memory over a duplex stream on a current-thread
 runtime; the cost of moving the same bytes through that runtime with no
-HTTP is measured separately.
+HTTP is measured separately. picohttpparser gets the same framing pass as
+httparse, and llhttp's callbacks do a server's reading and answer each
+request. H6 runs whole servers over sockets, with serve-net carrying
+http-net.
 
-Linux x86_64 (WSL2), medians of three rounds, http-net 0.6.0 (working
-tree), httparse 1.10.1, hyper 1.12.0:
+Linux x86_64 (WSL2), a quiet machine (no fuzzers; load average 0.2 at the
+start, 2.7 at the end), pinned to one core, 2026-11-04: http-net 0.9.0,
+httparse 1.10.1, hyper 1.12.0, picohttpparser `dd573d8`, llhttp 9.4.3
+([`http-net-bench`](https://github.com/jamesgober/http-net-bench), results
+`2026-11-04-fb4f3084276c`). H1 is from a second H1-only run straight after
+the full run, four passes in which http-net read 172 to 174 ns: the
+results file's drift check caught the full run's first H1 pass running 5
+to 9% slow.
 
 | Id | Workload | http-net | Competitor | |
 |---|---|---:|---:|---|
-| H1 | request head and framing, 12 fields | 177 ns | httparse with SIMD 172 ns; without SIMD 153 ns; parse only 104 to 114 ns | parity with SIMD, 16% behind without |
-| H2 | full server exchange, five fields and 1 KiB body | 250 ns (prebuilt `Response`), 406 ns (built per request) | hyper 1,382 ns (of which about 310 ns is the runtime) | 3.4 to 5.5x faster |
-| H3 | response head and framing | 50 ns | httparse 46 to 49 ns | parity to 8% behind |
-| H3 | full client exchange | 95 ns | hyper 1,239 ns (about 300 ns runtime) | 13x faster |
-| H4 | chunked framing of 1 MiB, data in place | 1.69 µs | httparse `parse_chunk_size` loop 1.22 µs | 38% behind |
-| H4 | the same with the body copied out | 17.5 µs | 17.1 µs | parity |
-| H5 | 100,000 pipelined requests | 7.32 ms | hyper with `pipeline_flush` 23.6 ms | 3.2x faster |
+| H1 | request head and framing, 12 fields | 173 ns | httparse with SIMD 169 to 176 ns; without SIMD 153 ns; parse only 99 to 114 ns. picohttpparser with the same pass 155 to 160 ns, parse only 98 to 111 ns | parity with httparse SIMD, 13% behind without; 8 to 12% behind picohttpparser |
+| H2 | full server exchange, five fields and 1 KiB body | 244 ns (prebuilt `Response`), 437 ns (built per request) | hyper 1,313 ns (of which about 294 ns is the runtime) | 3.0 to 5.4x faster |
+| H3 | response head and framing | 49 to 50 ns | httparse 45 to 52 ns | parity |
+| H3 | full client exchange | 94 ns | hyper 1,230 to 1,239 ns (about 280 ns runtime) | 13x faster |
+| H4 | chunked framing of 1 MiB, data in place | 1.63 µs | httparse `parse_chunk_size` loop 1.17 µs | 39% behind |
+| H4 | the same with the body copied out | 16.8 µs | httparse loop 16.4 µs; picohttpparser `phr_decode_chunked` (in place, one move of every byte) 10.6 µs | parity with httparse; 58% behind picohttpparser |
+| H5 | 100,000 pipelined requests | 7.12 ms | hyper with `pipeline_flush` 22.6 ms; llhttp answering each request 7.39 ms, counting only 5.69 ms | 3.2x faster than hyper; 4% ahead of llhttp doing the same work |
+| H6 | plaintext over 127.0.0.1, one core, 16 connections, 16 pipelined | serve-net 373k req/s | hyper 429k, actix-web 384k, may-minihttp 530k | 13% behind hyper |
+| H6 | the same on 1 connection, 16 pipelined | serve-net 168k req/s | hyper 164k, actix-web 153k, may-minihttp 184k | level with hyper |
 
-httparse's SIMD path is slower than its own scalar path on this head: its
+H1, the picohttpparser and llhttp rows, and H6 are report only.
+picohttpparser rows are compared within one build: the same C code moves
+up to 12% between the bench's two builds (fat LTO lays out the Rust
+around it anew), while http-net does not move. The 0.6.0 run had H1 at
+177 ns, 16% behind httparse's scalar build; the frozen code is level with
+it within noise.
+
+httparse's SIMD path is slower than its own scalar path on this head, and
+picohttpparser's SSE4.2 build gains at most 4% over its scalar build: the
 lines are short (about 30 bytes), and SIMD setup does not pay off below a
-few dozen bytes per line. H6 (plaintext over sockets) is not measured
-yet; it will run through serve-net;
-the C harnesses the specification lists as report-only (picohttpparser,
-llhttp) are not run.
+few dozen bytes per line. Against the C parsers, http-net is 8 to 12%
+behind picohttpparser on a head (both deciding framing with the same
+rules), and 4% ahead of llhttp on pipelined requests when llhttp's
+callbacks do a server's reading and answer each one; llhttp's own
+benchmark shape, one counting callback, is 25% faster than http-net doing
+the full work. picohttpparser's chunked decoder is 58% faster than
+http-net's with the body copied out, because it moves each byte once, in
+place.
+
+H6 times whole servers on one core, so it reads as what serve-net does,
+not http-net alone. serve-net 0.3 runs on net-io 0.3's blocking driver:
+one thread per connection. On one connection it is level with hyper; at
+16 connections the core switches threads on every batch, and serve-net
+is 13% behind hyper, 3% behind actix-web, and 30% behind may-minihttp.
+Each server used about 93% of its core at 16 connections, and about half
+of it on one connection, where the client's turnaround sets the rate.
+http-net's own exchange (H2) is 244 ns, about a tenth of the 2.7 µs
+serve-net spends per request at 373k req/s; a non-blocking driver in
+net-io is where that gap would close.
 
 ### What the comparison means
 
@@ -133,11 +167,15 @@ llhttp) are not run.
   http-net is three to thirteen times faster than hyper, most of which is
   hyper's own HTTP work, not its runtime.
 - **On parsing a head alone** (H1, H3 head), http-net is level with
-  httparse, while doing more: it validates the `Host` value, the target's
+  httparse and 8 to 12% behind picohttpparser, while doing more: it validates the `Host` value, the target's
   characters and escapes, every field value byte, and the framing rules
   above, all included in its time, and it does so without `unsafe` code.
 - **On chunk framing alone** (H4, in place), httparse's minimal loop is
-  faster; once the body bytes are moved, the two are level.
+  faster; once the body bytes are moved, the two are level, and
+  picohttpparser's in-place decoder is faster than both.
+- **Over sockets** (H6), the server around http-net sets the rate:
+  serve-net on a blocking, thread-per-connection driver is level with
+  hyper on one connection and 13% behind at 16.
 
 ### Decisions
 
@@ -146,9 +184,9 @@ llhttp) are not run.
   SIMD path on H1. They are at parity, and httparse's own scalar path is
   faster than its SIMD path on this workload.
 - **20% faster than the best competitor at equal or stronger security:
-  met on the full exchanges (H2: 3.4x; H5: 3.2x), not met on head parsing
-  (H1: parity with httparse's default configuration, 16% behind its scalar
-  build).** The cause is the extra validation listed
+  met on the full exchanges (H2: 3.0x; H5: 3.2x), not met on head parsing
+  (H1: parity with httparse's default configuration, 13% behind its scalar
+  build, 8 to 12% behind picohttpparser).** The cause is the extra validation listed
   above, which the comparison counts in http-net's time but which httparse
   leaves to its caller. Reaching 20% ahead on H1 would need SIMD scanning
   with `unsafe` intrinsics or dropping checks; neither is
@@ -202,6 +240,8 @@ against the 0.6 run, so only the ratios are reported; they are those of
 | H4 chunked framing, data in place | 40% behind httparse's `parse_chunk_size` loop |
 | H4 the same with the body copied out | 9% ahead |
 | H5 100,000 pipelined requests | 3.0x faster than hyper |
+
+The quiet-machine run of 2026-11-04 above replaces these figures.
 
 **aarch64.** `.github/workflows/bench.yml` runs `cargo bench` on GitHub's
 Linux arm64 and macOS runners on demand. Shared runners are noisy, so
