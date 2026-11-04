@@ -167,9 +167,12 @@ gate and CI green on every platform and the MSRV), and James approves.
   the unmet targets decomposed in `docs/PERFORMANCE.md` (the response-write
   benches include reading the request; `write_head` validates each
   borrowed field per call).
-- **Status:** done for the frozen code; the H1 comparison is rerun on a
-  quiet machine before 1.0 (the 0.9.x run shared the machine with
-  fuzzers, so only its ratios are used).
+- A quiet-machine competitor run (2026-11-04, D-76) replaced the loaded
+  one and added picohttpparser, llhttp, and H6 over sockets: H1 at parity
+  with httparse with SIMD, 13% behind its scalar build, 8 to 12% behind
+  picohttpparser; 4% ahead of llhttp on pipelined requests doing the same
+  work; serve-net level with hyper on one connection, 13% behind at 16.
+- **Status:** done.
 
 ### Security
 
@@ -187,7 +190,8 @@ gate and CI green on every platform and the MSRV), and James approves.
   closes, and body bytes in `Debug`, all fixed in 0.9.1 with tests.
   Every fuzz target ran again for 15 minutes on the 0.9.1 code with no
   finding in the crate (one overflow in a test oracle, fixed, D-74), and
-  the HTTP Garden ran again with the same result as its first run.
+  the HTTP Garden ran again with the same result as its first run, on
+  the 0.9.1 code and again on the 0.9.2 code.
 - **Status:** done.
 
 ### Parity with other implementations
@@ -225,14 +229,12 @@ Everything else in the audit above is done.
 - The 1.0 go or no-go itself, no earlier than 2026-11-12 (two weeks after
   0.9.0 with no API change, D-66).
 
-**Engineering, before the 1.0 tag** (no API effect):
-
-- An H1 competitor run on a quiet machine (D-72).
-- H6 (plaintext over sockets, through serve-net) and the report-only C
-  harnesses (picohttpparser, llhttp) in `http-net-bench`; the
-  specification lists them, none is run yet.
+**Engineering, before the 1.0 tag:** none left. The quiet-machine H1
+run, H6, and the picohttpparser and llhttp harnesses ran on 2026-11-04
+(D-76).
 
 **Targets not met, with the decision on record** (`docs/PERFORMANCE.md`):
 the latency targets for the browser GET, pipelined requests, the 1 MiB
 bodies, the response write, `write_head`, and the client parse; and 20%
-ahead of httparse on head parsing (D-54: parity, kept safe).
+ahead of httparse on head parsing (D-54: parity, kept safe; 8 to 12%
+behind picohttpparser, D-76).
