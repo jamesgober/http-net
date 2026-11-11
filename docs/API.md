@@ -376,9 +376,15 @@ then `Upgraded`.
 
 ### Credentials in `Debug` output
 
-From 0.3, every `Debug` implementation in the crate replaces the values of
-`authorization`, `proxy-authorization`, `cookie`, and `set-cookie` with
-`<redacted N bytes>` (the length only). This covers [`RequestHead`](#requesthead),
+From 0.3, every `Debug` implementation in the crate replaces the value of a
+credential field with `<redacted N bytes>` (the length only). From 0.10 a
+credential field is `authorization`, `proxy-authorization`, `cookie`,
+`set-cookie`, or any field whose name contains `auth`, `cookie`, `token`,
+`secret`, `key`, `session`, `password`, `passwd`, `csrf`, `xsrf`,
+`signature`, or `credential` (so `x-api-key`, `x-auth-token`,
+`x-csrf-token`, and `x-session-id` too), and the query of a request
+target prints as its length (`/cb?<redacted 19 bytes>`), since it often
+carries a token or a signature. This covers [`RequestHead`](#requesthead),
 [`ResponseHead`](#responsehead), [`Headers`](#headers), the events that
 carry them, [`Request`](#request), [`Response`](#response),
 [`ResponseHeadRef`](#output-and-the-borrowed-writer), and
@@ -389,11 +395,11 @@ a bearer token. Body bytes print as their length too, since a body can
 carry credentials no field list sees: `ServerEvent::Body`,
 `ClientEvent::Body`, `blocking::Incoming`, and the leftover bytes of
 `blocking::Upgraded` (0.9.1; before, those printed the bytes).
-Field names are matched ASCII case-insensitively. The accessors
-(`header`, `headers`, `header_value`) still return the real bytes. The list
-is fixed; a caller-extensible list (for custom credential fields such as
-an API key header) is not provided. `Display` of an error never includes
-input bytes at all.
+Field names are matched ASCII case-insensitively. Other field values and
+the path print as received. The accessors (`header`, `headers`,
+`header_value`, `target`) still return the real bytes. The list is fixed;
+a field whose name matches none of these parts and carries a secret
+prints in full. `Display` of an error never includes input bytes at all.
 
 ```rust
 use http_net::{ServerConn, ServerEvent};
@@ -712,6 +718,21 @@ The server side of one HTTP/1.1 connection: a sans-IO state machine.
 field index are reused across requests (proven by a counting-allocator
 test). The buffer grows lazily from 4 KiB up to
 [`buffer_capacity`](#limitsbuffer_capacity); `new` allocates nothing.
+
+Which call writes what:
+
+| To send | Call | Tier |
+|---|---|---|
+| a whole response (full body, or none) | `respond` | 1 |
+| the same with a `date` field from a `DateCache` | `respond_with_date` | 2 |
+| a response whose body comes in pieces | `respond` with `Response::chunked` or `content_length`, then `send_body` and `end_body` (or `end_body_with_trailers`) | 2 |
+| a large full body without copying it into `out` | `respond_head_only`, then write `Response::body_bytes` yourself | 2 |
+| `100 Continue` before reading the body | `send_continue` | 2 |
+| `103 Early Hints` or another 1xx | `send_informational` | 2 |
+| borrowed fields into your own output type, allocating nothing | `ResponseHeadRef::respond_into`, `send_body_into`, `end_body_into` | 3 |
+
+A response built per request allocates its fields; a driver that answers
+many requests can keep one `Response` and `clear` it each time.
 
 | Method | Signature | Ships |
 |---|---|---|
@@ -1121,8 +1142,10 @@ pub fn set_wipe(&mut self, wipe: bool)
   allocates again. The storage is dropped, not kept for `into_buffer`.
 - `set_wipe(true)` zeroes the bytes of every finished request (head, body,
   framing) before the buffer is reused, zeroes the stale copies compaction
-  leaves behind, and zeroes the whole buffer on `reset`, `into_buffer`, and
-  drop, so credentials do not linger between requests (threat T-36). It
+  leaves behind, zeroes the old block when the buffer grows (from 0.10;
+  before, growth freed it unwiped), and zeroes the whole buffer on `reset`,
+  `into_buffer`, and drop, so credentials do not linger between requests
+  (threat T-36). It
   costs a `memset` of each request's bytes, about 11 ns per KiB (measured,
   `docs/PERFORMANCE.md`), and no allocation.
 
@@ -1188,7 +1211,7 @@ pub enum ServerEvent<'a> {
 |---|---|---|---|
 | `Request` | A request head arrived, after the whole head. | Inspect it; answer `expects_continue()`; you may respond now (closing afterwards if body bytes are unread). | exists |
 | `Body` | A run of body bytes (chunked encoding removed), valid until the next `&mut` call. | Consume it. | exists |
-| `Trailers` | The request's trailer fields, just before `RequestEnd`; only with `set_report_trailers(true)` and a non-empty trailer section. They never change framing. | Read them. | 0.4 |
+| `Trailers` | The request's trailer fields, just before `RequestEnd`; only with `set_report_trailers(true)` and a non-empty trailer section. They never change framing; from 0.10 `content-length`, `transfer-encoding`, and `host` are dropped from them (RFC 9110 section 6.5.1), and a section of only those gives no event. | Read them. | 0.4; 0.10 |
 | `RequestEnd` | The request is complete. | Respond if you have not. | exists |
 | `NeedInput` | More input is needed. | Read and feed, or `feed_eof`. | exists |
 | `AwaitingResponse` | The request is done; its response is not. Pipelined input waits. | Finish the response. | exists |
@@ -1328,6 +1351,7 @@ assert_eq!(accept, [&b"text/html"[..], b"x/y;q=\"0.5,1\""]);
 | `is_upgrade()` | `bool` | HTTP/1.1, `Connection: upgrade`, and an `Upgrade` offering at least one protocol other than `h2c`. | exists; 0.3 |
 | `upgrade_protocols()` | `ListElements<'a, 'static>` | The offered protocols as product tokens, across every `Upgrade` line, `h2c` omitted; empty unless `is_upgrade()`. | 0.4 |
 | `connection_options()` | `ListElements<'a, 'static>` | The `Connection` field's options across every line, in order; compare ASCII case-insensitively; pass to [`is_hop_by_hop`](#is_hop_by_hop). | 0.5 |
+| `end_to_end_headers()` | `impl Iterator<Item = (&'a str, &'a [u8])>` | Every field except the hop-by-hop ones (the rule of [`is_hop_by_hop`](#is_hop_by_hop)), in order: what a proxy forwards. The options are read once, so it is linear in the head. `content-length`, `host`, and `proxy-authorization` are kept; a proxy rebuilds or drops them, as `Request::forward_from` does. | 0.10 |
 
 ```rust
 use http_net::{BodyFraming, ServerConn, ServerEvent};
@@ -1372,6 +1396,7 @@ A parsed response head borrowed from the client connection's buffer.
 | `content_length()` | `Option<u64>` | the raw parsed `Content-Length` (also for a `HEAD` response, whose `framing()` is `None`) | 0.3 |
 | `keep_alive()` | `bool` | whether the connection can carry another request after this response | exists |
 | `is_informational()` | `bool` | whether this is a 1xx head (as reported by `ClientEvent::Informational`) | 0.4 |
+| `end_to_end_headers()` | `impl Iterator<Item = (&'a str, &'a [u8])>` | Every field except the hop-by-hop ones (the `Connection`-listed names read from `header_list("connection")`), in order, linear in the head; `content-length` is kept, the next hop's framing is the proxy's to write. | 0.10 |
 
 ```rust
 use http_net::{ClientConn, ClientEvent, Request};
@@ -2048,7 +2073,7 @@ says HTTP/1.1.
 | `method(&self) -> &str`, `target(&self) -> &str` | | exists |
 | `body_bytes`, `header_value` | as for `Response` | exists |
 | `expect_continue(self) -> Request` | adds `expect: 100-continue` and makes the connection wait for `100` before the body; needs a streamed body (`content_length` or `chunked`) | 0.4 |
-| `forward_from(head: &RequestHead<'_>) -> Request` | a request for an upstream with the hop-by-hop fields removed (RFC 9110 section 7.6.1); see [below](#requestforward_from) | 0.5 |
+| `forward_from(head: &RequestHead<'_>) -> Request` | a request for an upstream with the hop-by-hop fields removed (RFC 9110 section 7.6.1), `host` written from the authority, `proxy-authorization` dropped; see [below](#requestforward_from) | 0.5; 0.10 |
 
 ```rust
 use http_net::Request;
@@ -2089,19 +2114,32 @@ keeps the method and the target as received, and every field except the
 hop-by-hop ones (RFC 9110 section 7.6.1: `connection`, `keep-alive`,
 `proxy-connection`, `te`, `transfer-encoding`, `upgrade`, `trailer`, and
 any name the head's `Connection` lists) in their original order.
-`content-length` is not copied: the body mode follows the head's framing
-(chunked stays chunked, a length stays that length; stream the body with
-`ClientConn::send_body`) and the connection writes the framing field
-itself. An absolute-form target stays absolute (origin servers accept it,
-RFC 9112 section 3.2.2); rebuild with `Request::new` for origin form. Add
-`via` and forwarding fields with `header`. Every name `Connection` lists
-is dropped, end-to-end names such as `authorization` or `x-forwarded-for`
-included, so a client can strip fields a proxy relies on: check
-`connection_options()` first if the next hop must see one (listing `host`
-drops it, and the request fails closed at send). **Errors** (at `send_request`):
-`InvalidState` for an upgrade request (tunnel it instead); the builders'
-errors, such as `MissingHost` for an HTTP/1.0 head without `Host`.
-**Ships:** 0.5.
+
+- `host` comes first and is written from `RequestHead::host()`, the
+  authority this proxy read: the absolute-form target's, else the `Host`
+  field's. The received `Host` is never copied (RFC 9112 section 3.2.2), so
+  the next hop sees the authority that was checked, and an HTTP/1.0
+  absolute-form request without `Host` can be forwarded (from 0.10).
+- `proxy-authorization` is dropped: it is this proxy's credential (RFC
+  9110 section 11.7.2). A proxy chain that relays it on purpose adds it
+  back with `header` (from 0.10).
+- `content-length` is not copied: the body mode follows the head's framing
+  (chunked stays chunked, a length stays that length; stream the body with
+  `ClientConn::send_body`) and the connection writes the framing field
+  itself.
+
+An absolute-form target stays absolute (origin servers accept it, RFC 9112
+section 3.2.2); rebuild with `Request::new` for origin form. Add `via` and
+forwarding fields with `header`. Every name `Connection` lists is dropped,
+end-to-end names such as `authorization` or `x-forwarded-for` included, so
+a client can strip fields a proxy relies on: check `connection_options()`
+first if the next hop must see one. The options are read once, so the copy
+is linear in the head however many fields and options a client sends
+(from 0.10; before, each field re-read every option). **Errors** (at
+`send_request`): `InvalidState` for an upgrade request (tunnel it
+instead); the builders' errors, such as `MissingHost` for an HTTP/1.0
+origin-form head without `Host`. **Ships:** 0.5; `host` and
+`proxy-authorization` rules and linear cost 0.10.
 
 ```rust
 use http_net::{ClientConn, Request, ServerConn, ServerEvent};
@@ -2113,7 +2151,7 @@ let forwarded = Request::forward_from(&head).header("via", "1.1 proxy");
 let mut upstream = ClientConn::new();
 let mut out = Vec::new();
 upstream.send_request(&forwarded, &mut out)?;
-assert_eq!(out, b"POST /api HTTP/1.1\r\nHost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
+assert_eq!(out, b"POST /api HTTP/1.1\r\nhost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
 # Ok::<(), http_net::HttpError>(())
 ```
 
@@ -2335,6 +2373,18 @@ allocations (outstanding requests are forgotten), adopt and return pooled
 storage, and free the buffer while no request is outstanding. **Ships:**
 0.5.
 
+`set_wipe(&mut self, wipe: bool)` works as on `ServerConn`: with `true`,
+each finished response (head, body, framing) is zeroed when the next
+request starts, and compaction leftovers, the old block on growth, and the
+whole buffer on `reset`, `into_buffer`, and drop are zeroed, so
+`set-cookie` values and tokens in bodies do not linger. Off by default.
+**Ships:** 0.10.
+
+```rust
+let mut conn = http_net::ClientConn::new();
+conn.set_wipe(true);
+```
+
 ### `ClientConn::set_leniency` and `ClientLeniency`
 
 ```rust,ignore
@@ -2385,6 +2435,7 @@ assert_eq!(resp.header("x-long"), Some(&b"one,   two"[..]));
 | `set_leniency(&mut self, leniency: ClientLeniency)` | opt-in tolerance: `obs_fold_in_responses` replaces each fold's CR LF with SP SP in place (RFC 9112 section 5.2 user-agent rule); bare LF, bare CR, CL with TE on a response that has a body, and whitespace before a colon are never tolerated | 0.5 |
 | `outstanding(&self) -> usize`, `can_send(&self) -> bool` | pipelining state (depth from `Limits::pipeline_depth`, idempotent requests only) | 0.5 |
 | `reset`, `with_buffer`, `into_buffer`, `shrink_idle` | as on `ServerConn` | 0.5 |
+| `set_wipe(&mut self, wipe: bool)` | as on `ServerConn`: finished responses zeroed | 0.10 |
 
 ## `ClientEvent`
 
@@ -2458,7 +2509,11 @@ Whether a field name is hop-by-hop for a message: the fixed set
 9110 section 7.6.1), ASCII case-insensitively. For a request pass
 `RequestHead::connection_options()`; for a response pass
 `ResponseHead::header_list("connection")` (a `ResponseHead` has no
-`connection_options`). **Ships:** 0.5.
+`connection_options`). It answers for one name and reads every option;
+to filter a whole head, use `end_to_end_headers()` on
+[`RequestHead`](#requesthead) or [`ResponseHead`](#responsehead), which
+reads the options once. Calling `is_hop_by_hop` for every field costs
+fields times options, both of which a client chooses. **Ships:** 0.5.
 
 ```rust
 use http_net::{ServerConn, ServerEvent, is_hop_by_hop};
@@ -2510,7 +2565,7 @@ decoder included.
 |---|---|---|
 | `Data { skip, len }` | `skip` framing bytes, then `len` bytes of body (never 0) | consume `skip + len`, call again with what follows |
 | `NeedMore { consumed }` | the framing so far is valid but incomplete | drop `consumed`, keep the rest, append input, call again |
-| `Trailers { skip, len }` | `skip` framing bytes, then a validated trailer section of `len` bytes (its field lines and the final CRLF); only for a section with at least one field | consume `skip + len`; the next call reports `Done { consumed: 0 }` |
+| `Trailers { skip, len }` | `skip` framing bytes, then a validated trailer section of `len` bytes (its field lines and the final CRLF); only for a section with at least one field. Validated, not filtered: it may name `content-length`, `transfer-encoding`, or `host` | consume `skip + len`; the next call reports `Done { consumed: 0 }`. Never relay the bytes as they are: re-emit the fields you keep with `end_body_with_trailers`, which refuses the names a trailer may not carry |
 | `Done { consumed }` | the body ends after `consumed` bytes; what follows is the next message | stop |
 
 `eof` says no more input will come: a body still open then fails with

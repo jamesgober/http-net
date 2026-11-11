@@ -232,7 +232,9 @@ fn test_client_trailers_reported_when_on_and_absent_when_off() {
 /// stream. With two GETs in flight, a `Content-Length: 50` in the first
 /// response's trailers is not applied to anything: the second response is
 /// framed by its own head, so the bodies are `z` then `ok`, with trailer
-/// reporting on or off and the input split at every byte.
+/// reporting on or off and the input split at every byte. The field itself
+/// is dropped from the trailer event (RFC 9110 section 6.5.1), so with
+/// reporting on there is no event at all.
 #[test]
 fn test_client_trailers_cannot_reframe_the_next_pipelined_response() {
     let wire: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\nContent-Length: 50\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -265,12 +267,10 @@ fn test_client_trailers_cannot_reframe_the_next_pipelined_response() {
                 }
             }
             assert_eq!(bodies, ["z", "ok"], "report {report}, cut {cut}");
-            let expected: Vec<(String, Vec<u8>)> = if report {
-                vec![("Content-Length".into(), b"50".to_vec())]
-            } else {
-                Vec::new()
-            };
-            assert_eq!(trailers, expected, "report {report}, cut {cut}");
+            assert!(
+                trailers.is_empty(),
+                "report {report}, cut {cut}: {trailers:?}"
+            );
             assert_eq!(conn.outstanding(), 0);
         }
     }
@@ -481,4 +481,48 @@ fn test_client_trailers_debug_redacts_credentials() {
             _ => {}
         }
     }
+}
+
+/// RFC 9110 section 6.5.1: `content-length`, `transfer-encoding`, and
+/// `host` in a trailer section are dropped from the trailer event, on the
+/// server and the client, so nothing downstream merges or relays them
+/// (0.10). Other fields are reported; a section of only those fields gives
+/// no event.
+#[test]
+fn test_trailers_drop_framing_and_routing_fields() {
+    let input = chunked_request(
+        b"Content-Length: 50\r\nDigest: sha-256=x\r\ntransfer-encoding: chunked\r\nHOST: evil\r\n",
+    );
+    let events = whole_and_bytewise(&input, Limits::new(), REPORT);
+    assert!(
+        events.contains(&Ev::Trailers(vec![(
+            "Digest".into(),
+            b"sha-256=x".to_vec()
+        )])),
+        "{events:?}"
+    );
+    let input = chunked_request(b"Content-Length: 50\r\nHost: evil\r\n");
+    let events = whole_and_bytewise(&input, Limits::new(), REPORT);
+    assert!(
+        !events.iter().any(|e| matches!(e, Ev::Trailers(_))),
+        "{events:?}"
+    );
+    assert!(events.contains(&Ev::End));
+
+    let mut conn = ClientConn::new();
+    conn.set_report_trailers(true);
+    conn.send_request(&Request::get("/").header("host", "a"), &mut Vec::new())
+        .unwrap();
+    let _ = conn.feed(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nHost: x\r\nX-Sum: 1\r\n\r\n",
+    );
+    let mut names = Vec::new();
+    loop {
+        match conn.poll().unwrap() {
+            ClientEvent::Trailers(t) => names.extend(t.map(|(n, _)| n.to_string())),
+            ClientEvent::ResponseEnd => break,
+            _ => {}
+        }
+    }
+    assert_eq!(names, ["X-Sum"]);
 }

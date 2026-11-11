@@ -251,6 +251,7 @@ thing, every public item in `docs/API.md` (D-77).
 - [x] The blocking time setters take a `Duration` or `None` (`Some(..)` still compiles).
 - [x] `From<HttpError> for std::io::Error`, so `?` works in an `io::Result` driver.
 - [x] The rest checked and kept, with the reasons (D-77); `docs/MIGRATION.md` shows each change.
+- [x] An independent review of 0.9.2: no defect in the core; the proxy helper made linear, `host` written from the authority, `proxy-authorization` dropped; the wipe covers buffer growth and the client; incoming trailers drop framing and routing names; wider `Debug` redaction; the blocking server documented for trusted networks; `parse-net` pinned (D-78, `docs/SECURITY.md` review record).
 
 ## v1.0.0 - Stable
 - [ ] The full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.

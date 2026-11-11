@@ -15,9 +15,9 @@
 
 ## [0.10.0] - 2026-11-11
 
-The simplicity audit before 1.0 (`dev/PLAN.md` D-77): four signature
-changes and one addition, no behaviour change. `docs/MIGRATION.md` shows
-each change.
+The simplicity audit before 1.0 (`dev/PLAN.md` D-77), and the fixes from
+an independent review of 0.9.2 (D-78). `docs/MIGRATION.md` shows each
+change.
 
 ### Changed
 
@@ -33,6 +33,18 @@ each change.
   value or `None` (`impl Into<Option<..>>`); `Some(..)` still compiles.
   They are no longer `const fn`.
 
+- `Request::forward_from` writes `host` from the authority the proxy
+  read (the absolute-form target's, else the `Host` field's) and never
+  copies the received `Host` (RFC 9112 section 3.2.2); it drops
+  `proxy-authorization` (RFC 9110 section 11.7.2).
+- Incoming trailer events drop `content-length`, `transfer-encoding`, and
+  `host` (RFC 9110 section 6.5.1); a section of only those gives no event.
+- `Debug` also redacts fields whose names mark a credential (`x-api-key`,
+  `x-auth-token`, `x-csrf-token`, `x-session-id`, and the like) and the
+  query of a request target.
+- `parse-net` is pinned to `=0.7.0`: its grammar decides what is accepted,
+  so a new one reaches users only through an http-net release.
+
 ### Removed
 
 - `Asked`.
@@ -42,6 +54,23 @@ each change.
 - `impl From<HttpError> for std::io::Error` (feature `std`), so `?` works
   in a function returning `std::io::Result`.
 - `blocking::Connection::with_limits`.
+- `RequestHead::end_to_end_headers` and `ResponseHead::end_to_end_headers`:
+  the fields a proxy forwards, linear in the head.
+- `ClientConn::set_wipe`, as on `ServerConn`.
+
+### Fixed
+
+- `Request::forward_from` cost fields times `Connection` options; one
+  request the default limits accept could take milliseconds of CPU to
+  forward. It is linear now.
+- With `set_wipe(true)`, growing the input buffer freed the old block
+  without zeroing it.
+
+### Documentation
+
+- The blocking server is for local, development, and trusted-network use;
+  internet-facing servers drive `ServerConn` from an event loop.
+- `ServerConn` lists which call writes what.
 
 ### Documentation
 

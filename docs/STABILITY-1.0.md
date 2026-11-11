@@ -202,6 +202,10 @@ gate and CI green on every platform and the MSRV), and James approves.
   finding in the crate (one overflow in a test oracle, fixed, D-74), and
   the HTTP Garden ran again with the same result as its first run, on
   the 0.9.1 code and again on the 0.9.2 code.
+- A third, independent review, of 0.9.2 (D-78), found no defect in the
+  parser or framing core; its proxy, wipe, and adapter findings are fixed
+  in 0.10.0 with regression tests (`docs/SECURITY.md`, review record
+  0.10.0; threats T-43 to T-45).
 - **Status:** done.
 
 ### Parity with other implementations

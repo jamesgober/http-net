@@ -8,7 +8,7 @@ use crate::{
     error::HttpError,
     head::{
         Asked, HeadKind, HeadScanner, Headers, ResponseHead, ResponseInfo, Scan,
-        interpret_response, switches_to_offered,
+        drop_forbidden_trailers, interpret_response, switches_to_offered,
     },
     limits::{Limits, MAX_PIPELINE_DEPTH},
     message::{OutBody, Request, check_trailers, push_last_chunk_with_trailers},
@@ -666,6 +666,7 @@ impl ClientConn {
         self.req_chunked = matches!(request.body, OutBody::Chunked);
         self.waiting_continue = request.expect_continue;
         self.body_refused = false;
+        self.buf.wipe_consumed();
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
@@ -728,6 +729,7 @@ impl ClientConn {
         self.req_chunked = false;
         self.waiting_continue = false;
         self.body_refused = false;
+        self.buf.wipe_consumed();
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
@@ -1159,6 +1161,7 @@ impl ClientConn {
 
     /// Drops the current (interim) head and waits for the next one.
     fn next_head(&mut self) {
+        self.buf.wipe_consumed();
         self.buf.unpin();
         self.buf.pin_at_pos();
         self.scanner.reset();
@@ -1193,10 +1196,17 @@ impl ClientConn {
                 self.buf.consume(n);
                 Ok(ClientEvent::Body(self.buf.range(start, start + n)))
             }
-            Step::Trailers => Ok(ClientEvent::Trailers(Headers::new(
-                self.buf.unread(),
-                &self.trailers.fields,
-            ))),
+            Step::Trailers => {
+                drop_forbidden_trailers(self.buf.unread(), &mut self.trailers.fields);
+                if self.trailers.fields.is_empty() {
+                    // Nothing left to report: the next step ends the body.
+                    return self.poll_body();
+                }
+                Ok(ClientEvent::Trailers(Headers::new(
+                    self.buf.unread(),
+                    &self.trailers.fields,
+                )))
+            }
             Step::Done => {
                 self.state = State::Complete;
                 Ok(ClientEvent::ResponseEnd)
@@ -1330,6 +1340,24 @@ impl ClientConn {
         self.report_trailers = report;
     }
 
+    /// When `true`, the bytes of every finished response (head, body, and
+    /// framing) are zeroed before the buffer is reused, stale copies left by
+    /// compaction and growth are zeroed, and the whole buffer is zeroed on
+    /// [`reset`](Self::reset), [`into_buffer`](Self::into_buffer), and drop,
+    /// so `set-cookie` values and tokens in bodies do not linger in memory.
+    /// Costs a `memset` of each response's bytes. Off by default; the same
+    /// as [`ServerConn::set_wipe`](crate::ServerConn::set_wipe).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut conn = http_net::ClientConn::new();
+    /// conn.set_wipe(true);
+    /// ```
+    pub fn set_wipe(&mut self, wipe: bool) {
+        self.buf.set_wipe(wipe);
+    }
+
     /// Sets the opt-in tolerances for responses (see [`ClientLeniency`]);
     /// the default is strict. Takes effect from the next response head.
     ///
@@ -1451,6 +1479,26 @@ impl ClientConn {
 
 #[cfg(test)]
 mod tests {
+    /// With wiping on, the bytes of a finished response are zeroed when the
+    /// next request starts, so they do not wait in the buffer for the
+    /// connection to end (0.10).
+    #[test]
+    fn test_set_wipe_zeroes_a_finished_response_at_the_next_request() {
+        use crate::{Limits, Request};
+        for wipe in [true, false] {
+            let mut conn = ClientConn::with_limits(Limits::new());
+            conn.set_wipe(wipe);
+            let get = Request::get("/").header("host", "a");
+            conn.send_request(&get, &mut Vec::new()).unwrap();
+            let _ = conn
+                .feed(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=SECRET\r\nContent-Length: 2\r\n\r\nok");
+            while !matches!(conn.poll(), Ok(ClientEvent::ResponseEnd)) {}
+            conn.send_request(&get, &mut Vec::new()).unwrap();
+            let held = conn.buf.range(0, 128).windows(6).any(|w| w == b"SECRET");
+            assert_eq!(held, !wipe, "wipe {wipe}");
+        }
+    }
+
     use super::*;
     use crate::head::BodyFraming;
 

@@ -218,7 +218,7 @@ fn test_forward_from_drops_exactly_the_hop_by_hop_fields() {
     ClientConn::new().send_request(&req, &mut out).unwrap();
     assert_eq!(
         out,
-        b"PUT /f HTTP/1.1\r\nHost: up\r\nAccept: */*\r\nX-End: 2\r\ntransfer-encoding: chunked\r\n\r\n"
+        b"PUT /f HTTP/1.1\r\nhost: up\r\nAccept: */*\r\nX-End: 2\r\ntransfer-encoding: chunked\r\n\r\n"
     );
 }
 
@@ -318,4 +318,68 @@ fn test_is_hop_by_hop_uses_every_connection_line() {
     assert!(is_hop_by_hop("b", head.connection_options()));
     assert!(!is_hop_by_hop("d", head.connection_options()));
     assert_eq!(head.connection_options().count(), 3);
+}
+
+/// RFC 9112 section 3.2.2: a proxy generates `Host` from an absolute-form
+/// target and never forwards the received one, so the next hop sees the
+/// authority `host()` returned (fixed in 0.10: the client's `Host` was
+/// copied, naming another virtual host than the one checked).
+#[test]
+fn test_forward_from_absolute_target_writes_host_from_the_authority() {
+    let (conn, req) =
+        received(b"GET http://public.test/admin HTTP/1.1\r\nHost: internal.test\r\n\r\n");
+    assert_eq!(conn.request().and_then(|r| r.host()), Some("public.test"));
+    let mut out = Vec::new();
+    ClientConn::new().send_request(&req, &mut out).unwrap();
+    assert_eq!(
+        out,
+        b"GET http://public.test/admin HTTP/1.1\r\nhost: public.test\r\n\r\n"
+    );
+    // HTTP/1.0 in absolute form needs no Host; the forwarded request gets
+    // one from the authority (it could not be sent before).
+    let (_, req) = received(b"GET http://a.test:8080/x HTTP/1.0\r\n\r\n");
+    let mut out = Vec::new();
+    ClientConn::new().send_request(&req, &mut out).unwrap();
+    assert!(out.starts_with(b"GET http://a.test:8080/x HTTP/1.1\r\nhost: a.test:8080\r\n"));
+    // Origin form: the Host value, once, whatever Connection lists.
+    let (_, req) = received(b"GET /x HTTP/1.1\r\nHost: app\r\nConnection: host\r\n\r\n");
+    let mut out = Vec::new();
+    ClientConn::new().send_request(&req, &mut out).unwrap();
+    assert_eq!(out, b"GET /x HTTP/1.1\r\nhost: app\r\n\r\n");
+}
+
+/// RFC 9110 section 11.7.2: `Proxy-Authorization` is this proxy's
+/// credential and is not relayed (fixed in 0.10); `Authorization` is the
+/// origin's and is.
+#[test]
+fn test_forward_from_drops_proxy_authorization() {
+    let (_, req) = received(
+        b"GET /x HTTP/1.1\r\nHost: a\r\nProxy-Authorization: Basic cHJveHk6c2VjcmV0\r\nAuthorization: Bearer t\r\n\r\n",
+    );
+    let mut out = Vec::new();
+    ClientConn::new().send_request(&req, &mut out).unwrap();
+    assert_eq!(
+        out,
+        b"GET /x HTTP/1.1\r\nhost: a\r\nAuthorization: Bearer t\r\n\r\n"
+    );
+}
+
+/// `end_to_end_headers` keeps what `is_hop_by_hop` says is end-to-end, in
+/// order, on requests and responses.
+#[test]
+fn test_end_to_end_headers_agree_with_is_hop_by_hop() {
+    let input = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: X-A, x-b\r\nX-A: 1\r\nTE: trailers\r\nX-B: 2\r\nX-C: 3\r\nConnection: Zed\r\nZed: 4\r\n\r\n";
+    let mut conn = ServerConn::new();
+    let _ = conn.feed(input);
+    let Ok(ServerEvent::Request(req)) = conn.poll() else {
+        panic!("request")
+    };
+    let kept: Vec<&str> = req.end_to_end_headers().map(|(n, _)| n).collect();
+    let expected: Vec<&str> = req
+        .headers()
+        .filter(|(n, _)| !is_hop_by_hop(n, req.connection_options()))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(kept, expected);
+    assert_eq!(kept, ["Host", "X-C"]);
 }

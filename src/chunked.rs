@@ -41,6 +41,13 @@ pub enum ChunkStep {
     /// (its field lines and the blank line), already validated; consume
     /// both, and the next call reports [`ChunkStep::Done`]. Only reported for
     /// a section that has at least one field.
+    ///
+    /// The bytes are validated, not filtered: a section may name
+    /// `content-length`, `transfer-encoding`, or `host`, which the
+    /// connections drop from their trailer events (RFC 9110 section 6.5.1).
+    /// A proxy must not relay these bytes as they are; re-emit the fields it
+    /// keeps with `end_body_with_trailers`, which refuses the names a
+    /// trailer may not carry.
     Trailers {
         /// Framing bytes before the section.
         skip: usize,

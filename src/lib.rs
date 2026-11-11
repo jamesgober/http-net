@@ -79,10 +79,15 @@
 //!
 //! ## Credentials in `Debug` output
 //!
-//! Every `Debug` implementation in the crate prints the values of
-//! `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` as
-//! `<redacted N bytes>`, so logging a request with `{:?}` never leaks a
-//! session cookie or a bearer token. The accessors return the real values.
+//! Every `Debug` implementation in the crate prints the value of a
+//! credential field as `<redacted N bytes>`: `authorization`,
+//! `proxy-authorization`, `cookie`, `set-cookie`, and any field whose name
+//! contains `auth`, `cookie`, `token`, `secret`, `key`, `session`,
+//! `password`, `passwd`, `csrf`, `xsrf`, `signature`, or `credential`
+//! (`x-api-key`, `x-auth-token`). A request target's query prints as its
+//! length. So logging a request with `{:?}` does not leak a session cookie,
+//! a bearer token, or a signed URL. Other field values print as received,
+//! and the accessors return the real values.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

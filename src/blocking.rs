@@ -8,6 +8,13 @@
 //! and limit enforcement happens in the sans-IO core.
 //!
 //! Only plain `http://` is spoken; there is no TLS in this crate.
+//!
+//! The server is for local, development, and trusted-network use. One
+//! thread serves each connection, up to the connection cap (64 by
+//! default), and the cap is the only admission control: a peer that holds
+//! that many slow connections keeps other clients waiting until the
+//! request timeout ends each one. An internet-facing server drives
+//! [`ServerConn`] from an event loop with per-peer limits (serve-net does).
 
 use std::{
     cell::Cell,
@@ -30,7 +37,7 @@ use crate::{
     BodyPlan, ClientConn, ClientEvent, DateCache, HttpDate, HttpError, Limits, Method, Progress,
     Request, RequestHead, Response, ServerConn, ServerEvent,
     message::OutBody,
-    redact::{FieldValue, serialized_fields},
+    redact::{FieldValue, Target, serialized_fields},
 };
 
 /// Bytes a closing connection reads and discards so the peer's unread data
@@ -420,7 +427,7 @@ impl fmt::Debug for Upgraded {
         f.debug_struct("Upgraded")
             .field("stream", &self.stream)
             .field("leftover", &format_args!("{} bytes", self.leftover.len()))
-            .field("target", &self.target)
+            .field("target", &Target(&self.target))
             .finish()
     }
 }
@@ -1951,6 +1958,23 @@ fn connect_any(
     timeout: Duration,
     deadline: Option<Instant>,
 ) -> Result<TcpStream, Error> {
+    let stream = first_connected(addrs, timeout, deadline, TcpStream::connect_timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+/// Tries each address in turn with `connect`, each attempt waiting at most
+/// `timeout` and what is left of `deadline`; the first success wins, and
+/// the last failure is the error. The connect function is a parameter so
+/// the fallback logic is tested without sockets.
+fn first_connected<S>(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    timeout: Duration,
+    deadline: Option<Instant>,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> io::Result<S>,
+) -> Result<S, Error> {
     let mut last = None;
     for addr in addrs {
         let wait = match deadline {
@@ -1963,13 +1987,8 @@ fn connect_any(
             }
             None => timeout,
         };
-        match TcpStream::connect_timeout(&addr, wait) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(timeout))?;
-                stream.set_write_timeout(Some(timeout))?;
-                stream.set_nodelay(true)?;
-                return Ok(stream);
-            }
+        match connect(&addr, wait) {
+            Ok(stream) => return Ok(stream),
             Err(e) => last = Some(e),
         }
     }
@@ -2283,24 +2302,80 @@ mod tests {
     }
 
     /// E-198: a name that resolves to several addresses is tried in order;
-    /// an address that refuses the connection does not end the attempt.
+    /// an address that refuses the connection does not end the attempt. The
+    /// fallback is tested with a scripted connect, so no port has to stay
+    /// closed (a freed ephemeral port can be taken again by another test or
+    /// process, which made a socket version of this test flaky).
     #[test]
-    fn test_connect_any_unreachable_first_address_tries_the_next() {
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
-        let refused = closed.local_addr().unwrap();
-        drop(closed);
-        let open = TcpListener::bind("127.0.0.1:0").unwrap();
-        let good = open.local_addr().unwrap();
-        let stream = connect_any([refused, good], Duration::from_secs(5), None).unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), good);
+    fn test_first_connected_refused_first_address_tries_the_next() {
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let mut tried = Vec::new();
+        let got = first_connected([a, b], Duration::from_secs(5), None, |addr, _| {
+            tried.push(*addr);
+            if *addr == a {
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            } else {
+                Ok(*addr)
+            }
+        });
+        assert_eq!(got.unwrap(), b);
+        assert_eq!(tried, [a, b]);
 
-        let err = connect_any([refused], Duration::from_secs(5), None).unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err}");
-        let err = connect_any(Vec::<SocketAddr>::new(), Duration::from_secs(5), None).unwrap_err();
+        let err = first_connected([a, b], Duration::from_secs(5), None, |addr, _| {
+            Err::<(), _>(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                addr.to_string(),
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.to_string() == b.to_string()),
+            "the last failure is reported: {err}"
+        );
+        let err = first_connected(
+            Vec::<SocketAddr>::new(),
+            Duration::from_secs(5),
+            None,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
             "{err}"
         );
+    }
+
+    /// Each attempt waits at most the timeout and what is left of the
+    /// deadline.
+    #[test]
+    fn test_first_connected_each_wait_is_capped_by_the_deadline() {
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut waits = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _ = first_connected([a, a], Duration::from_secs(5), Some(deadline), |_, wait| {
+            waits.push(wait);
+            Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused))
+        });
+        assert_eq!(waits, [Duration::from_secs(5), Duration::from_secs(5)]);
+        waits.clear();
+        let soon = Instant::now() + Duration::from_secs(2);
+        let _ = first_connected([a], Duration::from_secs(5), Some(soon), |_, wait| {
+            waits.push(wait);
+            Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused))
+        });
+        assert!(waits[0] <= Duration::from_secs(2), "{waits:?}");
+    }
+
+    /// The socket path: a live listener is reached and the stream gets its
+    /// timeouts.
+    #[test]
+    fn test_connect_any_reaches_a_listener() {
+        let open = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = open.local_addr().unwrap();
+        let stream = connect_any([good], Duration::from_secs(5), None).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert_eq!(stream.read_timeout().unwrap(), Some(Duration::from_secs(5)));
     }
 
     #[test]

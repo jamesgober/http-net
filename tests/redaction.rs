@@ -417,3 +417,31 @@ fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
         assert!(shown.contains("bytes"), "{shown}");
     }
 }
+
+/// Credential-like custom fields and the query print as lengths (widened
+/// in 0.10: `x-api-key`, `x-auth-token`, and an `access_token` query
+/// printed in full); other fields still print as received.
+#[test]
+fn test_debug_redacts_custom_credential_fields_and_the_query() {
+    let mut conn = ServerConn::new();
+    let wire = b"GET /cb?access_token=SECRET1 HTTP/1.1\r\nHost: a\r\nX-Api-Key: SECRET2\r\nX-Auth-Token: SECRET3\r\nX-Session-Id: SECRET4\r\nX-Request-Id: visible\r\n\r\n";
+    let _ = conn.feed(wire);
+    let shown = match conn.poll().unwrap() {
+        ServerEvent::Request(req) => format!("{req:?}"),
+        other => panic!("{other:?}"),
+    };
+    for s in ["SECRET1", "SECRET2", "SECRET3", "SECRET4"] {
+        assert!(!shown.contains(s), "{shown}");
+    }
+    assert!(shown.contains("\"/cb?<redacted 20 bytes>\""), "{shown}");
+    assert!(shown.contains("visible"), "{shown}");
+
+    let req = Request::get("/q?sig=SECRET5")
+        .header("host", "a")
+        .header("x-client-secret", "SECRET6");
+    let shown = format!("{req:?}");
+    assert!(
+        !shown.contains("SECRET5") && !shown.contains("SECRET6"),
+        "{shown}"
+    );
+}

@@ -7,9 +7,10 @@ section.
 
 ## 0.9.2 to 0.10.0
 
-The simplicity audit before 1.0 (`dev/PLAN.md` D-77). Four signature
-changes, each a compile error that points at the line to change, and one
-addition. No behaviour changes.
+The simplicity audit before 1.0 (`dev/PLAN.md` D-77) and the fixes from
+an independent review of 0.9.2 (D-78). Four signature changes, each a
+compile error that points at the line to change; four behaviour changes
+for proxies, trailer readers, and logs; and additions.
 
 ### `parse_response_head` takes the request's `Method`
 
@@ -65,10 +66,66 @@ limit off. They are no longer `const fn`.
 `Some`. Only a call in a `const` context breaks; build that value at run
 time.
 
+### `forward_from` writes `host` and drops `proxy-authorization`
+
+**What changed.** The forwarded request's first field is
+`host: <RequestHead::host()>`, the authority the proxy read; the received
+`Host` field is never copied, also when `Connection` lists it.
+`proxy-authorization` is not copied.
+
+**Why.** RFC 9112 section 3.2.2: a proxy generates `Host` from an
+absolute-form target. Copying it let a client name one authority in the
+target, which the proxy checked, and another in `Host`, which the next hop
+routed by. `Proxy-Authorization` is this proxy's credential (RFC 9110
+section 11.7.2).
+
+**What to do.** Nothing, unless you compare the forwarded bytes (the
+field is now `host` and first) or relay proxy credentials on purpose: add
+them back with `.header("proxy-authorization", ..)`.
+
+### Trailer events drop `content-length`, `transfer-encoding`, and `host`
+
+**What changed.** `ServerEvent::Trailers` and `ClientEvent::Trailers` no
+longer contain those three fields; a trailer section of only those gives
+no event. `ChunkedDecoder` still hands back the section's bytes as they
+are.
+
+**Why.** RFC 9110 section 6.5.1: they may not be trailers, and a
+recipient that merged or relayed them could reframe or reroute a message.
+
+**What to do.** Nothing. Do not relay `ChunkStep::Trailers` bytes as they
+are; re-emit the fields you keep with `end_body_with_trailers`.
+
+### `Debug` redacts more
+
+**What changed.** Fields whose names contain `auth`, `cookie`, `token`,
+`secret`, `key`, `session`, `password`, `passwd`, `csrf`, `xsrf`,
+`signature`, or `credential` print as `<redacted N bytes>`, and a request
+target's query prints as its length.
+
+**What to do.** Nothing, unless a log reader expected those values; read
+them with the accessors, which are unchanged.
+
+### `parse-net` is pinned
+
+**What changed.** The dependency is `parse-net = "=0.7.0"`.
+
+**What to do.** Nothing. Another crate in the build that needs a newer
+`parse-net` 0.7 release cannot share it until http-net moves.
+
 ### Added
 
 - `impl From<HttpError> for std::io::Error` (feature `std`), so `?`
   works in a function that returns `std::io::Result`.
+- `RequestHead::end_to_end_headers` and `ResponseHead::end_to_end_headers`,
+  the fields a proxy forwards, linear in the head. Prefer them to calling
+  `is_hop_by_hop` for every field, which costs fields times options.
+- `ClientConn::set_wipe`.
+
+### Fixed
+
+- `forward_from` is linear in the head.
+- With wiping on, a buffer that grows zeroes its old block.
 
 ## 0.9.1 to 0.9.2
 

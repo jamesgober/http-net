@@ -40,7 +40,7 @@ whether the attack test exists in this build.
 | T-10 | oversized chunk sizes wrapping | at most 16 hex digits, checked arithmetic, running total checked against `max_body` before data | `tests/smuggling.rs`, `tests/adversarial.rs` | a few instructions per chunk | tested |
 | T-11 | chunk-extension flood (CVE-2024-22019) | per-message extension budget = `max_header_bytes`; one chunk line at most `max_start_line` | `tests/adversarial.rs` (budget across the message; one line over the budget at every split; exactly the budget accepted, one more refused); `tests/alloc.rs` (10 MiB of extensions, 10 MiB of one chunk line) | one add per chunk | tested |
 | T-12 | chunk data longer than declared | CRLF required right after the data | `tests/smuggling.rs`, `tests/adversarial.rs`, `tests/rfc_cases.rs` | none | tested |
-| T-13 | trailer fields reframing a message | trailers validated and never merged; framing from the header section only; forbidden outgoing trailer fields refused | `tests/adversarial.rs`, `tests/trailers.rs` (server, and a client pipelining two responses whose first trailer section carries `Content-Length`) | none | tested |
+| T-13 | trailer fields reframing a message | trailers validated and never merged; framing from the header section only; forbidden outgoing trailer fields refused; from 0.10 incoming `content-length`, `transfer-encoding`, and `host` dropped from trailer events, so nothing downstream merges or relays them | `tests/adversarial.rs`, `tests/trailers.rs` (server, a client pipelining two responses whose first trailer section carries `Content-Length`, and the dropped names on both sides) | a pass over the trailer fields | tested |
 | T-14 | 0.CL desync | `Content-Length` honoured on every method; answering before reading the body closes | `tests/adversarial.rs` | none | tested |
 | T-15 | `Expect`-based desync | `Expect` never changes framing; `100-continue` matched as a trimmed, case-insensitive list element | eight vectors in `tests/adversarial.rs` | none | tested |
 | T-16 | smuggling a pipelined request after an error | nothing parsed after a parse error | `tests/smuggling.rs`; `tests/conformance.rs` | none | tested |
@@ -55,21 +55,24 @@ whether the attack test exists in this build.
 | T-25 | slow body | as T-24 | `tests/localhost.rs` (answered `408`, closed within the deadline) | as T-24 | tested |
 | T-26 | slow reader of a large response | blocking: total response deadline (60 s by default) | `tests/localhost.rs` | one `Instant` per write | tested |
 | T-27 | memory exhaustion by huge heads or bodies | every budget checked before buffering; CL above `max_body` refused on the header line | boundary tests; seven 10 MiB hostile streams in `tests/alloc.rs` | none | tested |
-| T-28 | many idle connections | `shrink_idle`; the blocking server's connection cap with 503 | `tests/pipelining_reuse.rs`, `tests/localhost.rs` | one free | tested |
+| T-28 | many idle connections | `shrink_idle`; the blocking server's connection cap with 503. The cap is the blocking server's only admission control, so 64 slow connections hold it until the request timeout; it is documented for local and trusted networks only (0.10), and internet-facing servers use an event loop with per-peer limits | `tests/pipelining_reuse.rs`, `tests/localhost.rs` | one free | tested |
 | T-29 | pipelining flood | pipelined input stays in the bounded buffer; parsing stops until the response is written; request caps | a 100,000-request stream in `tests/prop_roundtrip.rs`; 100,000 requests offered without an answer stay within `buffer_capacity()` (`tests/adversarial.rs`) | none | tested |
 | T-30 | header count or byte flood | `max_headers`, `max_header_bytes`, the 8 KiB per-line budget | boundary tests | a counter per field | tested |
 | T-31 | interim response flood | interim heads budgeted by count (`max_interim`) and bytes | `tests/adversarial.rs`, `tests/interim.rs` | a counter per interim | tested |
 | T-32 | quadratic parsing on byte-at-a-time input | resumable scanner; compaction only when full | a 16 KiB head fed one byte at a time (`tests/prop_roundtrip.rs`); the linearity guard (`tests/linearity.rs`: 8 times the bytes cost under 16 times the time) and its bench group | none | tested |
 | T-33 | integer overflow | checked arithmetic for CL, chunk sizes, running totals | `tests/adversarial.rs`; fuzzing | none | tested |
 | T-34 | panics | clippy denies (`unwrap`, `expect`, `unreachable!`, printing), bounded indexing, fuzzing | never-panic property tests; eight fuzz targets in CI; the 0.7 campaign (24 CPU-hours per target, no finding) | none | tested |
-| T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie` everywhere; body and tunnel bytes print as lengths | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers, `ResponseHeadRef`, `blocking::Connection`, whose buffers print as lengths only, and since 0.9.1 the body events, `blocking::Incoming`, and the leftover bytes of `blocking::Upgraded`) | only when formatting | tested |
-| T-36 | credentials left in reused memory | `set_wipe`: zero finished requests, compaction leftovers, and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run); the wipe on drop is not tested, since observing it would mean reading the freed block | +5 ns (+2.1%) on the 453-byte browser GET, about 11 ns per KiB (0.9.1, `wipe` bench) | tested |
+| T-35 | credentials in logs | `Debug` redacts `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, and from 0.10 any field whose name contains `auth`, `cookie`, `token`, `secret`, `key`, `session`, `password`, `passwd`, `csrf`, `xsrf`, `signature`, or `credential`, and a target's query; body and tunnel bytes print as lengths | `tests/redaction.rs` (every view, owned and copied heads, the stateless parsers, `ResponseHeadRef`, `blocking::Connection`, whose buffers print as lengths only, and since 0.9.1 the body events, `blocking::Incoming`, and the leftover bytes of `blocking::Upgraded`) | only when formatting | tested |
+| T-36 | credentials left in reused memory | `set_wipe` on either connection (the client from 0.10): zero finished messages, compaction leftovers, the old block when the buffer grows (0.10), and the buffer on reset, release, drop | `tests/pipelining_reuse.rs` (finished requests, compaction, release, and reset mid-body, each with a control run); `tests/wipe_growth.rs` (an allocator that inspects every freed block: none holds the credential after growth or drop, with a control run that does see it); a `client.rs` unit test for a finished response | +5 ns (+2.1%) on the 453-byte browser GET, about 11 ns per KiB (0.9.1, `wipe` bench) | tested |
 | T-37 | error text reflecting attacker bytes | `Display` is static text; `from_error` uses only it | `error.rs` units over every variant; `tests/adversarial.rs` (`from_error` for every variant; refused bytes never in the answer) | none | tested |
 | T-38 | HTTP/0.9 messages | a version is required in both start lines | `tests/rfc_cases.rs` (request and response, whole and byte by byte) | none | tested |
 | T-39 | status out of range | refused (`InvalidStatus`) | `tests/rfc_cases.rs` | none | tested |
 | T-40 | lingering-close abuse | drain bounded to 1 s and 256 KiB; the refusal path never waits | `tests/localhost.rs` (a peer that trickles; a peer that writes 8 MiB unpaced; the only slot freed for the next client); since 0.9.1 a `blocking.rs` unit test shows the byte cap ends the drain of a peer that never stops (at most 256 KiB plus one read, well inside the 1 s cap) | at most 1 s of a thread per close | tested |
 | T-41 | busy accept loop on persistent errors | 10 ms back-off after every failed accept; give up after more than 1,000 in a row; a success resets the count | `blocking.rs` unit test of the back-off policy the accept loop uses | none | tested |
 | T-42 | prior-knowledge HTTP/2 to an HTTP/1.1 listener | 505 and close (`Http2Preface` in 0.5) | `tests/rfc_cases.rs` | 24 compares at connection start | tested |
+| T-43 | CPU exhaustion through a proxy's hop-by-hop filtering | the `Connection` options are read once and sorted, so `forward_from` and `end_to_end_headers` are linear in the head (0.10; before, fields times options) | `tests/linearity.rs` (thousands of options against one; 8 times the fields against 8 times the time) | a sort of the options | tested |
+| T-44 | `Host` confusion through a proxy | `forward_from` writes `host` from the authority this proxy read and never copies the received `Host` (RFC 9112 section 3.2.2, 0.10) | `tests/forwarding.rs`, `tests/conformance.rs` | none | tested |
+| T-45 | a proxy's credentials relayed to the origin | `forward_from` drops `proxy-authorization` (RFC 9110 section 11.7.2, 0.10) | `tests/forwarding.rs` | none | tested |
 
 ## Hardening record (0.7)
 
@@ -225,6 +228,35 @@ in 0.9.2 with tests; none is a smuggling, desync, panic, or memory defect
 - At `ResponseEnd`, `is_reusable()`, `can_send()`, and `progress()` could
   disagree with `send_request`, which refused what they allowed until the
   next `poll`.
+
+## Review record (0.10.0)
+
+A third, independent review, of 0.9.2 (every source file, the threat
+table, the documentation claims, a fuzz run of both connections), found no
+smuggling vector, no panic, no integer overflow, and no limit checked
+after the bytes it governs. Its findings were in the proxy helper, the
+blocking adapter, and the tests, and are fixed in 0.10.0 with regression
+tests:
+
+- `forward_from`, and `is_hop_by_hop` called once per field, cost fields
+  times `Connection` options: one 16 KiB request that the default limits
+  accept took milliseconds of CPU to forward. Both are linear now
+  (T-43), and `end_to_end_headers` gives hand-written proxies the linear
+  path.
+- `forward_from` copied the received `Host` beside an absolute-form
+  target that names another authority (T-44), and relayed
+  `proxy-authorization` (T-45).
+- With wiping on, growing the input buffer freed the old block unwiped
+  (T-36); the client had no wipe at all.
+- The blocking server did not say it is for trusted networks (T-28).
+- A socket test of the client's address fallback depended on a freed
+  port staying closed; the fallback is now tested without sockets.
+
+Changed on the review's advice: incoming trailers drop the framing and
+routing names (T-13); `Debug` redacts custom credential fields and the
+query (T-35); `parse-net`, whose grammar decides what is accepted, is
+pinned to one release, so a new grammar reaches users only through an
+http-net release that ran the parity tests on it.
 
 ## Where http-net is stricter than the RFCs
 

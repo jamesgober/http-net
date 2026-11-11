@@ -212,7 +212,17 @@ impl Buffer {
                 self.compact();
             } else if len < self.cap {
                 let grown = len.saturating_mul(2).max(MIN_ALLOC).min(self.cap);
-                self.data.resize(grown, 0);
+                if self.wipe && grown > self.data.capacity() {
+                    // A reallocation would free the old block unwiped: copy
+                    // into a new one and zero the old one first.
+                    let mut next = Vec::with_capacity(grown);
+                    next.extend_from_slice(&self.data);
+                    next.resize(grown, 0);
+                    zero(&mut self.data);
+                    self.data = next;
+                } else {
+                    self.data.resize(grown, 0);
+                }
             } else if reclaimable > 0 {
                 self.compact();
             }
