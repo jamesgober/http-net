@@ -63,8 +63,11 @@ fn best_of_nine_interleaved(small: usize, large: usize) -> (Duration, Duration) 
 fn test_byte_at_a_time_cost_grows_linearly_with_the_head() {
     let (small, large) = best_of_nine_interleaved(4 * 1024, 32 * 1024);
     let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // Linear is 8x and a rescanning parser 64x. The bound sits between
+    // them with room for a loaded machine, where the 32 KiB head loses
+    // more of its cache than the 4 KiB one (21x measured at load 70).
     assert!(
-        ratio < 16.0,
+        ratio < 32.0,
         "8x the bytes cost {ratio:.1}x the time ({small:?} for 4 KiB, {large:?} for 32 KiB)"
     );
 }
@@ -100,74 +103,56 @@ fn test_byte_at_a_time_parses_what_whole_input_parses() {
     assert!(expected.len() > 200);
 }
 
-/// `forward_from` on a head whose fields a client controls is linear: a
-/// `Connection` line of thousands of options costs about what a plain
-/// head of the same field count does, and eight times the fields cost
-/// about eight times the time. Before 0.10 each field re-read every option
-/// and every field: about 100 times the plain cost for the first, 64 times
-/// for the second.
+/// `forward_from` on a head whose fields and `Connection` options a client
+/// controls is linear: eight times the fields and options cost about eight
+/// times the time. Before 0.10 each field re-read every option and every
+/// field, so the same growth cost 64 times.
 #[test]
 fn test_forward_from_is_linear_in_fields_and_connection_options() {
     use http_net::Request;
 
-    fn owned(wire: &[u8], limits: Limits) -> http_net::OwnedRequestHead {
+    let limits = Limits::new()
+        .with_max_headers(20_000)
+        .with_max_header_bytes(1 << 20)
+        .with_max_field_line(64 * 1024);
+    // `fields` plain fields and one `Connection` line of `options` distinct
+    // options, none of which names a field.
+    let head = |fields: usize, options: usize| {
+        let mut wire = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
+        if options > 0 {
+            let list: Vec<String> = (0..options).map(|i| format!("o{i}")).collect();
+            wire.extend_from_slice(format!("Connection: {}\r\n", list.join(",")).as_bytes());
+        }
+        for i in 0..fields {
+            wire.extend_from_slice(format!("x{i:05}: v\r\n").as_bytes());
+        }
+        wire.extend_from_slice(b"\r\n");
         let mut conn = ServerConn::with_limits(limits);
-        assert_eq!(conn.feed(wire), wire.len());
+        assert_eq!(conn.feed(&wire), wire.len());
         match conn.poll() {
             Ok(ServerEvent::Request(req)) => req.to_owned(),
             other => panic!("{other:?}"),
         }
-    }
-    fn best(head: &http_net::OwnedRequestHead, rounds: u32) -> Duration {
-        let started = Instant::now();
-        for _ in 0..rounds {
-            let r = Request::forward_from(&head.view());
-            assert!(r.header_value("x00").is_some());
-        }
-        started.elapsed() / rounds
-    }
-    fn fields(wire: &mut Vec<u8>, n: usize) {
-        for i in 0..n {
-            wire.extend_from_slice(format!("x{i:02}: v\r\n").as_bytes());
-        }
-        wire.extend_from_slice(b"\r\n");
-    }
-
-    // One Connection line of about 4,000 one-byte options, as the default
-    // limits allow, against one option.
-    let mut hostile = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: ".to_vec();
-    for _ in 0..(8 * 1024 - 14) / 2 {
-        hostile.extend_from_slice(b"a,");
-    }
-    hostile.extend_from_slice(b"\r\n");
-    fields(&mut hostile, 97);
-    let mut plain = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: a\r\n".to_vec();
-    fields(&mut plain, 97);
-    let (hostile, plain) = (owned(&hostile, Limits::new()), owned(&plain, Limits::new()));
-    let (mut h, mut p) = (Duration::MAX, Duration::MAX);
-    for _ in 0..9 {
-        p = p.min(best(&plain, 50));
-        h = h.min(best(&hostile, 50));
-    }
-    assert!(h < p * 20, "options: plain {p:?}, hostile {h:?}");
-
-    // 2,000 against 16,000 plain fields.
-    let limits = Limits::new()
-        .with_max_headers(20_000)
-        .with_max_header_bytes(1 << 20);
-    let many = |n: usize| {
-        let mut wire = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
-        for i in 0..n {
-            wire.extend_from_slice(format!("x{i:05}: v\r\n").as_bytes());
-        }
-        wire.extend_from_slice(b"x00: v\r\n\r\n");
-        owned(&wire, limits)
     };
-    let (small, large) = (many(2_000), many(16_000));
-    let (mut s, mut l) = (Duration::MAX, Duration::MAX);
-    for _ in 0..9 {
-        s = s.min(best(&small, 3));
-        l = l.min(best(&large, 3));
+    let time = |head: &http_net::OwnedRequestHead| {
+        let started = Instant::now();
+        for _ in 0..3 {
+            let r = Request::forward_from(&head.view());
+            assert!(r.header_value("x00000").is_some());
+        }
+        started.elapsed() / 3
+    };
+    for (what, small, large) in [
+        ("fields", head(1_000, 0), head(8_000, 0)),
+        ("fields and options", head(250, 500), head(2_000, 4_000)),
+    ] {
+        let (mut s, mut l) = (Duration::MAX, Duration::MAX);
+        for _ in 0..9 {
+            s = s.min(time(&small));
+            l = l.min(time(&large));
+        }
+        eprintln!("forward_from, {what}: {s:?} small, {l:?} 8x");
+        // Linear is 8x, the old cost 64x.
+        assert!(l < s * 32, "{what}: {s:?} small, {l:?} at 8x");
     }
-    assert!(l < s * 24, "fields: 2,000 {s:?}, 16,000 {l:?}");
 }
