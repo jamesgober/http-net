@@ -235,9 +235,22 @@ repeated. Fixes ship as 0.9.x patches; what stays open is in
 - [ ] Still open (not code, or not this repository): the third consumer (D-62); the support window and report channel (James).
 
 Exit criteria:
-- [ ] Two consecutive weeks without an API change, counted from 0.9.0 (D-66).
+- [ ] Two consecutive weeks without an API change, counted from the last API change (0.10.0, D-66, D-77).
 - [x] Full documentation set present (`docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, `docs/SECURITY.md`, `docs/PLATFORM-NOTES.md`, `docs/STABILITY-1.0.md`, plus `docs/PARITY.md`).
 - [ ] Full local gate and CI green on all platforms and MSRV (each 0.9.x release).
+
+## v0.10.0 - Beta: the simplicity audit (2026-11-11)
+
+Before 1.0, the public API was checked once more against the simplified-API
+rule: Tier 1 one-liners with plain `?`, plain names, one way to do each
+thing, every public item in `docs/API.md` (D-77).
+
+- [x] `Asked` removed: `parse_response_head` takes the request's `Method`.
+- [x] `RequestHead::copy_into` returns `HeadFacts` (its `Result` was never an error).
+- [x] `blocking::Connection::new(stream)` plus `with_limits`, like every other constructor.
+- [x] The blocking time setters take a `Duration` or `None` (`Some(..)` still compiles).
+- [x] `From<HttpError> for std::io::Error`, so `?` works in an `io::Result` driver.
+- [x] The rest checked and kept, with the reasons (D-77); `docs/MIGRATION.md` shows each change.
 
 ## v1.0.0 - Stable
 - [ ] The full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.

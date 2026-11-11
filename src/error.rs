@@ -392,6 +392,43 @@ impl fmt::Display for HttpError {
 
 impl core::error::Error for HttpError {}
 
+/// For drivers that return `std::io::Result`, so `conn.poll()?` works
+/// there: running out of input is `UnexpectedEof`, a caller mistake is
+/// `InvalidInput`, and anything the peer sent is `InvalidData`. The
+/// `HttpError` is the source, so it can be read back with
+/// `io::Error::get_ref` and `downcast_ref`.
+///
+/// # Examples
+///
+/// ```
+/// use std::io;
+/// use http_net::{HttpError, ServerConn};
+///
+/// fn read_head(conn: &mut ServerConn) -> io::Result<()> {
+///     let _ = conn.feed(b"GET / HTTP/1.1\n\n");
+///     conn.poll()?;
+///     Ok(())
+/// }
+///
+/// let e = read_head(&mut ServerConn::new()).unwrap_err();
+/// assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+/// assert_eq!(e.get_ref().and_then(|e| e.downcast_ref::<HttpError>()), Some(&HttpError::BareLf));
+/// ```
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+impl From<HttpError> for std::io::Error {
+    fn from(error: HttpError) -> Self {
+        let kind = if error == HttpError::UnexpectedEof {
+            std::io::ErrorKind::UnexpectedEof
+        } else if error.is_peer_error() {
+            std::io::ErrorKind::InvalidData
+        } else {
+            std::io::ErrorKind::InvalidInput
+        };
+        Self::new(kind, error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString;
@@ -493,6 +530,36 @@ mod tests {
             HttpError::ConflictingFraming
                 .to_string()
                 .contains("Content-Length")
+        );
+    }
+
+    /// Every variant maps to the documented `io::ErrorKind` and stays
+    /// readable as the source.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_into_io_error_every_variant_has_its_kind() {
+        use std::io::ErrorKind;
+        for e in ALL {
+            let io = std::io::Error::from(*e);
+            let expected = if *e == HttpError::UnexpectedEof {
+                ErrorKind::UnexpectedEof
+            } else if e.is_peer_error() {
+                ErrorKind::InvalidData
+            } else {
+                ErrorKind::InvalidInput
+            };
+            assert_eq!(io.kind(), expected, "{e:?}");
+            let inner = io.get_ref().and_then(|i| i.downcast_ref::<HttpError>());
+            assert_eq!(inner, Some(e));
+            assert_eq!(io.to_string(), e.to_string());
+        }
+        assert_eq!(
+            std::io::Error::from(HttpError::ReservedHeader).kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            std::io::Error::from(HttpError::BareLf).kind(),
+            ErrorKind::InvalidData
         );
     }
 }

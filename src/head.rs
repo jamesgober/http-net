@@ -985,22 +985,22 @@ impl ResponseInfo {
 /// What the request asked for, which decides how its response is framed
 /// (RFC 9112 section 6.3): a response to `HEAD` has no body whatever its
 /// fields say, and a 2xx to `CONNECT` turns the connection into a tunnel.
-/// The input to [`parse_response_head`](crate::parse_response_head).
-///
-/// # Examples
-///
-/// ```
-/// use http_net::Asked;
-///
-/// let after_head = Asked { head: true, ..Asked::default() };
-/// assert!(after_head.head && !after_head.connect);
-/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Asked {
+pub(crate) struct Asked {
     /// The request was `HEAD`.
-    pub head: bool,
+    pub(crate) head: bool,
     /// The request was `CONNECT`.
-    pub connect: bool,
+    pub(crate) connect: bool,
+}
+
+impl Asked {
+    /// The facts of a request with `method`.
+    pub(crate) fn from_method(method: Method) -> Self {
+        Self {
+            head: method == Method::Head,
+            connect: method == Method::Connect,
+        }
+    }
 }
 
 pub(crate) fn interpret_response(

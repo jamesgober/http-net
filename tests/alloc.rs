@@ -13,8 +13,8 @@ use std::{
 };
 
 use http_net::{
-    Asked, BodyPlan, ChunkStep, ChunkedDecoder, ClientConn, ClientEvent, FieldSpan, HttpDate,
-    HttpError, Limits, OutgoingBody, Parsed, Request, Response, ResponseHeadRef, ServerConn,
+    BodyPlan, ChunkStep, ChunkedDecoder, ClientConn, ClientEvent, FieldSpan, HttpDate, HttpError,
+    Limits, Method, OutgoingBody, Parsed, Request, Response, ResponseHeadRef, ServerConn,
     ServerEvent, parse_request_head, parse_response_head,
 };
 
@@ -781,7 +781,7 @@ fn test_stateless_parsers_allocate_nothing_ever() {
             assert_eq!(refused.err(), Some(HttpError::MissingHost));
             let response =
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
-            let parsed = parse_response_head(response, &limits, Asked::default(), &mut fields);
+            let parsed = parse_response_head(response, &limits, Method::Get, &mut fields);
             assert!(matches!(parsed, Ok(Parsed::Complete { .. })));
         }
     });
@@ -802,8 +802,7 @@ fn test_copy_into_reused_vectors_allocates_nothing() {
         loop {
             match conn.poll() {
                 Ok(ServerEvent::Request(head)) => {
-                    let facts = head.copy_into(&mut bytes, &mut fields);
-                    assert!(facts.is_ok());
+                    let _facts = head.copy_into(&mut bytes, &mut fields);
                 }
                 Ok(ServerEvent::NeedInput) => fed += conn.feed(&request[fed..]),
                 Ok(ServerEvent::Body(_)) => {}

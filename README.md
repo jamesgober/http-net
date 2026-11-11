@@ -74,14 +74,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.9"
+http-net = "0.10"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.9", default-features = false }
+http-net = { version = "0.10", default-features = false }
 ```
 
 <hr>

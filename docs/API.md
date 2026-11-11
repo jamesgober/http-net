@@ -161,6 +161,7 @@ Each entry gives the signature, what it does, its errors, and an example.
 | 0.7 | new in 0.7.0 |
 | 0.8 | new in 0.8.0 |
 | 0.9 | new or changed in 0.9.0 |
+| 0.10 | new or changed in 0.10.0 |
 
 Two values (`exists; 0.3`) mean shipped in the first, changed in the
 second.
@@ -442,6 +443,32 @@ pub enum HttpError { /* see Variants */ }
 
 impl core::fmt::Display for HttpError;
 impl core::error::Error for HttpError;
+impl From<HttpError> for std::io::Error; // feature `std`, 0.10
+```
+
+With `std`, `?` turns an `HttpError` into an `io::Error`, so a driver
+that returns `io::Result` needs no `map_err`: running out of input is
+`UnexpectedEof`, a usage error that no peer can cause is `InvalidInput`,
+and every other error is `InvalidData`. The `HttpError` stays inside
+(`get_ref` and `downcast_ref` read it back).
+
+```rust
+use std::io;
+use http_net::{HttpError, Response, ServerConn, ServerEvent};
+
+fn answer(conn: &mut ServerConn, input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    let _ = conn.feed(input);
+    while !matches!(conn.poll()?, ServerEvent::RequestEnd) {}
+    conn.respond(&Response::text(200, "ok"), out)?;
+    Ok(())
+}
+
+let mut out = Vec::new();
+answer(&mut ServerConn::new(), b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", &mut out)?;
+let e = answer(&mut ServerConn::new(), b"GET / HTTP/1.1\nHost: a\n\n", &mut out).unwrap_err();
+assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+assert_eq!(e.get_ref().and_then(|e| e.downcast_ref::<HttpError>()), Some(&HttpError::BareLf));
+# Ok::<(), io::Error>(())
 ```
 
 One variant per refusal. `Copy`; 24 bytes on 64-bit targets (the
@@ -1463,7 +1490,7 @@ impl<'a> RawHead<'a> {
 }
 
 impl RequestHead<'_> {
-    pub fn copy_into(&self, bytes: &mut Vec<u8>, fields: &mut Vec<FieldSpan>) -> Result<HeadFacts, HttpError>;
+    pub fn copy_into(&self, bytes: &mut Vec<u8>, fields: &mut Vec<FieldSpan>) -> HeadFacts;
     pub fn to_owned(&self) -> OwnedRequestHead;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1522,7 +1549,7 @@ let (mut bytes, mut fields) = (Vec::with_capacity(4096), Vec::with_capacity(64))
 let mut conn = ServerConn::new();
 let _ = conn.feed(b"GET /x HTTP/1.1\r\nHost: a\r\nX-Trace: 7\r\n\r\n");
 let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
-let facts = req.copy_into(&mut bytes, &mut fields)?;
+let facts = req.copy_into(&mut bytes, &mut fields);
 
 let owned = OwnedRequestHead::from_parts(bytes, fields, facts)?;
 assert_eq!(owned.view().header_str("x-trace"), Some("7"));
@@ -1540,7 +1567,7 @@ let mut conn = ServerConn::new();
 let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
 let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
 let (mut bytes, mut fields) = (Vec::new(), Vec::new());
-let facts = req.copy_into(&mut bytes, &mut fields)?;
+let facts = req.copy_into(&mut bytes, &mut fields);
 fields[0].value.end += 4; // the value now runs past its line
 assert!(matches!(
     OwnedRequestHead::from_parts(bytes, fields, facts),
@@ -1569,7 +1596,7 @@ differential tests, and engines that frame messages themselves.
 ```rust,ignore
 pub fn parse_request_head<'a>(input: &'a [u8], limits: &Limits, fields: &'a mut [FieldSpan])
     -> Result<Parsed<ParsedRequest<'a>>, HttpError>;
-pub fn parse_response_head<'a>(input: &'a [u8], limits: &Limits, asked: Asked, fields: &'a mut [FieldSpan])
+pub fn parse_response_head<'a>(input: &'a [u8], limits: &Limits, request_method: Method, fields: &'a mut [FieldSpan])
     -> Result<Parsed<ParsedResponse<'a>>, HttpError>;
 
 #[non_exhaustive]
@@ -1587,17 +1614,13 @@ impl ParsedRequest<'_> {
 pub struct ParsedResponse<'a> { /* private */ }
 impl core::fmt::Debug for ParsedResponse<'_>; // credential values redacted
 impl ParsedResponse<'_> { pub fn view(&self) -> ResponseHead<'_>; }
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Asked { pub head: bool, pub connect: bool }
 ```
 
 | Item | Behaviour | Errors | Ships |
 |---|---|---|---|
 | `parse_request_head` | `Complete` with the view and the head's length (`input[len..]` is the body or the next head) once the blank line is in; `Partial` while it is not, where a connection would ask for more input | the connection's head errors, except `UnexpectedEof` (that is `Partial` here) and `Http2Preface` (reported as `UnsupportedVersion`); `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5 |
-| `parse_response_head` | as above for a response; `asked` says what the request was, which decides the framing (`HEAD` and a `2xx` to `CONNECT` have no body); interim (`1xx`) heads are returned like any other; no [`ClientLeniency`](#clientconnset_leniency-and-clientleniency) applies, so obsolete line folding is always `ObsFold` | the connection's head errors (`UnexpectedEof` aside); `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5 |
+| `parse_response_head` | as above for a response; `request_method` is the method of the request it answers, which decides the framing (a response to `HEAD` and a `2xx` to `CONNECT` have no body; any other method frames by the fields); interim (`1xx`) heads are returned like any other; no [`ClientLeniency`](#clientconnset_leniency-and-clientleniency) applies, so obsolete line folding is always `ObsFold` | the connection's head errors (`UnexpectedEof` aside); `TooManyHeaders` also when the head has more fields than `fields.len()` | 0.5; 0.10 (takes the `Method`; was `Asked`) |
 | `Parsed`, `ParsedRequest`, `ParsedResponse` | the outcome and the parsed heads; `view()` gives the same accessors a connection's head has | none | 0.5 |
-| `Asked` | the request facts a response parser needs; `Asked::default()` is a plain request | none | 0.5 |
 
 The field array bounds the head as well as `Limits::max_headers`: with a
 smaller array, a head with more fields is `TooManyHeaders` rather than
@@ -1632,12 +1655,11 @@ assert_eq!(
 ```
 
 ```rust
-use http_net::{Asked, BodyFraming, FieldSpan, Limits, Parsed, parse_response_head};
+use http_net::{BodyFraming, FieldSpan, Limits, Method, Parsed, parse_response_head};
 
 let input = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
 let mut fields = [FieldSpan::default(); 8];
-let asked = Asked { head: true, ..Asked::default() };
-let Parsed::Complete { head, .. } = parse_response_head(input, &Limits::default(), asked, &mut fields)?
+let Parsed::Complete { head, .. } = parse_response_head(input, &Limits::default(), Method::Head, &mut fields)?
 else {
     panic!("the head is complete");
 };
@@ -2735,22 +2757,25 @@ assert!(date.as_str().ends_with(" GMT"));
 |---|---|---|---|
 | `with_limits(Limits)` | `limits()` | `Limits::new()` | exists |
 | `with_max_connections(usize)` | `max_connections()` | 64 (at least 1) | exists |
-| `with_read_timeout(Option<Duration>)` | `read_timeout()` | 10 s (each read; also the idle keep-alive timeout) | exists |
-| `with_request_timeout(Option<Duration>)` | `request_timeout()` | 30 s, from a request's first byte to the end of its body; idle keep-alive time does not count (this stops slowloris) | exists |
-| `with_write_timeout(Option<Duration>)` | `write_timeout()` | 10 s (each write) | exists |
-| `with_response_deadline(Option<Duration>)` | `response_deadline()` | 60 s to write one whole response; each write waits at most what is left (and never more than the write timeout), so a client reading one byte at a time cannot hold a thread (threat T-26) | 0.4 |
-| `with_max_requests_per_connection(Option<u64>)` | `max_requests_per_connection()` | none; the response that reaches the cap carries `connection: close` (`Some(0)` counts as 1) | 0.4 |
+| `with_read_timeout(impl Into<Option<Duration>>)` | `read_timeout()` | 10 s (each read; also the idle keep-alive timeout) | exists; 0.10 |
+| `with_request_timeout(impl Into<Option<Duration>>)` | `request_timeout()` | 30 s, from a request's first byte to the end of its body; idle keep-alive time does not count (this stops slowloris) | exists; 0.10 |
+| `with_write_timeout(impl Into<Option<Duration>>)` | `write_timeout()` | 10 s (each write) | exists; 0.10 |
+| `with_response_deadline(impl Into<Option<Duration>>)` | `response_deadline()` | 60 s to write one whole response; each write waits at most what is left (and never more than the write timeout), so a client reading one byte at a time cannot hold a thread (threat T-26) | 0.4; 0.10 |
+| `with_max_requests_per_connection(impl Into<Option<u64>>)` | `max_requests_per_connection()` | none; the response that reaches the cap carries `connection: close` (0 counts as 1) | 0.4; 0.10 |
 
-For LexerSketch Studio's budget ("header timeout 10 s"), set
-`with_request_timeout(Some(Duration::from_secs(10)))`.
+Each time setter takes a `Duration`, or `None` to switch that limit off
+(an `Option<Duration>` still works); the cap takes a count or `None`.
+Since 0.10 they are not `const fn`. For LexerSketch Studio's budget
+("header timeout 10 s"), set
+`with_request_timeout(Duration::from_secs(10))`.
 
 ```rust
 use std::time::Duration;
 use http_net::blocking::ServerConfig;
 
 let config = ServerConfig::new()
-    .with_response_deadline(Some(Duration::from_secs(20)))
-    .with_max_requests_per_connection(Some(1000));
+    .with_response_deadline(Duration::from_secs(20))
+    .with_max_requests_per_connection(1000);
 assert_eq!(config.response_deadline(), Some(Duration::from_secs(20)));
 assert_eq!(config.max_requests_per_connection(), Some(1000));
 ```
@@ -2771,9 +2796,10 @@ or keeping the socket after an upgrade.
 
 | Method | Notes | Ships |
 |---|---|---|
-| `new(stream: TcpStream, limits: Limits) -> Connection` | set socket timeouts first if you want them; the socket's read timeout is the idle timeout | exists |
-| `with_request_timeout(self, Option<Duration>) -> Connection` | deadline per request, from its first byte to the end of its body; `None` by default | exists |
-| `with_response_deadline(self, Option<Duration>) -> Connection` | total time to write one response, from `respond` through `end_body`; a miss is `Error::Io` of kind `TimedOut`; `None` by default | 0.4 |
+| `new(stream: TcpStream) -> Connection` | the default `Limits`; set socket timeouts first if you want them; the socket's read timeout is the idle timeout | exists; 0.10 (was `new(stream, limits)`) |
+| `with_limits(self, Limits) -> Connection` | the message limits; call it before the first `next_request` | 0.10 |
+| `with_request_timeout(self, impl Into<Option<Duration>>) -> Connection` | deadline per request, from its first byte to the end of its body; `None` by default | exists; 0.10 |
+| `with_response_deadline(self, impl Into<Option<Duration>>) -> Connection` | total time to write one response, from `respond` through `end_body`; a miss is `Error::Io` of kind `TimedOut`; `None` by default | 0.4; 0.10 |
 | `next_request(&mut self) -> Result<Option<Incoming<'_>>, Error>` | `None` when the connection is finished; answers `Expect: 100-continue` itself (other expectations are left to the caller: check `has_unknown_expectation`); a missed deadline is `Error::Io` of kind `TimedOut` | exists |
 | `respond(&mut self, response: &Response) -> Result<(), Error>` | adds `date` from `now_date` | exists; 0.4 |
 | `send_informational(&mut self, response: &Response) -> Result<(), Error>` | a 1xx (for example `103`) through `ServerConn::send_informational`, before `respond` | 0.4 |
@@ -2838,7 +2864,7 @@ assert_eq!(resp.status(), 201);
 | `with_limits(Limits)` | | exists |
 | `with_timeout(Duration)` | connect, read, and write timeout (zero is raised to 1 ms) | exists |
 | `get(&self, url: &str) -> Result<ClientResponse, Error>` | one connection per request with `connection: close` | exists |
-| `with_deadline(Option<Duration>)` | one total deadline for connect, write, and read of an exchange (`Error::Io` of kind `TimedOut`); `None` by default. Name resolution is not bounded: `std` offers no timeout for it | 0.4 |
+| `with_deadline(impl Into<Option<Duration>>)` | one total deadline for connect, write, and read of an exchange (`Error::Io` of kind `TimedOut`); `None` by default. Name resolution is not bounded: `std` offers no timeout for it | 0.4; 0.10 |
 | `request(&self, url: &str, request: Request) -> Result<ClientResponse, Error>` | any `Request` to an `http://` URL: the URL gives the target and `host`, the request gives method, fields, and a full body; refuses a request that already has `host` (`Http(InvalidHost)`), a streamed body, or an upgrade (`InvalidState`); a `Request::expect_continue` request with its full body fails with `Http(InvalidState)` | 0.4 |
 
 Not run: it needs a server on port 8080.
@@ -2847,7 +2873,7 @@ Not run: it needs a server on port 8080.
 use std::time::Duration;
 use http_net::{Request, blocking::Client};
 
-let client = Client::new().with_deadline(Some(Duration::from_secs(5)));
+let client = Client::new().with_deadline(Duration::from_secs(5));
 let put = Request::put("/ignored").header("content-type", "application/json").body(&b"{}"[..]);
 let resp = client.request("http://127.0.0.1:8080/items/7", put)?;
 # let _ = resp;

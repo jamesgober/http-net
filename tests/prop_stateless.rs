@@ -6,7 +6,7 @@
 //! connection asks for more input.
 
 use http_net::{
-    Asked, ClientConn, ClientEvent, FieldSpan, HttpError, Limits, Parsed, Request, RequestHead,
+    ClientConn, ClientEvent, FieldSpan, HttpError, Limits, Method, Parsed, Request, RequestHead,
     ResponseHead, ServerConn, ServerEvent, parse_request_head, parse_response_head,
 };
 use proptest::prelude::*;
@@ -226,7 +226,7 @@ proptest! {
             Err(e) => Err(e),
         };
         let mut fields = [FieldSpan::default(); 64];
-        let asked = Asked { head: head_request, connect: false };
+        let asked = if head_request { Method::Head } else { Method::Get };
         let stateless = match parse_response_head(&input, &limits, asked, &mut fields) {
             Ok(Parsed::Complete { head, .. }) if (100..200).contains(&head.view().status()) => {
                 return Ok(());
@@ -246,7 +246,7 @@ proptest! {
         let _ = conn.feed(&input);
         if let Ok(ServerEvent::Request(head)) = conn.poll() {
             let (mut bytes, mut fields) = (Vec::new(), Vec::new());
-            let facts = head.copy_into(&mut bytes, &mut fields).unwrap();
+            let facts = head.copy_into(&mut bytes, &mut fields);
             let owned = http_net::OwnedRequestHead::from_parts(bytes, fields, facts);
             prop_assert!(owned.is_ok(), "{:?}", owned);
             let owned = owned.unwrap();

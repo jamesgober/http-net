@@ -170,7 +170,7 @@ fn test_streamed_response_through_connection() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        let mut conn = Connection::new(stream, Limits::new());
+        let mut conn = Connection::new(stream);
         while let Some(req) = conn.next_request().unwrap() {
             let lines: usize = req.head().query().unwrap_or("3").parse().unwrap();
             conn.respond(&Response::new(200).chunked()).unwrap();
@@ -862,8 +862,7 @@ fn test_connection_response_deadline_slow_reader_times_out() {
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let mut conn = Connection::new(stream, Limits::new())
-        .with_response_deadline(Some(Duration::from_millis(500)));
+    let mut conn = Connection::new(stream).with_response_deadline(Some(Duration::from_millis(500)));
     assert!(conn.next_request().unwrap().is_some());
     let started = Instant::now();
     conn.respond(&Response::new(200).chunked()).unwrap();
@@ -996,7 +995,7 @@ fn test_connection_send_informational_writes_103_first() {
         reply
     });
     let (stream, _) = listener.accept().unwrap();
-    let mut conn = Connection::new(stream, Limits::new());
+    let mut conn = Connection::new(stream);
     assert!(conn.next_request().unwrap().is_some());
     conn.send_informational(&Response::new(103).header("link", "</a.css>; rel=preload"))
         .unwrap();
@@ -1127,8 +1126,7 @@ fn test_connection_request_deadline_is_timed_out_on_every_platform() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let mut conn = Connection::new(stream, Limits::new())
-        .with_request_timeout(Some(Duration::from_millis(300)));
+    let mut conn = Connection::new(stream).with_request_timeout(Some(Duration::from_millis(300)));
     let started = Instant::now();
     let outcome = conn.next_request().map(|r| r.is_some());
     let waited = started.elapsed();
@@ -1184,4 +1182,43 @@ fn test_head_failing_in_its_body_is_answered_without_content() {
             String::from_utf8_lossy(&reply)
         );
     }
+}
+
+/// `Connection::with_limits` replaces the default limits (0.10): a body
+/// over the configured budget is refused, one under it is served.
+#[test]
+fn test_connection_with_limits_applies_the_body_budget() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut conn = Connection::new(stream).with_limits(Limits::new().with_max_body(4));
+            match conn.next_request() {
+                Ok(Some(req)) => {
+                    let n = req.body().len();
+                    conn.respond(&Response::text(200, &n.to_string())).unwrap();
+                    results.push(Ok(n));
+                }
+                Ok(None) => results.push(Err(None)),
+                Err(e) => results.push(Err(Some(e.to_string()))),
+            }
+            conn.close();
+        }
+        results
+    });
+    for body in ["abcd", "abcde"] {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply);
+    }
+    let results = server.join().unwrap();
+    assert_eq!(results[0], Ok(4));
+    assert!(results[1].is_err(), "{:?}", results[1]);
 }

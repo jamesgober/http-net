@@ -131,8 +131,8 @@ pub use date::{DateCache, HttpDate};
 pub use error::HttpError;
 pub use forward::is_hop_by_hop;
 pub use head::{
-    Asked, BodyFraming, FieldSpan, HeaderValues, Headers, ListElements, RequestHead, ResponseHead,
-    Span, TargetForm, Version,
+    BodyFraming, FieldSpan, HeaderValues, Headers, ListElements, RequestHead, ResponseHead, Span,
+    TargetForm, Version,
 };
 pub use limits::Limits;
 pub use message::{Request, Response};

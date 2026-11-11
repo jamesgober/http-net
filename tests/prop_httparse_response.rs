@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use http_net::{
-    Asked, ClientConn, ClientEvent, FieldSpan, HttpError, Limits, Parsed, Request, ResponseHead,
+    ClientConn, ClientEvent, FieldSpan, HttpError, Limits, Method, Parsed, Request, ResponseHead,
     Version, parse_response_head,
 };
 use proptest::prelude::*;
@@ -73,7 +73,7 @@ fn ours(input: &[u8]) -> Ours {
     // As many slots as `Limits::new().max_headers()`, so the array is never
     // the reason for a refusal.
     let mut fields = [FieldSpan::default(); 100];
-    match parse_response_head(input, &Limits::new(), Asked::default(), &mut fields) {
+    match parse_response_head(input, &Limits::new(), Method::Get, &mut fields) {
         Ok(Parsed::Complete { head, len }) => Ours::Head(head_of(&head.view(), len)),
         Ok(_) => Ours::Incomplete,
         Err(e) => Ours::Refused(e),

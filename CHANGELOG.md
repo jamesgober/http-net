@@ -11,6 +11,38 @@
 
 ## [Unreleased]
 
+---
+
+## [0.10.0] - 2026-11-11
+
+The simplicity audit before 1.0 (`dev/PLAN.md` D-77): four signature
+changes and one addition, no behaviour change. `docs/MIGRATION.md` shows
+each change.
+
+### Changed
+
+- `parse_response_head` takes the request's `Method` in place of `Asked`.
+- `RequestHead::copy_into` returns `HeadFacts`, not a `Result` that was
+  never an error.
+- `blocking::Connection::new(stream)` takes only the socket; set limits
+  with the new `Connection::with_limits`.
+- The blocking time setters (`ServerConfig::with_read_timeout`,
+  `with_request_timeout`, `with_write_timeout`, `with_response_deadline`,
+  `with_max_requests_per_connection`, `Connection::with_request_timeout`,
+  `Connection::with_response_deadline`, `Client::with_deadline`) take a
+  value or `None` (`impl Into<Option<..>>`); `Some(..)` still compiles.
+  They are no longer `const fn`.
+
+### Removed
+
+- `Asked`.
+
+### Added
+
+- `impl From<HttpError> for std::io::Error` (feature `std`), so `?` works
+  in a function returning `std::io::Result`.
+- `blocking::Connection::with_limits`.
+
 ### Documentation
 
 - `docs/PERFORMANCE.md`: the competitor comparison measured again on a

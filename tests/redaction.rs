@@ -6,8 +6,8 @@
 //! compact and the pretty form. Accessors keep returning the real values.
 
 use http_net::{
-    Asked, ClientConn, ClientEvent, FieldSpan, Limits, OwnedRequestHead, Parsed, Request, Response,
-    ServerConn, ServerEvent, parse_request_head, parse_response_head,
+    ClientConn, ClientEvent, FieldSpan, Limits, Method, OwnedRequestHead, Parsed, Request,
+    Response, ServerConn, ServerEvent, parse_request_head, parse_response_head,
 };
 
 /// The four credential fields, each in several spellings.
@@ -223,7 +223,7 @@ fn test_owned_and_stateless_views_debug_redact_credentials() {
     let cookie = "sid=s3cr3t-session; HttpOnly";
     let input = response_with("Set-Cookie", cookie);
     let mut slots = [FieldSpan::default(); 16];
-    let parsed = parse_response_head(&input, &Limits::new(), Asked::default(), &mut slots).unwrap();
+    let parsed = parse_response_head(&input, &Limits::new(), Method::Get, &mut slots).unwrap();
     for shown in both(&parsed) {
         assert_redacted("Parsed<ParsedResponse>", &shown, cookie);
     }
@@ -294,7 +294,7 @@ fn test_response_head_ref_debug_redacts_every_spelling() {
 fn test_blocking_connection_debug_never_prints_its_buffers() {
     use std::io::{Read, Write};
 
-    use http_net::{Limits, blocking::Connection};
+    use http_net::blocking::Connection;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -314,7 +314,7 @@ fn test_blocking_connection_debug_never_prints_its_buffers() {
         }
     });
     let (stream, _) = listener.accept().unwrap();
-    let mut conn = Connection::new(stream, Limits::new());
+    let mut conn = Connection::new(stream);
     assert!(conn.next_request().unwrap().is_some());
     conn.respond(&Response::text(200, "ok").header("set-cookie", "sid=s3cr3t-session"))
         .unwrap();
@@ -370,7 +370,7 @@ fn test_body_events_debug_print_lengths_only() {
 fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
     use std::io::Write;
 
-    use http_net::{Limits, blocking::Connection};
+    use http_net::blocking::Connection;
 
     fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -383,7 +383,7 @@ fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
     client
         .write_all(b"POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: 16\r\n\r\npassword=s3cr3t!")
         .unwrap();
-    let mut conn = Connection::new(server, Limits::new());
+    let mut conn = Connection::new(server);
     let incoming = conn.next_request().unwrap().unwrap();
     for shown in both(&incoming) {
         assert!(
@@ -405,7 +405,7 @@ fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
     // Give the tunnelled bytes time to arrive with the CONNECT, so they are
     // the leftover.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let mut conn = Connection::new(server, Limits::new());
+    let mut conn = Connection::new(server);
     assert!(conn.next_request().unwrap().is_some());
     conn.respond(&Response::new(200)).unwrap();
     let upgraded = conn.into_upgraded().unwrap();

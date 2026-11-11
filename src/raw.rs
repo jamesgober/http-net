@@ -179,7 +179,7 @@ impl fmt::Debug for RawHead<'_> {
 /// let _ = conn.feed(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n");
 /// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
 /// let (mut bytes, mut fields) = (Vec::new(), Vec::new());
-/// let facts = req.copy_into(&mut bytes, &mut fields)?;
+/// let facts = req.copy_into(&mut bytes, &mut fields);
 /// let owned = OwnedRequestHead::from_parts(bytes, fields, facts)?;
 /// assert_eq!(owned.view().path(), "/x");
 /// # Ok::<(), http_net::HttpError>(())
@@ -232,11 +232,6 @@ impl<'a> RequestHead<'a> {
     /// view without parsing again. Once the vectors have grown to the
     /// largest head seen, the copy allocates nothing.
     ///
-    /// # Errors
-    ///
-    /// None today: a view always has a current head. The `Result` leaves
-    /// room for a head that cannot be copied without reading more input.
-    ///
     /// # Examples
     ///
     /// ```
@@ -247,25 +242,22 @@ impl<'a> RequestHead<'a> {
     /// let mut conn = ServerConn::new();
     /// let _ = conn.feed(b"POST /api HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi");
     /// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
-    /// let facts = req.copy_into(&mut bytes, &mut fields)?;
+    /// let facts = req.copy_into(&mut bytes, &mut fields);
     /// assert_eq!(bytes, b"POST /api HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n");
     /// let owned = OwnedRequestHead::from_parts(bytes, fields, facts)?;
     /// assert_eq!(owned.view().content_length(), Some(2));
     /// # Ok::<(), http_net::HttpError>(())
     /// ```
-    pub fn copy_into(
-        &self,
-        bytes: &mut Vec<u8>,
-        fields: &mut Vec<FieldSpan>,
-    ) -> Result<HeadFacts, HttpError> {
+    #[must_use = "the facts are needed to rebuild a view from the copied bytes"]
+    pub fn copy_into(&self, bytes: &mut Vec<u8>, fields: &mut Vec<FieldSpan>) -> HeadFacts {
         let raw = self.raw();
         bytes.clear();
         bytes.extend_from_slice(raw.bytes);
         fields.clear();
         fields.extend_from_slice(raw.fields);
-        Ok(HeadFacts {
+        HeadFacts {
             info: *self.parts().2,
-        })
+        }
     }
 
     /// An owned copy of the head, for keeping it across body events or
@@ -382,7 +374,7 @@ impl OwnedRequestHead {
     /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     /// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
     /// let (mut bytes, mut fields) = (Vec::new(), Vec::new());
-    /// let facts = req.copy_into(&mut bytes, &mut fields)?;
+    /// let facts = req.copy_into(&mut bytes, &mut fields);
     /// bytes[16] = b' '; // the first field name now starts with a space
     /// assert!(matches!(
     ///     OwnedRequestHead::from_parts(bytes, fields, facts),
@@ -708,9 +700,9 @@ pub fn parse_request_head<'a>(
 }
 
 /// Parses one response head from the start of `input` with the rules of
-/// [`ClientConn`](crate::ClientConn), framed by what the request `asked`
-/// (a `HEAD` request's response has no body; a 2xx to `CONNECT` is a
-/// tunnel). Interim (1xx) heads are returned like any other; check
+/// [`ClientConn`](crate::ClientConn), framed by the method of the request
+/// it answers (a response to `HEAD` has no body; a 2xx to `CONNECT` is a
+/// tunnel; any other method frames by the fields). Interim (1xx) heads are returned like any other; check
 /// [`ResponseHead::is_informational`] and parse the next head after `len`.
 /// No [`ClientLeniency`](crate::ClientLeniency) applies, so obsolete line
 /// folding is always [`HttpError::ObsFold`]. Allocates nothing.
@@ -724,12 +716,11 @@ pub fn parse_request_head<'a>(
 /// # Examples
 ///
 /// ```
-/// use http_net::{Asked, BodyFraming, FieldSpan, Limits, Parsed, parse_response_head};
+/// use http_net::{BodyFraming, FieldSpan, Limits, Method, Parsed, parse_response_head};
 ///
 /// let input = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
 /// let mut fields = [FieldSpan::default(); 8];
-/// let asked = Asked { head: true, connect: false };
-/// let Parsed::Complete { head, .. } = parse_response_head(input, &Limits::new(), asked, &mut fields)? else {
+/// let Parsed::Complete { head, .. } = parse_response_head(input, &Limits::new(), Method::Head, &mut fields)? else {
 ///     panic!("incomplete");
 /// };
 /// // A response to HEAD has no body, whatever its fields say.
@@ -740,7 +731,7 @@ pub fn parse_request_head<'a>(
 pub fn parse_response_head<'a>(
     input: &'a [u8],
     limits: &Limits,
-    asked: Asked,
+    request_method: Method,
     fields: &'a mut [FieldSpan],
 ) -> Result<Parsed<ParsedResponse<'a>>, HttpError> {
     let mut lines = LineScan::new();
@@ -753,6 +744,7 @@ pub fn parse_response_head<'a>(
     let slots: &'a [FieldSpan] = slots;
     let fields = slots.get(..count).unwrap_or(&[]);
     let bytes = input.get(..len).unwrap_or(input);
+    let asked = Asked::from_method(request_method);
     let info = interpret_response(bytes, lines.start_line(), fields, limits, asked)?;
     Ok(Parsed::Complete {
         head: ParsedResponse {
@@ -778,7 +770,7 @@ mod tests {
             panic!("no request in {input:?}");
         };
         let (mut bytes, mut fields) = (Vec::new(), Vec::new());
-        let facts = req.copy_into(&mut bytes, &mut fields).unwrap();
+        let facts = req.copy_into(&mut bytes, &mut fields);
         (bytes, fields, facts)
     }
 
@@ -1038,7 +1030,7 @@ mod tests {
         let mut fields = [FieldSpan::default(); 4];
         let input = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
         let Ok(Parsed::Complete { head, len }) =
-            parse_response_head(input, &Limits::new(), Asked::default(), &mut fields)
+            parse_response_head(input, &Limits::new(), Method::Get, &mut fields)
         else {
             panic!()
         };
@@ -1049,12 +1041,8 @@ mod tests {
             b"200"
         );
         let mut fields = [FieldSpan::default(); 4];
-        let connect = Asked {
-            head: false,
-            connect: true,
-        };
         let Ok(Parsed::Complete { head, .. }) =
-            parse_response_head(input, &Limits::new(), connect, &mut fields)
+            parse_response_head(input, &Limits::new(), Method::Connect, &mut fields)
         else {
             panic!()
         };
@@ -1064,7 +1052,7 @@ mod tests {
             parse_response_head(
                 b"\r\nHTTP/1.1 200 OK\r\n\r\n",
                 &Limits::new(),
-                Asked::default(),
+                Method::Get,
                 &mut fields
             )
             .err(),
@@ -1072,13 +1060,13 @@ mod tests {
         );
         let mut fields = [FieldSpan::default(); 4];
         assert!(matches!(
-            parse_response_head(b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n", &Limits::new(), Asked::default(), &mut fields),
+            parse_response_head(b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n", &Limits::new(), Method::Get, &mut fields),
             Ok(Parsed::Complete { head, .. }) if head.view().is_informational()
         ));
         let v = vec![b'x'; 3];
         let mut fields = [FieldSpan::default(); 4];
         assert!(matches!(
-            parse_response_head(&v, &Limits::new(), Asked::default(), &mut fields),
+            parse_response_head(&v, &Limits::new(), Method::Get, &mut fields),
             Ok(Parsed::Partial)
         ));
     }
