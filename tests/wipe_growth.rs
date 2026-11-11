@@ -5,8 +5,9 @@
 //! freed; `realloc` is left at its default (allocate, copy, free), so a
 //! block a reallocation moves is freed through `dealloc` and inspected too.
 //!
-//! One test per binary would be simplest; the tests share the allocator, so
-//! they take a lock and each counts only its own marker.
+//! The tests share the allocator, so they run one at a time (a lock) and
+//! each counts only its own marker. The allocator itself takes no lock: the
+//! marker is published through atomics, so no freed block goes unchecked.
 
 #![allow(unsafe_code)]
 
@@ -14,13 +15,15 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
 
 use http_net::{ClientConn, ClientEvent, Request, Response, ServerConn, ServerEvent};
 
-static MARKER: Mutex<Option<&'static [u8]>> = Mutex::new(None);
+/// The armed marker: its bytes and length; a length of 0 is disarmed.
+static MARKER_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static MARKER_LEN: AtomicUsize = AtomicUsize::new(0);
 static LEAKED: AtomicUsize = AtomicUsize::new(0);
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -35,17 +38,15 @@ unsafe impl GlobalAlloc for Inspecting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // `try_lock`: the lock is held while a marker is set, and this may
-        // run inside the allocator, so never wait for it.
-        if let Ok(marker) = MARKER.try_lock() {
-            if let Some(marker) = *marker {
-                if layout.size() >= marker.len() {
-                    // SAFETY: the block is live until `System.dealloc` below.
-                    let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
-                    if block.windows(marker.len()).any(|w| w == marker) {
-                        let _ = LEAKED.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+        let len = MARKER_LEN.load(Ordering::Acquire);
+        if len > 0 && layout.size() >= len {
+            // SAFETY: the marker is a `'static` slice of `len` bytes, published
+            // before its length; the block is live until `System.dealloc`.
+            let marker =
+                unsafe { std::slice::from_raw_parts(MARKER_PTR.load(Ordering::Acquire), len) };
+            let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+            if block.windows(len).any(|w| w == marker) {
+                let _ = LEAKED.fetch_add(1, Ordering::Relaxed);
             }
         }
         // SAFETY: as the caller promised for this block.
@@ -61,9 +62,10 @@ static GLOBAL: Inspecting = Inspecting;
 fn leaked_blocks(marker: &'static [u8], exchange: impl FnOnce()) -> usize {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     LEAKED.store(0, Ordering::Relaxed);
-    *MARKER.lock().unwrap() = Some(marker);
+    MARKER_PTR.store(marker.as_ptr().cast_mut(), Ordering::Release);
+    MARKER_LEN.store(marker.len(), Ordering::Release);
     exchange();
-    *MARKER.lock().unwrap() = None;
+    MARKER_LEN.store(0, Ordering::Release);
     LEAKED.load(Ordering::Relaxed)
 }
 
