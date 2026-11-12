@@ -8,6 +8,13 @@
 //! and limit enforcement happens in the sans-IO core.
 //!
 //! Only plain `http://` is spoken; there is no TLS in this crate.
+//!
+//! The server is for local, development, and trusted-network use. One
+//! thread serves each connection, up to the connection cap (64 by
+//! default), and the cap is the only admission control: a peer that holds
+//! that many slow connections keeps other clients waiting until the
+//! request timeout ends each one. An internet-facing server drives
+//! [`ServerConn`] from an event loop with per-peer limits (serve-net does).
 
 use std::{
     cell::Cell,
@@ -30,7 +37,7 @@ use crate::{
     BodyPlan, ClientConn, ClientEvent, DateCache, HttpDate, HttpError, Limits, Method, Progress,
     Request, RequestHead, Response, ServerConn, ServerEvent,
     message::OutBody,
-    redact::{FieldValue, serialized_fields},
+    redact::{FieldValue, Target, serialized_fields},
 };
 
 /// Bytes a closing connection reads and discards so the peer's unread data
@@ -121,7 +128,7 @@ impl From<HttpError> for Error {
 /// let config = ServerConfig::new()
 ///     .with_limits(Limits::new().with_max_body(16 * 1024))
 ///     .with_max_connections(8)
-///     .with_read_timeout(Some(Duration::from_secs(5)));
+///     .with_read_timeout(Duration::from_secs(5));
 /// assert_eq!(config.max_connections(), 8);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,17 +200,22 @@ impl ServerConfig {
 
     /// Sets the socket read timeout: the longest a single read may wait for
     /// bytes (the longest pause within a request), and how long an idle
-    /// keep-alive connection is held. `None` waits forever.
+    /// keep-alive connection is held. Pass a `Duration`, or `None` to wait
+    /// forever.
     ///
     /// # Examples
     ///
     /// ```
-    /// let c = http_net::blocking::ServerConfig::new().with_read_timeout(None);
-    /// assert_eq!(c.read_timeout(), None);
+    /// use std::time::Duration;
+    /// use http_net::blocking::ServerConfig;
+    ///
+    /// let c = ServerConfig::new().with_read_timeout(Duration::from_secs(5));
+    /// assert_eq!(c.read_timeout(), Some(Duration::from_secs(5)));
+    /// assert_eq!(c.with_read_timeout(None).read_timeout(), None);
     /// ```
     #[must_use]
-    pub const fn with_read_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.read_timeout = timeout;
+    pub fn with_read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.read_timeout = timeout.into();
         self
     }
 
@@ -213,33 +225,35 @@ impl ServerConfig {
     /// ("slowloris"); this deadline can. A request still incomplete when it
     /// passes is answered `408 Request Timeout` and the connection closed.
     /// Time spent idle between keep-alive requests does not count (the read
-    /// timeout governs that). `None` disables the deadline.
+    /// timeout governs that). Pass a `Duration`, or `None` to disable the
+    /// deadline.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::time::Duration;
-    /// let c = http_net::blocking::ServerConfig::new().with_request_timeout(Some(Duration::from_secs(10)));
+    /// let c = http_net::blocking::ServerConfig::new().with_request_timeout(Duration::from_secs(10));
     /// assert_eq!(c.request_timeout(), Some(Duration::from_secs(10)));
     /// ```
     #[must_use]
-    pub const fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.request_timeout = timeout;
+    pub fn with_request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.request_timeout = timeout.into();
         self
     }
 
-    /// Sets the socket write timeout. `None` waits forever.
+    /// Sets the socket write timeout. Pass a `Duration`, or `None` to wait
+    /// forever.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::time::Duration;
-    /// let c = http_net::blocking::ServerConfig::new().with_write_timeout(Some(Duration::from_secs(1)));
+    /// let c = http_net::blocking::ServerConfig::new().with_write_timeout(Duration::from_secs(1));
     /// assert_eq!(c.write_timeout(), Some(Duration::from_secs(1)));
     /// ```
     #[must_use]
-    pub const fn with_write_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.write_timeout = timeout;
+    pub fn with_write_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.write_timeout = timeout.into();
         self
     }
 
@@ -248,34 +262,35 @@ impl ServerConfig {
     /// The write timeout bounds each write; it cannot stop a client that
     /// reads one byte just inside it and so holds a thread for as long as a
     /// large response takes. This deadline can: when it passes, the
-    /// connection is closed. `None` disables it.
+    /// connection is closed. Pass a `Duration`, or `None` to disable it.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::time::Duration;
-    /// let c = http_net::blocking::ServerConfig::new().with_response_deadline(Some(Duration::from_secs(5)));
+    /// let c = http_net::blocking::ServerConfig::new().with_response_deadline(Duration::from_secs(5));
     /// assert_eq!(c.response_deadline(), Some(Duration::from_secs(5)));
     /// ```
     #[must_use]
-    pub const fn with_response_deadline(mut self, deadline: Option<Duration>) -> Self {
-        self.response_deadline = deadline;
+    pub fn with_response_deadline(mut self, deadline: impl Into<Option<Duration>>) -> Self {
+        self.response_deadline = deadline.into();
         self
     }
 
     /// Sets the most requests served on one connection: the response that
     /// reaches the cap carries `connection: close` and the connection ends
-    /// after it. `Some(0)` is raised to 1; `None` (the default) sets no cap.
+    /// after it. Pass a count (0 is raised to 1), or `None` (the default)
+    /// for no cap.
     ///
     /// # Examples
     ///
     /// ```
-    /// let c = http_net::blocking::ServerConfig::new().with_max_requests_per_connection(Some(100));
+    /// let c = http_net::blocking::ServerConfig::new().with_max_requests_per_connection(100);
     /// assert_eq!(c.max_requests_per_connection(), Some(100));
     /// ```
     #[must_use]
-    pub const fn with_max_requests_per_connection(mut self, max: Option<u64>) -> Self {
-        self.max_requests = match max {
+    pub fn with_max_requests_per_connection(mut self, max: impl Into<Option<u64>>) -> Self {
+        self.max_requests = match max.into() {
             Some(0) => Some(1),
             other => other,
         };
@@ -412,7 +427,7 @@ impl fmt::Debug for Upgraded {
         f.debug_struct("Upgraded")
             .field("stream", &self.stream)
             .field("leftover", &format_args!("{} bytes", self.leftover.len()))
-            .field("target", &self.target)
+            .field("target", &Target(&self.target))
             .finish()
     }
 }
@@ -790,7 +805,8 @@ fn serve_stream(
     if !configured {
         return;
     }
-    let mut conn = Connection::new(stream, config.limits)
+    let mut conn = Connection::new(stream)
+        .with_limits(config.limits)
         .with_request_timeout(config.request_timeout)
         .with_response_deadline(config.response_deadline);
     conn.refuse_unknown_expectations = true;
@@ -993,7 +1009,7 @@ impl<'a> Incoming<'a> {
 /// ```
 /// use std::net::{TcpListener, TcpStream};
 /// use std::io::{Read, Write};
-/// use http_net::{blocking::Connection, Limits, Response};
+/// use http_net::{blocking::Connection, Response};
 ///
 /// let listener = TcpListener::bind("127.0.0.1:0")?;
 /// let addr = listener.local_addr()?;
@@ -1006,7 +1022,7 @@ impl<'a> Incoming<'a> {
 /// });
 ///
 /// let (stream, _) = listener.accept()?;
-/// let mut conn = Connection::new(stream, Limits::new());
+/// let mut conn = Connection::new(stream);
 /// while let Some(req) = conn.next_request()? {
 ///     let sum: u32 = std::str::from_utf8(req.body())?.split(' ').filter_map(|n| n.parse::<u32>().ok()).sum();
 ///     let response = Response::text(200, &sum.to_string());
@@ -1062,8 +1078,9 @@ impl fmt::Debug for Connection {
 }
 
 impl Connection {
-    /// Wraps an accepted socket. Set its timeouts first if you want them:
-    /// the read timeout set on `stream` is the idle timeout, and
+    /// Wraps an accepted socket, with the default [`Limits`]. Set its
+    /// timeouts first if you want them: the read timeout set on `stream` is
+    /// the idle timeout, and
     /// [`with_request_timeout`](Self::with_request_timeout) adds a deadline
     /// for each request as a whole.
     ///
@@ -1071,12 +1088,12 @@ impl Connection {
     ///
     /// See [`Connection`].
     #[must_use]
-    pub fn new(stream: TcpStream, limits: Limits) -> Self {
+    pub fn new(stream: TcpStream) -> Self {
         let read_timeout = stream.read_timeout().ok().flatten();
         let write_timeout = stream.write_timeout().ok().flatten();
         Self {
             stream,
-            conn: ServerConn::with_limits(limits),
+            conn: ServerConn::new(),
             body: Vec::new(),
             out: Vec::new(),
             read_timeout,
@@ -1103,14 +1120,34 @@ impl Connection {
     /// ```
     /// use std::time::Duration;
     /// # fn demo(stream: std::net::TcpStream) {
-    /// let conn = http_net::blocking::Connection::new(stream, http_net::Limits::new())
-    ///     .with_response_deadline(Some(Duration::from_secs(60)));
+    /// let conn = http_net::blocking::Connection::new(stream)
+    ///     .with_response_deadline(Duration::from_secs(60));
     /// # let _ = conn;
     /// # }
     /// ```
     #[must_use]
-    pub fn with_response_deadline(mut self, deadline: Option<Duration>) -> Self {
-        self.response_deadline = deadline;
+    pub fn with_response_deadline(mut self, deadline: impl Into<Option<Duration>>) -> Self {
+        self.response_deadline = deadline.into();
+        self
+    }
+
+    /// Sets the message limits. Call it before the first
+    /// [`next_request`](Self::next_request): it starts the connection's
+    /// state again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn demo(stream: std::net::TcpStream) {
+    /// use http_net::{Limits, blocking::Connection};
+    ///
+    /// let conn = Connection::new(stream).with_limits(Limits::new().with_max_body(64 * 1024));
+    /// # let _ = conn;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.conn = ServerConn::with_limits(limits);
         self
     }
 
@@ -1126,14 +1163,14 @@ impl Connection {
     /// ```
     /// use std::time::Duration;
     /// # fn demo(stream: std::net::TcpStream) {
-    /// let conn = http_net::blocking::Connection::new(stream, http_net::Limits::new())
-    ///     .with_request_timeout(Some(Duration::from_secs(10)));
+    /// let conn = http_net::blocking::Connection::new(stream)
+    ///     .with_request_timeout(Duration::from_secs(10));
     /// # let _ = conn;
     /// # }
     /// ```
     #[must_use]
-    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.request_timeout = timeout;
+    pub fn with_request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.request_timeout = timeout.into();
         self
     }
 
@@ -1785,18 +1822,18 @@ impl Client {
     /// request, and reading the whole response. The per-operation timeout
     /// of [`with_timeout`](Self::with_timeout) cannot stop a server that
     /// sends one byte just inside it; this deadline can. Name resolution is
-    /// not bounded: `std` offers no timeout for it. `None` (the default)
-    /// disables the deadline.
+    /// not bounded: `std` offers no timeout for it. Pass a `Duration`, or
+    /// `None` (the default) for no deadline.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::time::Duration;
-    /// let _ = http_net::blocking::Client::new().with_deadline(Some(Duration::from_secs(10)));
+    /// let _ = http_net::blocking::Client::new().with_deadline(Duration::from_secs(10));
     /// ```
     #[must_use]
-    pub const fn with_deadline(mut self, deadline: Option<Duration>) -> Self {
-        self.deadline = deadline;
+    pub fn with_deadline(mut self, deadline: impl Into<Option<Duration>>) -> Self {
+        self.deadline = deadline.into();
         self
     }
 
@@ -1921,6 +1958,23 @@ fn connect_any(
     timeout: Duration,
     deadline: Option<Instant>,
 ) -> Result<TcpStream, Error> {
+    let stream = first_connected(addrs, timeout, deadline, TcpStream::connect_timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+/// Tries each address in turn with `connect`, each attempt waiting at most
+/// `timeout` and what is left of `deadline`; the first success wins, and
+/// the last failure is the error. The connect function is a parameter so
+/// the fallback logic is tested without sockets.
+fn first_connected<S>(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    timeout: Duration,
+    deadline: Option<Instant>,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> io::Result<S>,
+) -> Result<S, Error> {
     let mut last = None;
     for addr in addrs {
         let wait = match deadline {
@@ -1933,13 +1987,8 @@ fn connect_any(
             }
             None => timeout,
         };
-        match TcpStream::connect_timeout(&addr, wait) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(timeout))?;
-                stream.set_write_timeout(Some(timeout))?;
-                stream.set_nodelay(true)?;
-                return Ok(stream);
-            }
+        match connect(&addr, wait) {
+            Ok(stream) => return Ok(stream),
             Err(e) => last = Some(e),
         }
     }
@@ -2215,6 +2264,26 @@ mod tests {
     }
 
     #[test]
+    fn test_time_setters_take_a_duration_an_option_or_none() {
+        let five = Duration::from_secs(5);
+        let c = ServerConfig::new()
+            .with_read_timeout(five)
+            .with_request_timeout(Some(five))
+            .with_write_timeout(None)
+            .with_response_deadline(five)
+            .with_max_requests_per_connection(0);
+        assert_eq!(c.read_timeout(), Some(five));
+        assert_eq!(c.request_timeout(), Some(five));
+        assert_eq!(c.write_timeout(), None);
+        assert_eq!(c.response_deadline(), Some(five));
+        assert_eq!(c.max_requests_per_connection(), Some(1));
+        let c = c.with_max_requests_per_connection(None);
+        assert_eq!(c.max_requests_per_connection(), None);
+        assert_eq!(Client::new().with_deadline(five).deadline, Some(five));
+        assert_eq!(Client::new().with_deadline(None).deadline, None);
+    }
+
+    #[test]
     fn test_now_date_is_the_current_second() {
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2233,24 +2302,80 @@ mod tests {
     }
 
     /// E-198: a name that resolves to several addresses is tried in order;
-    /// an address that refuses the connection does not end the attempt.
+    /// an address that refuses the connection does not end the attempt. The
+    /// fallback is tested with a scripted connect, so no port has to stay
+    /// closed (a freed ephemeral port can be taken again by another test or
+    /// process, which made a socket version of this test flaky).
     #[test]
-    fn test_connect_any_unreachable_first_address_tries_the_next() {
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
-        let refused = closed.local_addr().unwrap();
-        drop(closed);
-        let open = TcpListener::bind("127.0.0.1:0").unwrap();
-        let good = open.local_addr().unwrap();
-        let stream = connect_any([refused, good], Duration::from_secs(5), None).unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), good);
+    fn test_first_connected_refused_first_address_tries_the_next() {
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let mut tried = Vec::new();
+        let got = first_connected([a, b], Duration::from_secs(5), None, |addr, _| {
+            tried.push(*addr);
+            if *addr == a {
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            } else {
+                Ok(*addr)
+            }
+        });
+        assert_eq!(got.unwrap(), b);
+        assert_eq!(tried, [a, b]);
 
-        let err = connect_any([refused], Duration::from_secs(5), None).unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err}");
-        let err = connect_any(Vec::<SocketAddr>::new(), Duration::from_secs(5), None).unwrap_err();
+        let err = first_connected([a, b], Duration::from_secs(5), None, |addr, _| {
+            Err::<(), _>(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                addr.to_string(),
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.to_string() == b.to_string()),
+            "the last failure is reported: {err}"
+        );
+        let err = first_connected(
+            Vec::<SocketAddr>::new(),
+            Duration::from_secs(5),
+            None,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
             "{err}"
         );
+    }
+
+    /// Each attempt waits at most the timeout and what is left of the
+    /// deadline.
+    #[test]
+    fn test_first_connected_each_wait_is_capped_by_the_deadline() {
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut waits = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _ = first_connected([a, a], Duration::from_secs(5), Some(deadline), |_, wait| {
+            waits.push(wait);
+            Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused))
+        });
+        assert_eq!(waits, [Duration::from_secs(5), Duration::from_secs(5)]);
+        waits.clear();
+        let soon = Instant::now() + Duration::from_secs(2);
+        let _ = first_connected([a], Duration::from_secs(5), Some(soon), |_, wait| {
+            waits.push(wait);
+            Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused))
+        });
+        assert!(waits[0] <= Duration::from_secs(2), "{waits:?}");
+    }
+
+    /// The socket path: a live listener is reached and the stream gets its
+    /// timeouts.
+    #[test]
+    fn test_connect_any_reaches_a_listener() {
+        let open = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = open.local_addr().unwrap();
+        let stream = connect_any([good], Duration::from_secs(5), None).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert_eq!(stream.read_timeout().unwrap(), Some(Duration::from_secs(5)));
     }
 
     #[test]

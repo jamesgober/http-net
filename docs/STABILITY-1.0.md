@@ -1,8 +1,8 @@
 # http-net - Stability (1.0)
 
 > What http-net 1.0.0 commits to, what a 1.x release may change, what only a
-> 2.0 may change, and the audit that 1.0.0 is released on. **Draft (0.9.2):**
-> the API is frozen as the 1.0 candidate; the audit record at the end is
+> 2.0 may change, and the audit that 1.0.0 is released on. **Draft (0.10.0):**
+> the API is frozen as the 1.0 candidate (simplified in 0.10.0, D-77); the audit record at the end is
 > filled in as each part is done, and 1.0.0 ships only when every part is
 > recorded and James approves the release.
 
@@ -37,7 +37,7 @@ The complete list, with signatures, errors, and examples, is
 | Connections | `ServerConn`, `ServerEvent`, `Progress`; `ClientConn`, `ClientEvent`, `ClientLeniency` |
 | Views | `RequestHead`, `ResponseHead`, `Headers`, `HeaderValues`, `ListElements`, `Version`, `BodyFraming`, `TargetForm`, `OwnedRequestHead` |
 | Builders | `Request`, `Response` |
-| Allocation-free tier | `RawHead`, `Span`, `FieldSpan`, `HeadFacts`, `parse_request_head`, `parse_response_head`, `Asked`, `Parsed`, `ParsedRequest`, `ParsedResponse`, `ChunkedDecoder`, `ChunkStep`, `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` |
+| Allocation-free tier | `RawHead`, `Span`, `FieldSpan`, `HeadFacts`, `parse_request_head`, `parse_response_head`, `Parsed`, `ParsedRequest`, `ParsedResponse`, `ChunkedDecoder`, `ChunkStep`, `Output`, `ResponseHeadRef`, `OutgoingBody`, `BodyPlan` |
 | Vocabulary | `Method`, `MethodSet`, `status` (constants, `StatusClass`, `reason_phrase`, `status_class`, `status_allows_body`), `HttpDate`, `DateCache`, `is_hop_by_hop`, `is_h2_preface`, `VERSION` |
 | Configuration and errors | `Limits` (every setting and its default), `HttpError` (every variant, `is_peer_error`, `is_usage_error`, `status`) |
 | `blocking` (feature `std`) | `Server`, `ServerConfig`, `ShutdownHandle`, `Incoming`, `Connection`, `Upgraded`, `Client`, `ClientResponse`, `Error`, `get`, `post`, `serve`, `now_date` |
@@ -48,7 +48,7 @@ Which types may grow in 1.x is decided at the freeze (`dev/PLAN.md` D-63):
   and a new variant is a minor release.
 - `ClientLeniency` and `blocking::Upgraded` are `#[non_exhaustive]` structs:
   a new field is a minor release.
-- `Asked`, `ResponseHeadRef`, `Span`, and `FieldSpan` are built by callers
+- `ResponseHeadRef`, `Span`, and `FieldSpan` are built by callers
   with struct literals and stay exactly as they are for all of 1.x.
 - Every other public struct has private fields; new methods are a minor
   release.
@@ -112,7 +112,8 @@ latest release only.
 
 Each part records what was checked, how, and the result. 1.0.0 ships when
 every part says **done**, the 0.9 exit criteria hold (two consecutive weeks
-without an API change after 0.9.0, D-66; the full documentation set; local
+without an API change, counted from the last API change, 0.10.0, D-66 and
+D-77; the full documentation set; local
 gate and CI green on every platform and the MSRV), and James approves.
 
 ### API
@@ -124,7 +125,16 @@ gate and CI green on every platform and the MSRV), and James approves.
 - `cargo semver-checks` to 0.9.1 and to 0.9.2: no change (196 checks).
   Run it with a toolchain whose rustdoc format it reads (Rust 1.95 for
   cargo-semver-checks 0.47).
-- **Status:** freeze done; two-week clock running from the 0.9.0 release.
+- Simplicity audit before 1.0 (D-77): Tier 1 one-liners with plain `?`,
+  plain names, one way to do each thing, every public item in
+  `docs/API.md`. Five findings, fixed in 0.10.0: `Asked` removed
+  (`parse_response_head` takes the request's `Method`), `copy_into`
+  returns its facts with no `Result` that could never fail,
+  `blocking::Connection::new` takes only the socket (`with_limits` like
+  every other constructor), the blocking time setters take a `Duration`
+  or `None`, and `?` turns an `HttpError` into an `io::Error`. The rest
+  was checked and kept, with the reasons in D-77.
+- **Status:** done; the two-week clock restarts at the 0.10.0 release.
 
 ### Documentation
 
@@ -192,6 +202,10 @@ gate and CI green on every platform and the MSRV), and James approves.
   finding in the crate (one overflow in a test oracle, fixed, D-74), and
   the HTTP Garden ran again with the same result as its first run, on
   the 0.9.1 code and again on the 0.9.2 code.
+- A third, independent review, of 0.9.2 (D-78), found no defect in the
+  parser or framing core; its proxy, wipe, and adapter findings are fixed
+  in 0.10.0 with regression tests (`docs/SECURITY.md`, review record
+  0.10.0; threats T-43 to T-45).
 - **Status:** done.
 
 ### Parity with other implementations
@@ -226,8 +240,10 @@ Everything else in the audit above is done.
   one, or ship 1.0 on two.
 - Whether LexerSketch Studio's publish step must use the API end to end
   before 1.0, as the specification asks.
-- The 1.0 go or no-go itself, no earlier than 2026-11-12 (two weeks after
-  0.9.0 with no API change, D-66).
+- The 1.0 go or no-go itself, no earlier than 2026-11-26: two weeks
+  after 0.10.0, the last API change (D-66, D-77). The clock restarted
+  because the simplicity audit changed the API; waiving it is James's
+  call.
 
 **Engineering, before the 1.0 tag:** none left. The quiet-machine H1
 run, H6, and the picohttpparser and llhttp harnesses ran on 2026-11-04

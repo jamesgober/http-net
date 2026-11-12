@@ -44,9 +44,9 @@
 - **[`Limits`](./docs/API.md#limits)** bounds every buffer; **[`HttpError`](./docs/API.md#httperror)** says exactly what was refused and which status to answer with, and [`Response::from_error`](./docs/API.md#responsefrom_error) builds that answer.
 - Both connections carry **trailers** (reported on request, sent with `end_body_with_trailers`) and **interim responses** (`send_informational` for `103 Early Hints`; reported to the client on request), and the client can send **`Expect: 100-continue`** and hold its body back. **[`Progress`](./docs/API.md#progress)**, `set_keep_alive`, and `requests_served` give drivers what they need for deadlines and load shedding; **[`DateCache`](./docs/API.md#httpdate-and-datecache)** formats `Date` once per second.
 - **[`Method`](./docs/API.md#method)** and **[`MethodSet`](./docs/API.md#methodset)** classify methods (safe, idempotent, a bit set for routers and `Allow`); [`reason_phrase`](./docs/API.md#reason_phrase) and the [`status`](./docs/API.md#status-constants) constants cover the whole IANA status registry.
-- The client **pipelines** idempotent requests up to a configured depth; both connections can be **reset, pooled, and shrunk** while idle, and the server can **wipe** consumed input so credentials do not linger.
+- The client **pipelines** idempotent requests up to a configured depth; both connections can be **reset, pooled, and shrunk** while idle, and **wipe** consumed input so credentials do not linger.
 - **Tier 3** for gateways and proxies (the parsers, the decoder, the writer, and copying a head into reused buffers allocate nothing): [spans and copied heads](./docs/API.md#spans-raw-heads-owned-heads) for passing a head to another thread, [stateless head parsers](./docs/API.md#stateless-head-parsers), a standalone [`ChunkedDecoder`](./docs/API.md#chunkeddecoder), the [`Output` writer](./docs/API.md#output-and-the-borrowed-writer) with borrowed fields, [`forward_from`](./docs/API.md#requestforward_from) with hop-by-hop removal, and [HTTP/2 preface detection](./docs/API.md#is_h2_preface).
-- The **[`blocking`](./docs/API.md#blocking-adapter)** module (feature `std`) drives both over `std::net`: a bounded thread-per-connection `Server`, a per-connection `Connection`, and `get`.
+- The **[`blocking`](./docs/API.md#blocking-adapter)** module (feature `std`) drives both over `std::net`: a bounded thread-per-connection `Server`, a per-connection `Connection`, and `get`. The server is for local, development, and trusted-network use: its connection cap is its only admission control, so an internet-facing server drives `ServerConn` from an event loop with per-peer limits (serve-net).
 
 <br>
 
@@ -61,7 +61,7 @@ What it guarantees, and how each guarantee is checked:
 | The parse does not depend on how input is split. | Property tests compare whole, split, and byte-at-a-time feeding. |
 | Serialize and parse round-trip. | Property tests: requests from `ClientConn` parsed by `ServerConn`, responses the other way, with full, chunked, and fixed-length streamed bodies; absolute-form targets; keep-alive intent. |
 | Slow or stuck peers cannot pin the server. | Socket tests: a head or body trickled inside the read timeout is cut off by the request timeout with `408`; a refused client that keeps sending cannot stall the accept loop; lingering close ends after 1 s however the peer behaves. |
-| Credentials never reach logs through `Debug`. | `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` values print as `<redacted N bytes>` in every `Debug` output of the crate, and body and tunnel bytes print as their length; `tests/redaction.rs` checks every type that prints fields, in every case spelling of the names. |
+| Credentials never reach logs through `Debug`. | `authorization`, `proxy-authorization`, `cookie`, and `set-cookie` values, and those of any field whose name contains `auth`, `token`, `key`, `secret`, `session`, `password`, `csrf`, or `signature`, print as `<redacted N bytes>` in every `Debug` output of the crate; a target's query, body bytes, and tunnel bytes print as their length; `tests/redaction.rs` checks every type that prints fields, in every case spelling of the names. Other field values print as received. |
 | Steady-state parsing allocates nothing. | A counting allocator (`tests/alloc.rs`): 10,000 keep-alive requests on one `ServerConn`, and 10,000 responses (also pipelined) on one `ClientConn`, allocate nothing after warm-up; the stateless parsers and the `ChunkedDecoder` allocate nothing at all, and the `Output` writer allocates nothing into a reused buffer; 10 MiB hostile streams never grow a connection past its buffer capacity. |
 | It agrees with other parsers where it accepts. | A differential test against `httparse` (`tests/prop_httparse.rs`): on every request head both accept, the length, method, target, version, and fields match; every head only `httparse` accepts is one of the documented stricter refusals. An RFC 9112 / 9110 conformance table (`tests/conformance.rs`) checks one statement per row. |
 | It survives fuzzing. | Eight cargo-fuzz targets (`fuzz/`): both connections under fuzzer-chosen splits, limits, and options (client fold leniency included), the chunk-line grammar, the builders, the stateless parsers and the `ChunkedDecoder` against the connections, and differential oracles against the reference parser and `httparse`, each run for 60 seconds in CI on every push and pull request to `main` and `dev`. |
@@ -74,14 +74,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-http-net = "0.9"
+http-net = "0.10"
 ```
 
 Without the standard library (the sans-IO core only):
 
 ```toml
 [dependencies]
-http-net = { version = "0.9", default-features = false }
+http-net = { version = "0.10", default-features = false }
 ```
 
 <hr>
@@ -110,7 +110,7 @@ thread.join().unwrap()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The server runs one thread per connection, at most 64 at once (the next is answered `503`), with a 10 s read timeout and a 30 s deadline per request (first byte to end of body; a late request gets `408`), answers `Expect: 100-continue` itself, and adds a `date` header to every response except that fixed `503`. Requests that fail to parse are answered with the matching status (`400`, `413`, `414`, `431`, `501`, `505`) and closed; the handler never sees them. A handler that returns a streamed or invalid response gets a `500` instead of a hung client.
+The server runs one thread per connection, at most 64 at once (the next is answered `503`), with a 10 s read timeout and a 30 s deadline per request (first byte to end of body; a late request gets `408`), answers `Expect: 100-continue` itself, and adds a `date` header to every response except that fixed `503`. Requests that fail to parse are answered with the matching status (`400`, `413`, `414`, `431`, `501`, `505`) and closed; the handler never sees them. A handler that returns a streamed or invalid response gets a `500` instead of a hung client. It is for local, development, and trusted-network use: 64 slow connections fill it, so an internet-facing server drives the sans-IO core below from an event loop with per-peer limits.
 
 ### The sans-IO core
 

@@ -8,7 +8,8 @@ use crate::{
     date::HttpDate,
     error::HttpError,
     head::{
-        HeadKind, HeadScanner, Headers, RequestHead, RequestInfo, Scan, Version, interpret_request,
+        HeadKind, HeadScanner, Headers, RequestHead, RequestInfo, Scan, Version,
+        drop_forbidden_trailers, interpret_request,
     },
     limits::Limits,
     message::{
@@ -495,32 +496,42 @@ impl ServerConn {
     }
 
     fn poll_body(&mut self) -> Result<ServerEvent<'_>, HttpError> {
-        let mut framing_bytes = 0;
-        let step = self.decoder.step(
-            self.buf.unread(),
-            self.buf.is_eof(),
-            &self.limits,
-            &mut self.trailers,
-            self.report_trailers,
-            &mut framing_bytes,
-        );
-        self.buf.consume(framing_bytes);
-        match step.map_err(|e| self.fail(e))? {
-            Step::Data(n) => {
-                let start = self.buf.pos();
-                self.buf.consume(n);
-                self.body_seen = true;
-                Ok(ServerEvent::Body(self.buf.range(start, start + n)))
-            }
-            Step::Trailers => Ok(ServerEvent::Trailers(Headers::new(
+        // A loop, not a recursive call, so the body path stays inlinable.
+        loop {
+            let mut framing_bytes = 0;
+            let step = self.decoder.step(
                 self.buf.unread(),
-                &self.trailers.fields,
-            ))),
-            Step::Done => {
-                self.state = ReqState::Complete;
-                Ok(ServerEvent::RequestEnd)
-            }
-            Step::NeedMore => Ok(ServerEvent::NeedInput),
+                self.buf.is_eof(),
+                &self.limits,
+                &mut self.trailers,
+                self.report_trailers,
+                &mut framing_bytes,
+            );
+            self.buf.consume(framing_bytes);
+            return match step.map_err(|e| self.fail(e))? {
+                Step::Data(n) => {
+                    let start = self.buf.pos();
+                    self.buf.consume(n);
+                    self.body_seen = true;
+                    Ok(ServerEvent::Body(self.buf.range(start, start + n)))
+                }
+                Step::Trailers => {
+                    drop_forbidden_trailers(self.buf.unread(), &mut self.trailers.fields);
+                    if self.trailers.fields.is_empty() {
+                        // Nothing left to report: the next step ends the body.
+                        continue;
+                    }
+                    Ok(ServerEvent::Trailers(Headers::new(
+                        self.buf.unread(),
+                        &self.trailers.fields,
+                    )))
+                }
+                Step::Done => {
+                    self.state = ReqState::Complete;
+                    Ok(ServerEvent::RequestEnd)
+                }
+                Step::NeedMore => Ok(ServerEvent::NeedInput),
+            };
         }
     }
 
@@ -1052,7 +1063,8 @@ impl ServerConn {
 
     /// When `true`, the bytes of every finished request (head, body, and
     /// framing) are zeroed before the buffer is reused, stale copies left by
-    /// compaction are zeroed, and the whole buffer is zeroed on
+    /// compaction and the old block left by growth are zeroed, and the whole
+    /// buffer is zeroed on
     /// [`reset`](Self::reset), [`into_buffer`](Self::into_buffer), and drop,
     /// so credentials do not linger in memory between requests. Costs a
     /// `memset` of each request's bytes (about 11 ns per KiB, measured). Off

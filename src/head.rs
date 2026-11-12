@@ -15,7 +15,7 @@ use crate::{
     error::HttpError,
     limits::Limits,
     method::Method,
-    redact::{FieldName, FieldValue},
+    redact::{FieldName, FieldValue, Target},
     scan::{
         ListSplit, check_field_value, find_byte, is_host_value, is_ows, is_reason, is_target_chars,
         is_tchar, is_token, list_elements, parse_decimal, printable_run, trim_ows,
@@ -139,6 +139,20 @@ pub struct FieldSpan {
 
 /// The connections' own name for a field record.
 pub(crate) type Field = FieldSpan;
+
+/// Removes the fields a trailer section may not carry and a recipient
+/// could act on if it merged them into the head: framing
+/// (`content-length`, `transfer-encoding`) and routing (`host`), RFC 9110
+/// section 6.5.1. They never frame the message here; dropping them keeps a
+/// proxy or an application from relaying or merging them.
+pub(crate) fn drop_forbidden_trailers(head: &[u8], fields: &mut Vec<Field>) {
+    fields.retain(|f| {
+        let name = f.name.get(head);
+        !(name.eq_ignore_ascii_case(b"content-length")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"host"))
+    });
+}
 
 /// Where scanned field records go: the connection's reusable vector, a
 /// caller's slice (the stateless parsers, which allocate nothing), or
@@ -985,22 +999,22 @@ impl ResponseInfo {
 /// What the request asked for, which decides how its response is framed
 /// (RFC 9112 section 6.3): a response to `HEAD` has no body whatever its
 /// fields say, and a 2xx to `CONNECT` turns the connection into a tunnel.
-/// The input to [`parse_response_head`](crate::parse_response_head).
-///
-/// # Examples
-///
-/// ```
-/// use http_net::Asked;
-///
-/// let after_head = Asked { head: true, ..Asked::default() };
-/// assert!(after_head.head && !after_head.connect);
-/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Asked {
+pub(crate) struct Asked {
     /// The request was `HEAD`.
-    pub head: bool,
+    pub(crate) head: bool,
     /// The request was `CONNECT`.
-    pub connect: bool,
+    pub(crate) connect: bool,
+}
+
+impl Asked {
+    /// The facts of a request with `method`.
+    pub(crate) fn from_method(method: Method) -> Self {
+        Self {
+            head: method == Method::Head,
+            connect: method == Method::Connect,
+        }
+    }
 }
 
 pub(crate) fn interpret_response(
@@ -1777,13 +1791,13 @@ impl<'a> RequestHead<'a> {
     }
 }
 
-/// Shows method, target, version, fields, and framing; the values of
-/// credential fields are replaced by `<redacted N bytes>`.
+/// Shows method, target, version, fields, and framing; the query and the
+/// values of credential fields are replaced by `<redacted N bytes>`.
 impl fmt::Debug for RequestHead<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RequestHead")
             .field("method", &self.method_str())
-            .field("target", &self.target())
+            .field("target", &Target(self.target()))
             .field("version", &self.version())
             .field("headers", &self.headers())
             .field("framing", &self.framing())

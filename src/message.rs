@@ -14,10 +14,9 @@ use core::fmt;
 
 use crate::{
     error::HttpError,
-    forward::is_hop_by_hop,
     head::{BodyFraming, RequestHead, check_target, is_h2c},
     method::Method,
-    redact::{SerializedFields, serialized_fields},
+    redact::{SerializedFields, Target, serialized_fields},
     scan::{check_field_value, is_protocol, is_token, trim_ows},
     write::Output,
 };
@@ -694,17 +693,26 @@ impl Request {
     /// The target is copied as received: an absolute-form target (a request
     /// to a proxy) stays absolute, which an origin server also accepts (RFC
     /// 9112 section 3.2.2); rewrite it with [`Request::new`] if the upstream
-    /// wants origin form. `Host` is forwarded as a field. Add `via` and
-    /// forwarding fields with [`header`](Self::header); requests are
-    /// re-serialized, never passed through as raw bytes.
+    /// wants origin form. `host` is not copied: it is written from
+    /// [`RequestHead::host`](crate::RequestHead::host), the authority this
+    /// proxy read (the absolute-form target's, else the `Host` field's), as
+    /// RFC 9112 section 3.2.2 requires, so the next hop sees the authority
+    /// that was checked. Add `via` and forwarding fields with
+    /// [`header`](Self::header); requests are re-serialized, never passed
+    /// through as raw bytes.
+    ///
+    /// `proxy-authorization` is dropped: it is this proxy's credential (RFC
+    /// 9110 section 11.7.2). A proxy chain that relays it on purpose adds it
+    /// back with [`header`](Self::header).
     ///
     /// Every name the client lists in `Connection` is dropped, as RFC 9110
     /// section 7.6.1 requires, including end-to-end names such as
     /// `authorization` or `x-forwarded-for`: a client can strip fields a
     /// proxy relies on this way. Check
     /// [`connection_options`](crate::RequestHead::connection_options)
-    /// first if the next hop must see one of them. Listing `host` drops it
-    /// too, and the request then fails closed at send (no `Host`).
+    /// first if the next hop must see one of them. The options are read
+    /// once ([`RequestHead::end_to_end_headers`](crate::RequestHead::end_to_end_headers)),
+    /// so the copy is linear in the head.
     ///
     /// # Errors
     ///
@@ -728,7 +736,7 @@ impl Request {
     /// let mut upstream = ClientConn::new();
     /// let mut out = Vec::new();
     /// upstream.send_request(&upstream_req, &mut out)?;
-    /// assert_eq!(out, b"POST /api HTTP/1.1\r\nHost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
+    /// assert_eq!(out, b"POST /api HTTP/1.1\r\nhost: app\r\nAccept: */*\r\nvia: 1.1 proxy\r\ncontent-length: 2\r\n\r\n");
     /// # Ok::<(), http_net::HttpError>(())
     /// ```
     #[must_use]
@@ -742,11 +750,16 @@ impl Request {
             }
             return request;
         }
-        for (name, value) in head.headers() {
+        if let Some(host) = head.host() {
+            request = request.header("host", host);
+        }
+        for (name, value) in head.end_to_end_headers() {
             // `content-length` is end-to-end, but the connection derives it
-            // from the body mode below, so it is not copied as a field.
-            if !is_hop_by_hop(name, head.connection_options())
-                && !name.eq_ignore_ascii_case("content-length")
+            // from the body mode below; `host` was written above from the
+            // authority; `proxy-authorization` was meant for this proxy.
+            if !["content-length", "host", "proxy-authorization"]
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
             {
                 request = request.header(name, value);
             }
@@ -987,14 +1000,13 @@ impl Request {
     }
 }
 
-/// Shows method, target, fields, and body size; the values of credential
-/// fields (`authorization`, `proxy-authorization`, `cookie`) are replaced by
-/// `<redacted N bytes>`.
+/// Shows method, target, fields, and body size; the query and the values
+/// of credential fields are replaced by `<redacted N bytes>`.
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Request")
             .field("method", &self.method)
-            .field("target", &self.target)
+            .field("target", &Target(&self.target))
             .field("fields", &SerializedFields(&self.fields))
             .field("body", &body_debug(&self.body))
             .field("error", &self.error)

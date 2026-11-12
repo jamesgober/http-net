@@ -87,7 +87,7 @@ GET /c HTTP/1.1\r\nHost: exam";
                     view.target()
                 );
                 let Ok(mut passport) = pool.recv() else { break };
-                passport.facts = Some(view.copy_into(&mut passport.bytes, &mut passport.fields)?);
+                passport.facts = Some(view.copy_into(&mut passport.bytes, &mut passport.fields));
                 if to_worker.send(passport).is_err() {
                     break;
                 }

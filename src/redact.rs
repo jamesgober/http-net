@@ -9,20 +9,48 @@
 
 use core::fmt;
 
-/// Fields whose values carry credentials (RFC 9110 sections 11.6.2 and
-/// 11.7.2; RFC 6265 sections 4.1 and 4.2). Matched ASCII case-insensitively.
-const CREDENTIAL_FIELDS: &[&[u8]] = &[
-    b"authorization",
-    b"proxy-authorization",
+/// Name parts that mark a field as carrying a credential: the standard
+/// fields (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`,
+/// RFC 9110 sections 11.6.2 and 11.7.2, RFC 6265) and the usual custom
+/// ones (`x-api-key`, `x-auth-token`, `x-csrf-token`, `x-session-id`).
+/// Matched ASCII case-insensitively anywhere in the name; redacting a
+/// harmless field is cheaper than printing a secret.
+const CREDENTIAL_PARTS: &[&[u8]] = &[
+    b"auth",
     b"cookie",
-    b"set-cookie",
+    b"token",
+    b"secret",
+    b"key",
+    b"session",
+    b"password",
+    b"passwd",
+    b"csrf",
+    b"xsrf",
+    b"signature",
+    b"credential",
 ];
 
 /// Whether a field named `name` carries credentials.
 pub(crate) fn is_credential(name: &[u8]) -> bool {
-    CREDENTIAL_FIELDS
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(name))
+    CREDENTIAL_PARTS.iter().any(|part| {
+        name.windows(part.len())
+            .any(|w| w.eq_ignore_ascii_case(part))
+    })
+}
+
+/// A request target as `Debug` shows it: the path, and the query as its
+/// length only, since a query often carries a token or a signature.
+pub(crate) struct Target<'a>(pub(crate) &'a str);
+
+impl fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.split_once('?') {
+            Some((path, query)) => {
+                write!(f, "\"{path}?<redacted {} bytes>\"", query.len())
+            }
+            None => fmt::Debug::fmt(self.0, f),
+        }
+    }
 }
 
 /// A field value as `Debug` shows it: a string when it is UTF-8, bytes
@@ -88,18 +116,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_credential_any_case_matches_the_four_fields() {
+    fn test_is_credential_any_case_matches_standard_and_custom_names() {
         for name in [
             &b"Authorization"[..],
             b"PROXY-AUTHORIZATION",
             b"cookie",
             b"Set-Cookie",
+            b"X-Api-Key",
+            b"x-auth-token",
+            b"X-CSRF-Token",
+            b"x-session-id",
+            b"X-Client-Secret",
+            b"x-amz-signature",
+            b"www-authenticate",
         ] {
             assert!(is_credential(name), "{name:?}");
         }
-        for name in [&b"cookies"[..], b"x-authorization", b"", b"set-cookie2"] {
+        for name in [
+            &b"accept"[..],
+            b"host",
+            b"content-type",
+            b"x-request-id",
+            b"keep-alive",
+            b"",
+        ] {
             assert!(!is_credential(name), "{name:?}");
         }
+    }
+
+    #[test]
+    fn test_target_debug_redacts_the_query_only() {
+        assert_eq!(
+            format!("{:?}", Target("/cb?access_token=SECRET")),
+            "\"/cb?<redacted 19 bytes>\""
+        );
+        assert_eq!(format!("{:?}", Target("/plain")), "\"/plain\"");
+        assert_eq!(format!("{:?}", Target("*")), "\"*\"");
     }
 
     #[test]

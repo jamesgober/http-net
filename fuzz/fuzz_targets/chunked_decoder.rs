@@ -1,7 +1,8 @@
 //! The standalone `ChunkedDecoder` against the connection it shares code
 //! with. The same bytes, sent as the chunked body of a request on
 //! `ServerConn` and decoded by `ChunkedDecoder` at fuzzer-chosen splits,
-//! must give the same body, the same trailers and the same error, and the
+//! must give the same body, the same trailers (once the fields a trailer
+//! may not carry are dropped, as the connection does) and the same error, and the
 //! bytes left after the body must parse on a fresh connection exactly as
 //! they did after the body on the first (except that only a fresh
 //! connection refuses the HTTP/2 preface, which it checks before its first
@@ -73,9 +74,19 @@ fn decode(pieces: &[&[u8]], limits: &Limits) -> (Vec<Ev>, Option<Vec<u8>>) {
                 let _ = buf.drain(..skip + len);
             }
             Ok(ChunkStep::Trailers { skip, len }) => {
-                let section = fields(&buf[skip..skip + len]);
+                let mut section = fields(&buf[skip..skip + len]);
                 assert!(!section.is_empty(), "an empty trailer section was reported");
-                events.push(Ev::Trailers(section));
+                // The decoder validates the section; the connection also
+                // drops the fields a trailer may not carry, and reports no
+                // event when none are left.
+                section.retain(|(name, _)| {
+                    !["content-length", "transfer-encoding", "host"]
+                        .iter()
+                        .any(|f| name.eq_ignore_ascii_case(f))
+                });
+                if !section.is_empty() {
+                    events.push(Ev::Trailers(section));
+                }
                 let _ = buf.drain(..skip + len);
             }
             Ok(ChunkStep::Done { consumed }) => {

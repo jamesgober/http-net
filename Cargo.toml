@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "http-net"
-version = "0.9.2"
+version = "0.10.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -60,9 +60,12 @@ std = []
 # The shared RFC 9110 field grammar (tokens, OWS, field values, decimal and
 # hex digits, the civil calendar of HTTP-date). First party, zero runtime
 # dependencies of its own, `no_std` without `alloc`; by published version
-# only, never a path (spec OD-1, NFR-1). Its default feature set is empty;
+# only, never a path (spec OD-1, NFR-1), and pinned to one release: it
+# decides what http-net accepts on the wire, so a new grammar reaches users
+# only through an http-net release that ran the parity tests on it. Its
+# default feature set is empty;
 # `default-features = false` keeps it that way if one is ever added.
-parse-net = { version = "0.7", default-features = false }
+parse-net = { version = "=0.7.0", default-features = false }
 
 
 # DEV DEPENDENCIES

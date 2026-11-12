@@ -5,6 +5,128 @@ user of the previous version can notice, why it was made, and what to do.
 Additions that change no existing behaviour are listed at the end of each
 section.
 
+## 0.9.2 to 0.10.0
+
+The simplicity audit before 1.0 (`dev/PLAN.md` D-77) and the fixes from
+an independent review of 0.9.2 (D-78). Four signature changes, each a
+compile error that points at the line to change; four behaviour changes
+for proxies, trailer readers, and logs; and additions.
+
+### `parse_response_head` takes the request's `Method`
+
+**What changed.** The third argument is the method of the request the
+response answers, in place of `Asked`, which is gone.
+
+**Why.** `Asked { head, connect }` was a second way to say "the request
+method" that a reader had to look up; `status_allows_body` already takes
+a `Method`.
+
+**What to do.**
+
+```rust
+use http_net::{FieldSpan, Limits, Method, Parsed, parse_response_head};
+
+let mut fields = [FieldSpan::default(); 8];
+// Was: parse_response_head(input, &limits, Asked { head: true, connect: false }, &mut fields)
+let parsed = parse_response_head(b"HTTP/1.1 204 No Content\r\n\r\n", &Limits::new(), Method::Head, &mut fields)?;
+assert!(matches!(parsed, Parsed::Complete { .. }));
+# Ok::<(), http_net::HttpError>(())
+```
+
+`Asked::default()` becomes `Method::Get` (any method other than `HEAD` and
+`CONNECT` frames the same way).
+
+### `RequestHead::copy_into` returns the facts
+
+**What changed.** It returns `HeadFacts` directly; it returned
+`Result<HeadFacts, HttpError>` that was never an error.
+
+**What to do.** Drop the `?`, `.unwrap()`, or `.expect(..)` after the call.
+
+### `blocking::Connection::new` takes only the socket
+
+**What changed.** `Connection::new(stream)` uses the default limits; set
+others with `.with_limits(limits)`, as on `ServerConn`, `ClientConn`, and
+`blocking::Client`.
+
+**What to do.** `Connection::new(stream, limits)` becomes
+`Connection::new(stream).with_limits(limits)`, or
+`Connection::new(stream)` when `limits` was `Limits::new()`.
+
+### Time setters take a `Duration`
+
+**What changed.** `ServerConfig::with_read_timeout`,
+`with_request_timeout`, `with_write_timeout`, `with_response_deadline`,
+`with_max_requests_per_connection`, `Connection::with_request_timeout`,
+`Connection::with_response_deadline`, and `Client::with_deadline` take
+`impl Into<Option<..>>`: pass the value itself, or `None` to switch the
+limit off. They are no longer `const fn`.
+
+**What to do.** Nothing: `Some(d)` still compiles. You may drop the
+`Some`. Only a call in a `const` context breaks; build that value at run
+time.
+
+### `forward_from` writes `host` and drops `proxy-authorization`
+
+**What changed.** The forwarded request's first field is
+`host: <RequestHead::host()>`, the authority the proxy read; the received
+`Host` field is never copied, also when `Connection` lists it.
+`proxy-authorization` is not copied.
+
+**Why.** RFC 9112 section 3.2.2: a proxy generates `Host` from an
+absolute-form target. Copying it let a client name one authority in the
+target, which the proxy checked, and another in `Host`, which the next hop
+routed by. `Proxy-Authorization` is this proxy's credential (RFC 9110
+section 11.7.2).
+
+**What to do.** Nothing, unless you compare the forwarded bytes (the
+field is now `host` and first) or relay proxy credentials on purpose: add
+them back with `.header("proxy-authorization", ..)`.
+
+### Trailer events drop `content-length`, `transfer-encoding`, and `host`
+
+**What changed.** `ServerEvent::Trailers` and `ClientEvent::Trailers` no
+longer contain those three fields; a trailer section of only those gives
+no event. `ChunkedDecoder` still hands back the section's bytes as they
+are.
+
+**Why.** RFC 9110 section 6.5.1: they may not be trailers, and a
+recipient that merged or relayed them could reframe or reroute a message.
+
+**What to do.** Nothing. Do not relay `ChunkStep::Trailers` bytes as they
+are; re-emit the fields you keep with `end_body_with_trailers`.
+
+### `Debug` redacts more
+
+**What changed.** Fields whose names contain `auth`, `cookie`, `token`,
+`secret`, `key`, `session`, `password`, `passwd`, `csrf`, `xsrf`,
+`signature`, or `credential` print as `<redacted N bytes>`, and a request
+target's query prints as its length.
+
+**What to do.** Nothing, unless a log reader expected those values; read
+them with the accessors, which are unchanged.
+
+### `parse-net` is pinned
+
+**What changed.** The dependency is `parse-net = "=0.7.0"`.
+
+**What to do.** Nothing. Another crate in the build that needs a newer
+`parse-net` 0.7 release cannot share it until http-net moves.
+
+### Added
+
+- `impl From<HttpError> for std::io::Error` (feature `std`), so `?`
+  works in a function that returns `std::io::Result`.
+- `RequestHead::end_to_end_headers` and `ResponseHead::end_to_end_headers`,
+  the fields a proxy forwards, linear in the head. Prefer them to calling
+  `is_hop_by_hop` for every field, which costs fields times options.
+- `ClientConn::set_wipe`.
+
+### Fixed
+
+- `forward_from` is linear in the head.
+- With wiping on, a buffer that grows zeroes its old block.
+
 ## 0.9.1 to 0.9.2
 
 Fixes only; no signature changes. Three behaviours can be noticed.

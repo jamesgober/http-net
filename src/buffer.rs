@@ -38,7 +38,7 @@ impl Drop for Buffer {
 
 /// Overwrites `bytes` with zeros in a way the optimizer keeps: the slice is
 /// passed to `black_box` afterwards, so the stores cannot be removed as dead.
-fn zero(bytes: &mut [u8]) {
+pub(crate) fn zero(bytes: &mut [u8]) {
     bytes.fill(0);
     let _ = core::hint::black_box(bytes);
 }
@@ -212,7 +212,17 @@ impl Buffer {
                 self.compact();
             } else if len < self.cap {
                 let grown = len.saturating_mul(2).max(MIN_ALLOC).min(self.cap);
-                self.data.resize(grown, 0);
+                if self.wipe && grown > self.data.capacity() {
+                    // A reallocation would free the old block unwiped: copy
+                    // into a new one and zero the old one first.
+                    let mut next = Vec::with_capacity(grown);
+                    next.extend_from_slice(&self.data);
+                    next.resize(grown, 0);
+                    zero(&mut self.data);
+                    self.data = next;
+                } else {
+                    self.data.resize(grown, 0);
+                }
             } else if reclaimable > 0 {
                 self.compact();
             }

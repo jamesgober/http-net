@@ -911,8 +911,27 @@ const ROWS: &[Row] = &[
                 .send_request(&Request::forward_from(&head), &mut out)
                 .map_err(|e| format!("{e:?}"))?;
             ensure(
-                out == b"GET / HTTP/1.1\r\nHost: up\r\nAccept: */*\r\n\r\n",
+                out == b"GET / HTTP/1.1\r\nhost: up\r\nAccept: */*\r\n\r\n",
                 "a hop-by-hop field was forwarded",
+            )
+        },
+    },
+    Row {
+        section: "RFC 9112 3.2.2 (0.10)",
+        statement: "a proxy that forwards an absolute-form request MUST generate a new Host from the target, not forward the received Host",
+        check: || {
+            let mut conn = ServerConn::new();
+            let _ = conn.feed(b"GET http://public.test/a HTTP/1.1\r\nHost: internal.test\r\n\r\n");
+            let Ok(ServerEvent::Request(head)) = conn.poll() else {
+                return Err("no request".into());
+            };
+            let mut out = Vec::new();
+            ClientConn::new()
+                .send_request(&Request::forward_from(&head), &mut out)
+                .map_err(|e| format!("{e:?}"))?;
+            ensure(
+                out == b"GET http://public.test/a HTTP/1.1\r\nhost: public.test\r\n\r\n",
+                "the received Host was forwarded",
             )
         },
     },

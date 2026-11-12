@@ -6,8 +6,8 @@
 //! compact and the pretty form. Accessors keep returning the real values.
 
 use http_net::{
-    Asked, ClientConn, ClientEvent, FieldSpan, Limits, OwnedRequestHead, Parsed, Request, Response,
-    ServerConn, ServerEvent, parse_request_head, parse_response_head,
+    ClientConn, ClientEvent, FieldSpan, Limits, Method, OwnedRequestHead, Parsed, Request,
+    Response, ServerConn, ServerEvent, parse_request_head, parse_response_head,
 };
 
 /// The four credential fields, each in several spellings.
@@ -223,7 +223,7 @@ fn test_owned_and_stateless_views_debug_redact_credentials() {
     let cookie = "sid=s3cr3t-session; HttpOnly";
     let input = response_with("Set-Cookie", cookie);
     let mut slots = [FieldSpan::default(); 16];
-    let parsed = parse_response_head(&input, &Limits::new(), Asked::default(), &mut slots).unwrap();
+    let parsed = parse_response_head(&input, &Limits::new(), Method::Get, &mut slots).unwrap();
     for shown in both(&parsed) {
         assert_redacted("Parsed<ParsedResponse>", &shown, cookie);
     }
@@ -294,7 +294,7 @@ fn test_response_head_ref_debug_redacts_every_spelling() {
 fn test_blocking_connection_debug_never_prints_its_buffers() {
     use std::io::{Read, Write};
 
-    use http_net::{Limits, blocking::Connection};
+    use http_net::blocking::Connection;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -314,7 +314,7 @@ fn test_blocking_connection_debug_never_prints_its_buffers() {
         }
     });
     let (stream, _) = listener.accept().unwrap();
-    let mut conn = Connection::new(stream, Limits::new());
+    let mut conn = Connection::new(stream);
     assert!(conn.next_request().unwrap().is_some());
     conn.respond(&Response::text(200, "ok").header("set-cookie", "sid=s3cr3t-session"))
         .unwrap();
@@ -370,7 +370,7 @@ fn test_body_events_debug_print_lengths_only() {
 fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
     use std::io::Write;
 
-    use http_net::{Limits, blocking::Connection};
+    use http_net::blocking::Connection;
 
     fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -383,7 +383,7 @@ fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
     client
         .write_all(b"POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: 16\r\n\r\npassword=s3cr3t!")
         .unwrap();
-    let mut conn = Connection::new(server, Limits::new());
+    let mut conn = Connection::new(server);
     let incoming = conn.next_request().unwrap().unwrap();
     for shown in both(&incoming) {
         assert!(
@@ -405,7 +405,7 @@ fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
     // Give the tunnelled bytes time to arrive with the CONNECT, so they are
     // the leftover.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let mut conn = Connection::new(server, Limits::new());
+    let mut conn = Connection::new(server);
     assert!(conn.next_request().unwrap().is_some());
     conn.respond(&Response::new(200)).unwrap();
     let upgraded = conn.into_upgraded().unwrap();
@@ -416,4 +416,32 @@ fn test_blocking_incoming_and_upgraded_debug_print_lengths_only() {
         );
         assert!(shown.contains("bytes"), "{shown}");
     }
+}
+
+/// Credential-like custom fields and the query print as lengths (widened
+/// in 0.10: `x-api-key`, `x-auth-token`, and an `access_token` query
+/// printed in full); other fields still print as received.
+#[test]
+fn test_debug_redacts_custom_credential_fields_and_the_query() {
+    let mut conn = ServerConn::new();
+    let wire = b"GET /cb?access_token=SECRET1 HTTP/1.1\r\nHost: a\r\nX-Api-Key: SECRET2\r\nX-Auth-Token: SECRET3\r\nX-Session-Id: SECRET4\r\nX-Request-Id: visible\r\n\r\n";
+    let _ = conn.feed(wire);
+    let shown = match conn.poll().unwrap() {
+        ServerEvent::Request(req) => format!("{req:?}"),
+        other => panic!("{other:?}"),
+    };
+    for s in ["SECRET1", "SECRET2", "SECRET3", "SECRET4"] {
+        assert!(!shown.contains(s), "{shown}");
+    }
+    assert!(shown.contains("\"/cb?<redacted 20 bytes>\""), "{shown}");
+    assert!(shown.contains("visible"), "{shown}");
+
+    let req = Request::get("/q?sig=SECRET5")
+        .header("host", "a")
+        .header("x-client-secret", "SECRET6");
+    let shown = format!("{req:?}");
+    assert!(
+        !shown.contains("SECRET5") && !shown.contains("SECRET6"),
+        "{shown}"
+    );
 }

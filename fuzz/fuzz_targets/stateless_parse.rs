@@ -12,7 +12,7 @@
 
 use arbitrary::Arbitrary;
 use http_net::{
-    Asked, ClientConn, ClientEvent, FieldSpan, HttpError, OwnedRequestHead, Parsed, Request,
+    ClientConn, ClientEvent, FieldSpan, HttpError, Method, OwnedRequestHead, Parsed, Request,
     RequestHead, ResponseHead, ServerConn, ServerEvent, parse_request_head, parse_response_head,
 };
 use http_net_fuzz::{RawLimits, limits_from};
@@ -75,7 +75,7 @@ fuzz_target!(|input: Input| {
         Ok(ServerEvent::Request(head)) => {
             // A copied head rebuilds to the same view.
             let (mut bytes, mut fields) = (Vec::new(), Vec::new());
-            let facts = head.copy_into(&mut bytes, &mut fields).expect("copy_into");
+            let facts = head.copy_into(&mut bytes, &mut fields);
             let owned = OwnedRequestHead::from_parts(bytes, fields, facts)
                 .unwrap_or_else(|e| panic!("a copied head was refused: {e:?}"));
             assert_eq!(request_facts(&owned.view()), request_facts(&head));
@@ -134,9 +134,10 @@ fuzz_target!(|input: Input| {
         Ok(other) => panic!("unexpected first client event {other:?}"),
         Err(e) => Err(e),
     };
-    let asked = Asked {
-        head: input.head_request,
-        connect: false,
+    let asked = if input.head_request {
+        Method::Head
+    } else {
+        Method::Get
     };
     let mut fields = vec![FieldSpan::default(); limits.max_headers() + 1];
     let stateless = match parse_response_head(data, &limits, asked, &mut fields) {
@@ -148,5 +149,8 @@ fuzz_target!(|input: Input| {
         Ok(_) => unreachable!("unknown outcome"),
         Err(e) => Err(e),
     };
-    assert_eq!(stateless, client_view, "stateless response parse differs from ClientConn");
+    assert_eq!(
+        stateless, client_view,
+        "stateless response parse differs from ClientConn"
+    );
 });
