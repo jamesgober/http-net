@@ -239,7 +239,7 @@ Exit criteria:
 - [x] Full documentation set present (`docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, `docs/SECURITY.md`, `docs/PLATFORM-NOTES.md`, `docs/STABILITY-1.0.md`, plus `docs/PARITY.md`).
 - [ ] Full local gate and CI green on all platforms and MSRV (each 0.9.x release).
 
-## v0.10.0 - Beta: the simplicity audit (2026-11-11)
+## v0.10.0 - Beta: the simplicity audit (2026-11-12)
 
 Before 1.0, the public API was checked once more against the simplified-API
 rule: Tier 1 one-liners with plain `?`, plain names, one way to do each

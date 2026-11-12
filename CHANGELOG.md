@@ -13,7 +13,7 @@
 
 ---
 
-## [0.10.0] - 2026-11-11
+## [0.10.0] - 2026-11-12
 
 The simplicity audit before 1.0 (`dev/PLAN.md` D-77), and the fixes from
 an independent review of 0.9.2 (D-78). `docs/MIGRATION.md` shows each

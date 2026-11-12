@@ -240,7 +240,7 @@ Everything else in the audit above is done.
   one, or ship 1.0 on two.
 - Whether LexerSketch Studio's publish step must use the API end to end
   before 1.0, as the specification asks.
-- The 1.0 go or no-go itself, no earlier than 2026-11-25: two weeks
+- The 1.0 go or no-go itself, no earlier than 2026-11-26: two weeks
   after 0.10.0, the last API change (D-66, D-77). The clock restarted
   because the simplicity audit changed the API; waiving it is James's
   call.
