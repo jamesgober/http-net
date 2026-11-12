@@ -142,7 +142,7 @@ messages into a caller-owned `Vec<u8>`.
 | Tier | Who | Items |
 |---|---|---|
 | 1 | application authors: serve a handler, fetch a URL, build a message | `blocking::Server::bind` + `serve`, `blocking::get`, `Response::text`, `Response::new`, `Response::from_error`, `Request::get`, `Request::post`, `reason_phrase`, `blocking::serve`, `blocking::post` |
-| 2 | driver authors (`serve-net`, `fetch-net`, WASP, LexerSketch): own the socket, drive the state machine | `ServerConn`, `ClientConn`, their events, `Progress`, `Limits`, the builders, the views, `HttpDate` and `DateCache`, `blocking::Connection`, `blocking::ServerConfig`, `blocking::Client` |
+| 2 | driver authors (`serve-net`, `fetch-net`, gateways, LexerSketch): own the socket, drive the state machine | `ServerConn`, `ClientConn`, their events, `Progress`, `Limits`, the builders, the views, `HttpDate` and `DateCache`, `blocking::Connection`, `blocking::ServerConfig`, `blocking::Client` |
 | 3 | engine-level users: passports, proxies, differential tests, other engines | `MethodSet`, `Method::index`; from 0.5 spans and raw heads, owned heads, stateless parsers, `ChunkedDecoder`, the `Output` trait and borrowed writer, hop-by-hop helpers, HTTP/2 preface detection |
 
 ### Reading the entries
@@ -1482,7 +1482,7 @@ assert_eq!(options, [&b"keep-alive"[..], b"X-Trace"]);
 
 ## Spans, raw heads, owned heads
 
-Tier 3: the zero-copy passport path for WASP and proxies. A view's head
+Tier 3: the zero-copy passport path for gateways and proxies. A view's head
 bytes and the offsets of its parts are public, so the head can be copied
 (or moved) somewhere else and read there without parsing it again. The
 example `passport` runs the whole path across two threads.

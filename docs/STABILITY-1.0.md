@@ -220,7 +220,7 @@ gate and CI green on every platform and the MSRV), and James approves.
 - serve-net and LexerSketch Studio run end to end against 0.8 with no
   change (D-62), and again against the 0.9.2 code: `ls-studio`'s 42 tests
   and serve-net's whole suite pass with no source change (the crate moved
-  to 0.9 on its own). The WASP gateway skeleton and the first fetch-net do not
+  to 0.9 on its own). A gateway consumer and the first fetch-net do not
   exist yet. The specification also asks for LexerSketch Studio's publish
   step to use the API end to end before 1.0.
 - **Status:** open.
@@ -236,7 +236,7 @@ Everything else in the audit above is done.
   for reporting a vulnerability ([Support](#support)); a root
   `SECURITY.md` follows from the channel.
 - The third consumer (D-62): serve-net and LexerSketch Studio run end to
-  end; the WASP gateway and the first fetch-net do not exist yet. Wait for
+  end; a gateway consumer and the first fetch-net do not exist yet. Wait for
   one, or ship 1.0 on two.
 - Whether LexerSketch Studio's publish step must use the API end to end
   before 1.0, as the specification asks.
