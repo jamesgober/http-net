@@ -32,7 +32,6 @@ change.
   `Connection::with_response_deadline`, `Client::with_deadline`) take a
   value or `None` (`impl Into<Option<..>>`); `Some(..)` still compiles.
   They are no longer `const fn`.
-
 - `Request::forward_from` writes `host` from the authority the proxy
   read (the absolute-form target's, else the `Host` field's) and never
   copies the received `Host` (RFC 9112 section 3.2.2); it drops
@@ -71,9 +70,6 @@ change.
 - The blocking server is for local, development, and trusted-network use;
   internet-facing servers drive `ServerConn` from an event loop.
 - `ServerConn` lists which call writes what.
-
-### Documentation
-
 - `docs/PERFORMANCE.md`: the competitor comparison measured again on a
   quiet machine, with picohttpparser, llhttp, and H6 over sockets added
   (D-76).
