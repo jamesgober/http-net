@@ -56,6 +56,8 @@ change.
 - `RequestHead::end_to_end_headers` and `ResponseHead::end_to_end_headers`:
   the fields a proxy forwards, linear in the head.
 - `ClientConn::set_wipe`, as on `ServerConn`.
+- `OwnedRequestHead::wipe`: drops an owned head with its bytes zeroed,
+  spare capacity included.
 
 ### Fixed
 

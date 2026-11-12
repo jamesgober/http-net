@@ -1528,6 +1528,7 @@ impl OwnedRequestHead {
     pub fn view(&self) -> RequestHead<'_>;
     pub fn from_parts(bytes: Vec<u8>, fields: Vec<FieldSpan>, facts: HeadFacts) -> Result<Self, HttpError>;
     pub fn into_parts(self) -> (Vec<u8>, Vec<FieldSpan>, HeadFacts);
+    pub fn wipe(self);
 }
 ```
 
@@ -1537,6 +1538,7 @@ impl OwnedRequestHead {
 | `raw`, `RawHead` | the head bytes and spans behind a view; the bytes can be moved and the spans stay valid | 0.5 |
 | `copy_into`, `HeadFacts` | copies the head (one copy) and spans into caller-owned reused vectors, cleared first, and returns the interpreted facts, so a passport rebuilds a view without re-parsing; no allocation once the vectors have grown | 0.5 |
 | `to_owned`, `OwnedRequestHead`, `view`, `from_parts`, `into_parts` | an owned copy; `from_parts` re-validates every span and the line structure and refuses a passport whose structure was changed with `InvalidState`; `into_parts` hands the vectors back for reuse | 0.5 |
+| `wipe` | drops the head with its bytes zeroed, spare capacity included; a plain drop frees them as they are, so call it where the connection wipes; a clone needs its own | 0.10 |
 
 A constant-time lookup of frequent fields (`KnownField`, `known`) is
 planned for after 1.0; see [Planned after 1.0](#planned-after-10).

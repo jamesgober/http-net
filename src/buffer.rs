@@ -38,7 +38,7 @@ impl Drop for Buffer {
 
 /// Overwrites `bytes` with zeros in a way the optimizer keeps: the slice is
 /// passed to `black_box` afterwards, so the stores cannot be removed as dead.
-fn zero(bytes: &mut [u8]) {
+pub(crate) fn zero(bytes: &mut [u8]) {
     bytes.fill(0);
     let _ = core::hint::black_box(bytes);
 }

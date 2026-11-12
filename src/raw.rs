@@ -416,6 +416,34 @@ impl OwnedRequestHead {
     pub fn into_parts(self) -> (Vec<u8>, Vec<FieldSpan>, HeadFacts) {
         (self.bytes, self.fields, self.facts)
     }
+
+    /// Drops the head, zeroing its bytes first, including any spare
+    /// capacity (a vector reused through [`RequestHead::copy_into`] can
+    /// still hold an earlier, longer head there). A plain drop frees the
+    /// bytes as they are, so an `Authorization` or `Cookie` value lingers
+    /// in freed memory; call this where
+    /// [`ServerConn::set_wipe`](crate::ServerConn::set_wipe) is on. A clone
+    /// is a separate copy and needs its own `wipe`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_net::{ServerConn, ServerEvent};
+    ///
+    /// let mut conn = ServerConn::new();
+    /// conn.set_wipe(true);
+    /// let _ = conn.feed(b"GET / HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer s3cret\r\n\r\n");
+    /// let ServerEvent::Request(req) = conn.poll().unwrap() else { panic!() };
+    /// let head = req.to_owned();
+    /// assert_eq!(head.view().path(), "/");
+    /// head.wipe();
+    /// ```
+    pub fn wipe(self) {
+        let mut bytes = self.bytes;
+        let capacity = bytes.capacity();
+        bytes.resize(capacity, 0);
+        crate::buffer::zero(&mut bytes);
+    }
 }
 
 impl fmt::Debug for OwnedRequestHead {

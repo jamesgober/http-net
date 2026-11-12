@@ -19,7 +19,10 @@ use std::{
     },
 };
 
-use http_net::{ClientConn, ClientEvent, Request, Response, ServerConn, ServerEvent};
+use http_net::{
+    ClientConn, ClientEvent, FieldSpan, Limits, OwnedRequestHead, Parsed, Request, Response,
+    ServerConn, ServerEvent, parse_request_head,
+};
 
 /// The armed marker: its bytes and length; a length of 0 is disarmed.
 static MARKER_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
@@ -135,4 +138,56 @@ fn test_client_wipe_leaves_no_cookie_in_freed_blocks_after_growth() {
     wire.extend_from_slice(b"Content-Length: 0\r\n\r\n");
     assert_eq!(leaked_blocks(MARKER, || fetch(&wire, true)), 0);
     assert!(leaked_blocks(MARKER, || fetch(&wire, false)) > 0);
+}
+
+#[test]
+fn test_owned_head_wipe_zeroes_its_bytes_and_spare_capacity() {
+    const MARKER: &[u8] = b"b3duZWQtaGVhZC1tYXJrZXI";
+    let mut wire = b"GET / HTTP/1.1\r\nHost: a\r\nAuthorization: Basic ".to_vec();
+    wire.extend_from_slice(MARKER);
+    wire.extend_from_slice(b"\r\n\r\n");
+    let finish = |head: OwnedRequestHead, wipe: bool| {
+        if wipe { head.wipe() } else { drop(head) }
+    };
+
+    // An owned copy kept past the connection's own (wiped) buffer.
+    let owned = |wipe: bool| {
+        let mut conn = ServerConn::new();
+        conn.set_wipe(true);
+        assert_eq!(conn.feed(&wire), wire.len());
+        let ServerEvent::Request(req) = conn.poll().unwrap() else {
+            panic!("no request")
+        };
+        finish(req.to_owned(), wipe);
+    };
+    assert_eq!(leaked_blocks(MARKER, || owned(true)), 0);
+    assert!(leaked_blocks(MARKER, || owned(false)) > 0);
+
+    // A head rebuilt from reused vectors: the longer head copied first is
+    // left in the spare capacity, which the wipe zeroes too.
+    let reused = |wipe: bool| {
+        let (mut bytes, mut spans) = (Vec::new(), Vec::new());
+        let mut slots = [FieldSpan::default(); 8];
+        let Ok(Parsed::Complete { head, .. }) =
+            parse_request_head(&wire, &Limits::new(), &mut slots)
+        else {
+            panic!("no head")
+        };
+        let _ = head.view().copy_into(&mut bytes, &mut spans);
+        let short = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        let mut slots = [FieldSpan::default(); 8];
+        let Ok(Parsed::Complete { head, .. }) =
+            parse_request_head(short, &Limits::new(), &mut slots)
+        else {
+            panic!("no head")
+        };
+        let facts = head.view().copy_into(&mut bytes, &mut spans);
+        assert!(bytes.capacity() > bytes.len());
+        finish(
+            OwnedRequestHead::from_parts(bytes, spans, facts).unwrap(),
+            wipe,
+        );
+    };
+    assert_eq!(leaked_blocks(MARKER, || reused(true)), 0);
+    assert!(leaked_blocks(MARKER, || reused(false)) > 0);
 }
