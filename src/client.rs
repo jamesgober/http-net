@@ -1180,38 +1180,41 @@ impl ClientConn {
     }
 
     fn poll_body(&mut self) -> Result<ClientEvent<'_>, HttpError> {
-        let mut framing_bytes = 0;
-        let step = self.decoder.step(
-            self.buf.unread(),
-            self.buf.is_eof(),
-            &self.limits,
-            &mut self.trailers,
-            self.report_trailers,
-            &mut framing_bytes,
-        );
-        self.buf.consume(framing_bytes);
-        match step.map_err(|e| self.fail(e))? {
-            Step::Data(n) => {
-                let start = self.buf.pos();
-                self.buf.consume(n);
-                Ok(ClientEvent::Body(self.buf.range(start, start + n)))
-            }
-            Step::Trailers => {
-                drop_forbidden_trailers(self.buf.unread(), &mut self.trailers.fields);
-                if self.trailers.fields.is_empty() {
-                    // Nothing left to report: the next step ends the body.
-                    return self.poll_body();
+        // A loop, not a recursive call, so the body path stays inlinable.
+        loop {
+            let mut framing_bytes = 0;
+            let step = self.decoder.step(
+                self.buf.unread(),
+                self.buf.is_eof(),
+                &self.limits,
+                &mut self.trailers,
+                self.report_trailers,
+                &mut framing_bytes,
+            );
+            self.buf.consume(framing_bytes);
+            return match step.map_err(|e| self.fail(e))? {
+                Step::Data(n) => {
+                    let start = self.buf.pos();
+                    self.buf.consume(n);
+                    Ok(ClientEvent::Body(self.buf.range(start, start + n)))
                 }
-                Ok(ClientEvent::Trailers(Headers::new(
-                    self.buf.unread(),
-                    &self.trailers.fields,
-                )))
-            }
-            Step::Done => {
-                self.state = State::Complete;
-                Ok(ClientEvent::ResponseEnd)
-            }
-            Step::NeedMore => Ok(ClientEvent::NeedInput),
+                Step::Trailers => {
+                    drop_forbidden_trailers(self.buf.unread(), &mut self.trailers.fields);
+                    if self.trailers.fields.is_empty() {
+                        // Nothing left to report: the next step ends the body.
+                        continue;
+                    }
+                    Ok(ClientEvent::Trailers(Headers::new(
+                        self.buf.unread(),
+                        &self.trailers.fields,
+                    )))
+                }
+                Step::Done => {
+                    self.state = State::Complete;
+                    Ok(ClientEvent::ResponseEnd)
+                }
+                Step::NeedMore => Ok(ClientEvent::NeedInput),
+            };
         }
     }
 
