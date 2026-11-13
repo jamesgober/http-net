@@ -246,7 +246,7 @@ defects, two of them `Debug` outputs that printed credentials.
 ## [0.8.0] - 2026-10-26
 
 Alpha: the shared RFC 9110 field grammar comes from the first-party crate
-`parse-net`, and the first consumers (serve-net, LexerSketch Studio) run
+`parse-net`, and the first consumers (serve-net, the editor tool) run
 end to end against this release with no change. Nothing a 0.7 user can
 notice changes.
 

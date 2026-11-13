@@ -142,7 +142,7 @@ messages into a caller-owned `Vec<u8>`.
 | Tier | Who | Items |
 |---|---|---|
 | 1 | application authors: serve a handler, fetch a URL, build a message | `blocking::Server::bind` + `serve`, `blocking::get`, `Response::text`, `Response::new`, `Response::from_error`, `Request::get`, `Request::post`, `reason_phrase`, `blocking::serve`, `blocking::post` |
-| 2 | driver authors (`serve-net`, `fetch-net`, gateways, LexerSketch): own the socket, drive the state machine | `ServerConn`, `ClientConn`, their events, `Progress`, `Limits`, the builders, the views, `HttpDate` and `DateCache`, `blocking::Connection`, `blocking::ServerConfig`, `blocking::Client` |
+| 2 | driver authors (`serve-net`, `fetch-net`, gateways, an editor tool): own the socket, drive the state machine | `ServerConn`, `ClientConn`, their events, `Progress`, `Limits`, the builders, the views, `HttpDate` and `DateCache`, `blocking::Connection`, `blocking::ServerConfig`, `blocking::Client` |
 | 3 | engine-level users: passports, proxies, differential tests, other engines | `MethodSet`, `Method::index`; from 0.5 spans and raw heads, owned heads, stateless parsers, `ChunkedDecoder`, the `Output` trait and borrowed writer, hop-by-hop helpers, HTTP/2 preface detection |
 
 ### Reading the entries
@@ -622,7 +622,7 @@ The budgets a connection enforces on incoming messages. Every limit is
 checked before the bytes it governs are buffered: a declared
 `Content-Length` above `max_body` is refused on the header line, and a
 chunk size is checked against the remaining body budget before its data is
-read. The defaults are LexerSketch Studio's localhost budgets.
+read. The defaults are the localhost budgets of an editor tool, the first consumer.
 
 | Setter | Getter | Default | Range | Ships |
 |---|---|---|---|---|
@@ -2822,7 +2822,7 @@ assert!(date.as_str().ends_with(" GMT"));
 
 Each time setter takes a `Duration`, or `None` to switch that limit off
 (an `Option<Duration>` still works); the cap takes a count or `None`.
-Since 0.10 they are not `const fn`. For LexerSketch Studio's budget
+Since 0.10 they are not `const fn`. For the editor tool's budget
 ("header timeout 10 s"), set
 `with_request_timeout(Duration::from_secs(10))`.
 

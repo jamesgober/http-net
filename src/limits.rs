@@ -18,7 +18,7 @@ const BODY_WINDOW: usize = 16 * 1024;
 /// `head = max_start_line + max_header_bytes` (64 KiB with the defaults):
 /// room for a pinned head plus one partial chunk line or trailer section.
 ///
-/// The defaults are the budgets of LexerSketch Studio's localhost server:
+/// The defaults are the budgets of an editor tool's localhost server:
 ///
 /// | Budget | Default |
 /// |---|---|
