@@ -1,13 +1,12 @@
 # http-net - Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative), `dev/PLAN.md` (design and decision log), and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
-> LexerSketch plan: `C:/Dev/libraries/Rust/lang-collection/_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is a member of the owner's `-net` network domain in net-collection. LexerSketch Studio (specs/STUDIO.md, decision D23/D24) is its first consumer.
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is a member of the owner's `-net` network domain in net-collection. An editor tool (decision D23/D24) is its first consumer.
 
 ---
 
@@ -15,7 +14,7 @@ This library is built and maintained to a production standard and treated as a f
 
 http-net owns HTTP/1.1 message syntax, framing, and connection state for servers and clients. It does not do TLS, routing frameworks, or async runtimes.
 
-LexerSketch Studio's local server and the publish step's HTTPS client both need HTTP, and the portfolio rule is no rented runtime crates.
+The editor tool's local server and the publish step's HTTPS client both need HTTP, and the portfolio rule is no rented runtime crates.
 
 ---
 
@@ -42,7 +41,7 @@ LexerSketch Studio's local server and the publish step's HTTPS client both need 
 6. Property tests cover every section-4 invariant; a cargo-fuzz target in `fuzz/` exists for every decoder or parser and runs in CI (60 s smoke run per target).
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
-9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).
+9. v1.0.0 only after a real consumer has exercised the API end to end (decision D18).
 
 ---
 

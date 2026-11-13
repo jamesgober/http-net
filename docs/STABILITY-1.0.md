@@ -217,11 +217,11 @@ gate and CI green on every platform and the MSRV), and James approves.
 
 ### Consumers
 
-- serve-net and LexerSketch Studio run end to end against 0.8 with no
-  change (D-62), and again against the 0.9.2 code: `ls-studio`'s 42 tests
+- serve-net and the editor tool run end to end against 0.8 with no
+  change (D-62), and again against the 0.9.2 code: the editor tool's 42 tests
   and serve-net's whole suite pass with no source change (the crate moved
   to 0.9 on its own). A gateway consumer and the first fetch-net do not
-  exist yet. The specification also asks for LexerSketch Studio's publish
+  exist yet. The specification also asks for the editor tool's publish
   step to use the API end to end before 1.0.
 - **Status:** open.
 
@@ -235,10 +235,10 @@ Everything else in the audit above is done.
 - The security-fix support window for 1.x minors and the private channel
   for reporting a vulnerability ([Support](#support)); a root
   `SECURITY.md` follows from the channel.
-- The third consumer (D-62): serve-net and LexerSketch Studio run end to
+- The third consumer (D-62): serve-net and the editor tool run end to
   end; a gateway consumer and the first fetch-net do not exist yet. Wait for
   one, or ship 1.0 on two.
-- Whether LexerSketch Studio's publish step must use the API end to end
+- Whether the editor tool's publish step must use the API end to end
   before 1.0, as the specification asks.
 - The 1.0 go or no-go itself, no earlier than 2026-11-26: two weeks
   after 0.10.0, the last API change (D-66, D-77). The clock restarted

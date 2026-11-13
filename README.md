@@ -170,7 +170,7 @@ assert_eq!(conn.remaining_input(), b"\x81\x85"); // the first bytes of the first
 | chunk extensions, summed over one message | 16 KiB (the header budget) | `ChunkExtensionsTooLarge` (400) |
 | interim 1xx responses before a final one (client) | 16, and 16 KiB of heads together | `TooManyInterim` / `HeadersTooLarge` |
 
-These are the budgets of LexerSketch Studio's localhost server. Change them with [`Limits`](./docs/API.md#limits). The blocking server adds time budgets in [`ServerConfig`](./docs/API.md#blockingserverconfig): 10 s per read, 30 s per request, 10 s per write, 60 s to write a whole response, at most 1 s of lingering close.
+These are the budgets of an editor tool's localhost server, the first consumer. Change them with [`Limits`](./docs/API.md#limits). The blocking server adds time budgets in [`ServerConfig`](./docs/API.md#blockingserverconfig): 10 s per read, 30 s per request, 10 s per write, 60 s to write a whole response, at most 1 s of lingering close.
 
 <br>
 

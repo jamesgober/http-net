@@ -1,7 +1,6 @@
 # http-net - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: C:/Dev/libraries/Rust/lang-collection/_lexersketch/ROADMAP.md and NEW-LIBS.md
 > Design and decision log: `dev/PLAN.md`. Approved public surface, with the version each item ships in: `docs/API.md`.
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
@@ -12,7 +11,7 @@ Compiles, CI green, structure correct, no domain logic.
 
 ## v0.2.0 - Foundation (DONE, 2026-10-12)
 - [x] Sans-IO request/response parser and serializer, keep-alive, chunked bodies, server and client state machines, a blocking std adapter; smuggling and fuzz-style property tests.
-- [x] Upgrade hand-off for ws-net (moved forward from v0.5.0: LexerSketch Studio's
+- [x] Upgrade hand-off for ws-net (moved forward from v0.5.0: the editor tool's
   WebSocket needs it, and it is a small, self-contained state transition).
 - [x] `Expect: 100-continue` on the server (moved forward from v0.5.0 during the
   adversarial review: RFC 9110 section 10.1.1 makes answering the expectation a
@@ -198,11 +197,11 @@ Exit criteria:
 - [x] No open fuzz or Garden finding (Garden not run, D-58); every threat test green; soak RSS growth under 5% (3.4%); one new defence idea evaluated and recorded in `dev/PLAN.md` (the response-side httparse differential: held).
 
 ## v0.8.0 - Alpha (DONE, 2026-10-26, two of three consumers)
-- [x] Integration with first consumers: the `serve-net` engine adapter and LexerSketch Studio run green against 0.8 with no change; a gateway and the first `fetch-net` do not exist yet (D-62). No API change came from their feedback.
+- [x] Integration with first consumers: the `serve-net` engine adapter and the editor tool run green against 0.8 with no change; a gateway and the first `fetch-net` do not exist yet (D-62). No API change came from their feedback.
 - [x] The shared grammar comes from `parse-net` 0.7 (D-59 to D-61; supersedes D-13).
 
 Exit criteria:
-- [ ] Three consumers run end to end against 0.8: two do (serve-net, LexerSketch Studio); the third waits for a gateway or `fetch-net` (D-62).
+- [ ] Three consumers run end to end against 0.8: two do (serve-net, the editor tool); the third waits for a gateway or `fetch-net` (D-62).
 - [x] Every P0 and P1 gap they report closed (none reported).
 - [x] Benchmarks within 5% of 0.6 (D-61).
 
@@ -229,7 +228,7 @@ repeated. Fixes ship as 0.9.x patches; what stays open is in
 - [x] Deferred and estimated items revisited: the 0.5 wipe idea measured (+2.1%, D-72 and the defence-ideas log); the T-40 caps told apart by a test; the T-36 cost measured; the module layout settled (D-71); `PLAN.md` buffer bound corrected.
 - [x] Documentation audit repeated on 0.9.1: three code defects fixed in 0.9.2 (`outstanding()` after a failed response, the reuse queries at `ResponseEnd`, `HEAD` errors in the head), 18 documentation corrections, and the review's properties committed as `tests/prop_split.rs` (D-75).
 - [x] aarch64 measured on CI runners (`docs/PERFORMANCE.md`).
-- [x] Consumers run again against the 0.9.2 code: `ls-studio` 42 of 42; serve-net's suite passes (its `tests/loopback.rs` run serially: run in parallel on a loaded machine, a random few fail to start a server, on published 0.9.1 as well).
+- [x] Consumers run again against the 0.9.2 code: the editor tool 42 of 42; serve-net's suite passes (its `tests/loopback.rs` run serially: run in parallel on a loaded machine, a random few fail to start a server, on published 0.9.1 as well).
 - [x] HTTP Garden run a third time, on the 0.9.2 code: the same 156 differences, no case changed (D-70).
 - [x] Quiet-machine competitor run in `http-net-bench` (2026-11-04), with picohttpparser, llhttp, and H6 over sockets through serve-net added: H1 13% behind httparse's scalar build (was 16%) and 8 to 12% behind picohttpparser, 4% ahead of llhttp on pipelined requests, serve-net level with hyper on one connection and 13% behind at 16 (D-76, `docs/PERFORMANCE.md`).
 - [ ] Still open (not code, or not this repository): the third consumer (D-62); the support window and report channel (James).
@@ -255,7 +254,7 @@ thing, every public item in `docs/API.md` (D-77).
 
 ## v1.0.0 - Stable
 - [ ] The full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.
-- [ ] Frozen after LexerSketch Studio and ls-publish use it end to end (DIRECTIVES item 9, decision D18).
+- [ ] Frozen after the editor tool and its publish step use it end to end (DIRECTIVES item 9, decision D18).
 
 Exit criteria:
 - [ ] API frozen until 2.0; an MSRV raise after 1.0 is a major change.
